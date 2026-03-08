@@ -301,7 +301,8 @@ app.post("/crops", requireAuth,
     }).select().single();
 
     if (error) return res.status(500).json({ error: error.message });
-    setImmediate(() => runRuleEngine(req.user.id));
+    // Run synchronously before responding — setImmediate is killed by Vercel serverless
+    await runRuleEngine(req.user.id);
     res.status(201).json(data);
   }
 );
@@ -319,7 +320,7 @@ app.put("/crops/:id", requireAuth, async (req, res) => {
   const { data, error } = await req.db.from("crop_instances")
     .update(updates).eq("id", req.params.id).eq("user_id", req.user.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
-  if (req.body.stage) setImmediate(() => runRuleEngine(req.user.id));
+  if (req.body.stage) await runRuleEngine(req.user.id);
   res.json(data);
 });
 
@@ -511,12 +512,13 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     }));
 
   // Surface crops with missing data to prompt user
+  // variety_id = linked variety from dropdown, variety = free text — either counts
   const missingData = crops
-    .filter(c => !c.variety_id || !c.sown_date)
+    .filter(c => (!c.variety_id && !c.variety) || !c.sown_date)
     .map(c => ({
       id:      c.id,
       name:    c.name,
-      missing: [!c.variety_id && "variety", !c.sown_date && "sow date"].filter(Boolean),
+      missing: [(!c.variety_id && !c.variety) && "variety", !c.sown_date && "sow date"].filter(Boolean),
     }));
 
   res.json({
