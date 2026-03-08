@@ -497,15 +497,18 @@ app.post("/crops", requireAuth,
     if (!validate(req, res)) return;
     const {
       area_id, name, variety, variety_id, crop_def_id,
-      sown_date, transplanted_date, planted_out_date,
+      sown_date, transplanted_date, planted_out_date, transplant_date,
       establishment_method, quantity, notes,
-      start_date_confidence, source,
-      is_other_crop, is_other_variety,  // flags from UI "Other" selections
+      start_date_confidence, source, status,
+      is_other_crop, is_other_variety,
     } = req.body;
 
     // Derive location_id from area
     const { data: area } = await req.db.from("growing_areas")
       .select("location_id").eq("id", area_id).single();
+
+    // Infer status from data if not explicitly set
+    const derivedStatus = status || (sown_date ? "growing" : "planned");
 
     const { data, error } = await req.db.from("crop_instances").insert({
       user_id:              req.user.id,
@@ -515,8 +518,10 @@ app.post("/crops", requireAuth,
       variety:              variety || null,
       variety_id:           variety_id || null,
       crop_def_id:          crop_def_id || null,
+      status:               derivedStatus,
       sown_date:            sown_date || null,
       transplanted_date:    transplanted_date || null,
+      transplant_date:      transplant_date || null,
       planted_out_date:     planted_out_date || null,
       establishment_method: establishment_method || null,
       quantity:             quantity || 1,
@@ -543,9 +548,9 @@ app.post("/crops", requireAuth,
 
 app.put("/crops/:id", requireAuth, async (req, res) => {
   const allowed = [
-    "variety","variety_id","sown_date","transplanted_date","planted_out_date",
+    "variety","variety_id","sown_date","transplanted_date","transplant_date","planted_out_date",
     "establishment_method","stage","quantity","notes","area_id","photo_url",
-    "start_date_confidence","last_fed_at",
+    "start_date_confidence","last_fed_at","status",
   ];
   const updates = Object.fromEntries(Object.entries(req.body).filter(([k]) => allowed.includes(k)));
   updates.updated_at = new Date().toISOString();
@@ -617,17 +622,39 @@ app.get("/tasks", requireAuth, async (req, res) => {
 
 app.post("/tasks/:id/complete", requireAuth, async (req, res) => {
   const completedAt = new Date().toISOString();
+  const today       = completedAt.split("T")[0];
+
   const { data, error } = await req.db.from("tasks")
     .update({ completed_at: completedAt })
     .eq("id", req.params.id).eq("user_id", req.user.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
 
-  // Update last_fed_at when a feed task is completed
-  if (data.task_type === "feed" && data.crop_instance_id) {
-    await req.db.from("crop_instances")
-      .update({ last_fed_at: completedAt, updated_at: completedAt })
-      .eq("id", data.crop_instance_id);
+  // Auto-update crop status + dates when lifecycle tasks are completed
+  if (data.crop_instance_id) {
+    const meta = data.meta ? (typeof data.meta === "string" ? JSON.parse(data.meta) : data.meta) : {};
+    const transition = meta.status_transition;
+
+    if (data.task_type === "feed") {
+      await req.db.from("crop_instances")
+        .update({ last_fed_at: completedAt, updated_at: completedAt })
+        .eq("id", data.crop_instance_id);
+
+    } else if (data.task_type === "sow" && transition === "sown") {
+      const sowMethod = meta.sow_method || "outdoors";
+      const newStatus = sowMethod === "indoors" ? "sown_indoors" : "sown_outdoors";
+      await req.db.from("crop_instances")
+        .update({ status: newStatus, sown_date: today, updated_at: completedAt })
+        .eq("id", data.crop_instance_id);
+      await runRuleEngine(req.user.id);
+
+    } else if (data.task_type === "transplant" && transition === "transplanted") {
+      await req.db.from("crop_instances")
+        .update({ status: "transplanted", transplant_date: today, updated_at: completedAt })
+        .eq("id", data.crop_instance_id);
+      await runRuleEngine(req.user.id);
+    }
   }
+
   res.json(data);
 });
 

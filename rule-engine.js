@@ -138,12 +138,95 @@ class RuleEngine {
 
     for (const crop of crops) {
       const effective  = resolveEffectiveValues(crop);
-      crop.stage       = inferStage(crop, effective);
+      const cropStatus = crop.status || "growing";
       const areaType   = crop.area?.type;
       const locId      = crop.location_id || crop.area?.location_id;
       const weather    = weatherByLocation[locId] || null;
       const envMods    = envModifiers[areaType]   || {};
       const context    = { weather, envMods };
+      const m          = currentMonth();
+      const sowMethod  = crop.crop_def?.sow_method || "either";
+
+      // ── PLANNED CROPS: generate sow prompt when in sow window ────────────────
+      if (cropStatus === "planned") {
+        const sowStart = crop.crop_def?.sow_window_start;
+        const sowEnd   = crop.crop_def?.sow_window_end;
+        if (sowStart && sowEnd && m >= sowStart && m <= sowEnd) {
+          const logKey  = `${crop.id}:sow_prompt`;
+          const lastRun = recentLog.get(logKey);
+          const cooldown = 7 * 86400000; // re-prompt weekly
+          if (!lastRun || (Date.now() - lastRun.getTime()) >= cooldown) {
+            let action, taskType;
+            if (sowMethod === "indoors") {
+              action   = `Time to sow ${crop.name} indoors — start on a windowsill or in the greenhouse`;
+              taskType = "sow";
+            } else if (sowMethod === "outdoors") {
+              action   = `Time to direct sow ${crop.name} outdoors`;
+              taskType = "sow";
+            } else {
+              action   = `Time to sow ${crop.name} — sow indoors for earlier start or direct sow outdoors`;
+              taskType = "sow";
+            }
+            const task = {
+              user_id:          crop.user_id,
+              crop_instance_id: crop.id,
+              area_id:          crop.area_id,
+              action,
+              task_type:        taskType,
+              urgency:          "medium",
+              due_date:         todayISO(),
+              source:           "rule_engine",
+              rule_id:          "sow_prompt",
+              date_confidence:  "exact",
+              meta:             JSON.stringify({ status_transition: "sown", sow_method: sowMethod }),
+            };
+            newTasks.push({ ...task, crop_name: crop.name, rule_id: "sow_prompt" });
+            if (!this.dryRun && this.supabase) {
+              await this._persistTaskWithKey(task, crop, "sow_prompt");
+            }
+          }
+        }
+        continue; // planned crops don't get other rules
+      }
+
+      // ── SOWN INDOORS: generate transplant task when frost risk low + window right
+      if (cropStatus === "sown_indoors") {
+        const txStart = crop.crop_def?.transplant_window_start;
+        const txEnd   = crop.crop_def?.transplant_window_end;
+        if (txStart && txEnd && m >= txStart && m <= txEnd) {
+          const frostRisk  = weather?.frost_risk === true;
+          const logKey     = `${crop.id}:transplant_prompt`;
+          const lastRun    = recentLog.get(logKey);
+          const cooldown   = frostRisk ? 3 * 86400000 : 7 * 86400000;
+          if (!lastRun || (Date.now() - lastRun.getTime()) >= cooldown) {
+            const action = frostRisk
+              ? `${crop.name} is ready to transplant but frost is forecast — hold off a few more days`
+              : `Time to transplant ${crop.name} outdoors — frosts should now be clear`;
+            const task = {
+              user_id:          crop.user_id,
+              crop_instance_id: crop.id,
+              area_id:          crop.area_id,
+              action,
+              task_type:        "transplant",
+              urgency:          frostRisk ? "low" : "medium",
+              due_date:         todayISO(),
+              source:           "rule_engine",
+              rule_id:          "transplant_prompt",
+              date_confidence:  "exact",
+              meta:             JSON.stringify({ status_transition: "transplanted" }),
+            };
+            newTasks.push({ ...task, crop_name: crop.name, rule_id: "transplant_prompt" });
+            if (!this.dryRun && this.supabase) {
+              await this._persistTaskWithKey(task, crop, "transplant_prompt");
+            }
+          }
+        }
+        continue; // sown_indoors crops only get transplant prompts for now
+      }
+
+      // ── GROWING CROPS: run normal rules ──────────────────────────────────────
+      // Skip crops with no sow date for rules that need it
+      crop.stage = inferStage(crop, effective);
 
       for (const rule of rules) {
         // 1. Crop match — NULL means applies to all crops
@@ -222,6 +305,24 @@ class RuleEngine {
     }
   }
 
+  async _persistTaskWithKey(task, crop, ruleKey) {
+    try {
+      const { data: inserted, error } = await this.supabase
+        .from("tasks")
+        .insert(task)
+        .select("id")
+        .single();
+      if (error) throw error;
+      await this.supabase.from("rule_log").insert({
+        crop_instance_id: crop.id,
+        rule_id:          ruleKey,
+        task_id:          inserted.id,
+      });
+    } catch (err) {
+      console.error("[RuleEngine] Persist error:", err.message);
+    }
+  }
+
   // ── Data loaders ────────────────────────────────────────────────────────────
 
   async _loadCrops(userId) {
@@ -232,9 +333,11 @@ class RuleEngine {
         *,
         area:area_id ( type, location_id ),
         crop_def:crop_def_id (
-          is_perennial, frost_sensitive,
+          is_perennial, frost_sensitive, sow_method,
           days_to_maturity_min, days_to_maturity_max,
-          feed_interval_days, pest_window_start, pest_window_end
+          feed_interval_days, pest_window_start, pest_window_end,
+          sow_window_start, sow_window_end,
+          transplant_window_start, transplant_window_end
         ),
         variety:variety_id (
           days_to_maturity_min, days_to_maturity_max,
