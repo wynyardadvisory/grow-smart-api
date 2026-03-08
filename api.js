@@ -341,6 +341,7 @@ Use null for any fields you don't have reliable data for. All month values are i
     });
 
     const raw = await response.json();
+    console.log(`[Enrich] Anthropic status: ${response.status}, type: ${raw.type}, error: ${raw.error?.message || 'none'}`);
     const text = raw.content?.[0]?.text || "";
     console.log(`[Enrich] Claude raw response (first 300 chars): ${text.slice(0, 300)}`);
 
@@ -751,9 +752,9 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       .order("urgency",  { ascending: false })
       .order("due_date", { ascending: true }),
     req.db.from("crop_instances")
-      .select("id, name, variety, variety_id, sown_date, area_id, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min)")
+      .select("id, name, variety, variety_id, sown_date, area_id, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, pest_window_start, pest_window_end, pest_notes)")
       .eq("user_id", req.user.id).eq("active", true),
-    req.db.from("profiles").select("name, plan").eq("id", req.user.id).single(),
+    req.db.from("profiles").select("name, plan, postcode").eq("id", req.user.id).single(),
     req.db.from("harvest_log")
       .select("id, harvested_at, quantity_g, crop:crop_instance_id(name)")
       .eq("user_id", req.user.id)
@@ -762,10 +763,13 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       .limit(5),
   ]);
 
-  const tasks  = tasksRes.data  || [];
-  const crops  = cropsRes.data  || [];
-  const year   = new Date().getFullYear();
+  const tasks   = tasksRes.data  || [];
+  const crops   = cropsRes.data  || [];
+  const profile = profileRes.data;
+  const year    = new Date().getFullYear();
+  const currentMonth = new Date().getMonth() + 1;
 
+  // ── Harvest forecast ──────────────────────────────────────────────────────
   const harvestForecast = crops
     .filter(c => c.crop_def?.harvest_month_start)
     .map(c => ({
@@ -775,8 +779,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       window_end:   new Date(year, c.crop_def.harvest_month_end   - 1, 28).toISOString().split("T")[0],
     }));
 
-  // Surface crops with missing data to prompt user
-  // variety_id = linked variety from dropdown, variety = free text — either counts
+  // ── Missing data prompts ──────────────────────────────────────────────────
   const missingData = crops
     .filter(c => (!c.variety_id && !c.variety) || !c.sown_date)
     .map(c => ({
@@ -785,9 +788,75 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       missing: [(!c.variety_id && !c.variety) && "variety", !c.sown_date && "sow date"].filter(Boolean),
     }));
 
+  // ── Pest risk — how many crops are in their peak pest window this month ───
+  const cropsInPestWindow = crops.filter(c => {
+    const ps = c.crop_def?.pest_window_start;
+    const pe = c.crop_def?.pest_window_end;
+    if (!ps || !pe) return false;
+    return currentMonth >= ps && currentMonth <= pe;
+  });
+  const pestRisk = cropsInPestWindow.length === 0 ? "low"
+                 : cropsInPestWindow.length <= 2   ? "medium"
+                 : "high";
+  const pestCrops = cropsInPestWindow.map(c => c.name);
+
+  // ── Weather + frost risk (7-day) ──────────────────────────────────────────
+  let weather = null;
+  try {
+    const postcode = profile?.postcode;
+    if (postcode) {
+      // Check cache first (includes 7-day frost data)
+      const { data: cached } = await supabaseService.from("weather_cache")
+        .select("temp_c, condition, frost_risk, frost_risk_7day, icon_code, expires_at")
+        .eq("postcode", postcode)
+        .gt("expires_at", new Date().toISOString())
+        .single();
+
+      if (cached) {
+        weather = cached;
+      } else {
+        // Fetch fresh from OpenWeather forecast API (5-day/3-hour = 40 slots)
+        const apiKey = process.env.OPENWEATHER_API_KEY;
+        const r    = await fetch(`https://api.openweathermap.org/data/2.5/forecast?q=${postcode},GB&appid=${apiKey}&units=metric&cnt=40`);
+        const json = await r.json();
+
+        if (json.list) {
+          const allSlots   = json.list;
+          const next7days  = allSlots.slice(0, 56); // up to 7 days of 3h slots
+          const minTemp7d  = Math.min(...next7days.map(f => f.main.temp_min));
+          const minTemp24h = Math.min(...allSlots.slice(0, 8).map(f => f.main.temp_min));
+
+          weather = {
+            postcode,
+            temp_c:          Math.round(json.list[0].main.temp),
+            condition:       json.list[0].weather[0].description,
+            icon_code:       json.list[0].weather[0].icon,
+            frost_risk:      minTemp24h <= 2,      // tonight / tomorrow
+            frost_risk_7day: minTemp7d,             // lowest temp in 7 days
+            rain_mm:         allSlots.slice(0, 8).reduce((s, f) => s + (f.rain?.["3h"] || 0), 0),
+            data:            json,
+            expires_at:      new Date(Date.now() + 3600000).toISOString(),
+          };
+          await supabaseService.from("weather_cache").upsert(weather);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[Dashboard] Weather fetch error:", err.message);
+  }
+
+  // ── Frost risk traffic light ──────────────────────────────────────────────
+  let frostRisk = "low";
+  if (weather) {
+    const min7 = weather.frost_risk_7day;
+    if (min7 <= 0)      frostRisk = "high";    // actual frost forecast
+    else if (min7 <= 3) frostRisk = "medium";  // close to freezing
+    else                frostRisk = "low";
+  }
+
   res.json({
-    user:             profileRes.data?.name,
-    plan:             profileRes.data?.plan || "free",
+    user:             profile?.name,
+    plan:             profile?.plan || "free",
     tasks: {
       today:     tasks.filter(t => t.due_date === today),
       this_week: tasks.filter(t => t.due_date > today && t.due_date <= weekEnd),
@@ -797,6 +866,14 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     harvest_forecast: harvestForecast,
     missing_data:     missingData,
     recent_harvests:  harvestRes.data || [],
+    weather: weather ? {
+      temp_c:    weather.temp_c,
+      condition: weather.condition,
+      icon_code: weather.icon_code,
+    } : null,
+    frost_risk:  frostRisk,
+    pest_risk:   pestRisk,
+    pest_crops:  pestCrops,
   });
 });
 
