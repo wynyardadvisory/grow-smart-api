@@ -342,10 +342,14 @@ Use null for any fields you don't have reliable data for. All month values are i
 
     const raw = await response.json();
     const text = raw.content?.[0]?.text || "";
+    console.log(`[Enrich] Claude raw response (first 300 chars): ${text.slice(0, 300)}`);
 
     let parsed;
     try {
-      parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+      // Extract JSON robustly — find the outermost { } block regardless of surrounding text
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) throw new Error("No JSON object found in response");
+      parsed = JSON.parse(jsonMatch[0]);
     } catch {
       throw new Error(`Claude returned unparseable JSON: ${text.slice(0, 200)}`);
     }
