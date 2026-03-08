@@ -151,42 +151,42 @@ class RuleEngine {
       if (cropStatus === "planned") {
         const sowStart = crop.crop_def?.sow_window_start;
         const sowEnd   = crop.crop_def?.sow_window_end;
+        console.log(`[RuleEngine] Planned crop: ${crop.name}, sowStart=${sowStart}, sowEnd=${sowEnd}, month=${m}`);
         if (sowStart && sowEnd && m >= sowStart && m <= sowEnd) {
           const logKey  = `${crop.id}:sow_prompt`;
           const lastRun = recentLog.get(logKey);
-          const cooldown = 7 * 86400000; // re-prompt weekly
+          const cooldown = 7 * 86400000;
           if (!lastRun || (Date.now() - lastRun.getTime()) >= cooldown) {
-            let action, taskType;
+            let action;
             if (sowMethod === "indoors") {
-              action   = `Time to sow ${crop.name} indoors — start on a windowsill or in the greenhouse`;
-              taskType = "sow";
+              action = `Time to sow ${crop.name} indoors — start on a windowsill or in the greenhouse`;
             } else if (sowMethod === "outdoors") {
-              action   = `Time to direct sow ${crop.name} outdoors`;
-              taskType = "sow";
+              action = `Time to direct sow ${crop.name} outdoors`;
             } else {
-              action   = `Time to sow ${crop.name} — sow indoors for earlier start or direct sow outdoors`;
-              taskType = "sow";
+              action = `Time to sow ${crop.name} — sow indoors for earlier start or direct sow outdoors`;
             }
             const task = {
               user_id:          crop.user_id,
               crop_instance_id: crop.id,
               area_id:          crop.area_id,
               action,
-              task_type:        taskType,
+              task_type:        "sow",
               urgency:          "medium",
               due_date:         todayISO(),
               source:           "rule_engine",
               rule_id:          "sow_prompt",
               date_confidence:  "exact",
-              meta:             JSON.stringify({ status_transition: "sown", sow_method: sowMethod }),
             };
+            console.log(`[RuleEngine] Generating sow task for ${crop.name}`);
             newTasks.push({ ...task, crop_name: crop.name, rule_id: "sow_prompt" });
             if (!this.dryRun && this.supabase) {
               await this._persistTaskWithKey(task, crop, "sow_prompt");
             }
+          } else {
+            console.log(`[RuleEngine] Sow prompt for ${crop.name} on cooldown`);
           }
         }
-        continue; // planned crops don't get other rules
+        continue;
       }
 
       // ── SOWN INDOORS: generate transplant task when frost risk low + window right
