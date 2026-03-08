@@ -381,6 +381,21 @@ app.post("/tasks/:id/complete", requireAuth, async (req, res) => {
   res.json(data);
 });
 
+app.post("/tasks/:id/uncomplete", requireAuth, async (req, res) => {
+  const { data, error } = await req.db.from("tasks")
+    .update({ completed_at: null })
+    .eq("id", req.params.id).eq("user_id", req.user.id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Reverse last_fed_at if it was a feed task — set back to null
+  if (data.task_type === "feed" && data.crop_instance_id) {
+    await req.db.from("crop_instances")
+      .update({ last_fed_at: null })
+      .eq("id", data.crop_instance_id);
+  }
+  res.json(data);
+});
+
 app.post("/tasks/:id/snooze", requireAuth,
   [body("days").isInt({ min: 1, max: 14 })],
   async (req, res) => {
