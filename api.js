@@ -246,6 +246,226 @@ app.get("/crop-definitions/:id/sow-advice", async (req, res) => {
 });
 
 // =============================================================================
+// CROP ENRICHMENT — AI-powered background worker
+// Fires when a user submits an "other" crop or variety name.
+// Calls Claude to validate, correct spelling, and build full crop data.
+// On success: inserts into crop_definitions/varieties and links the instance.
+// =============================================================================
+
+async function enrichCrop(cropInstanceId, submittedName, submittedVariety) {
+  const db = supabaseService;
+
+  // Create a pending record immediately
+  const { data: pending, error: pendingErr } = await db
+    .from("pending_crops")
+    .insert({
+      crop_instance_id:  cropInstanceId,
+      submitted_name:    submittedName,
+      submitted_variety: submittedVariety || null,
+      status:            "processing",
+    })
+    .select().single();
+
+  if (pendingErr) {
+    console.error("[Enrich] Failed to create pending record:", pendingErr.message);
+    return;
+  }
+
+  try {
+    const prompt = `You are a horticultural expert for UK home growers and allotment holders.
+A user has added a crop to their garden with the following details:
+- Crop name: "${submittedName}"
+- Variety: "${submittedVariety || "not specified"}"
+
+Your task:
+1. Determine if this is a real, growable crop in the UK (vegetables, fruit, herbs). If it is nonsense, misspelled beyond recognition, or not a real crop, reject it.
+2. If real, correct any spelling errors in both the crop name and variety name.
+3. Return comprehensive UK growing data.
+
+Respond ONLY with a JSON object — no markdown, no explanation. Use this exact structure:
+{
+  "valid": true,
+  "rejection_reason": null,
+  "crop": {
+    "name": "corrected crop name",
+    "category": "one of: fruiting, root, brassica, legume, allium, salad, herb, perennial, fruit",
+    "default_establishment": "one of: indoors, direct_sow, tuber, crown, runner, cane",
+    "is_perennial": false,
+    "sow_indoors_start": 2,
+    "sow_indoors_end": 4,
+    "sow_direct_start": null,
+    "sow_direct_end": null,
+    "plant_out_start": 5,
+    "plant_out_end": 6,
+    "harvest_month_start": 7,
+    "harvest_month_end": 10,
+    "days_to_maturity_min": 60,
+    "days_to_maturity_max": 90,
+    "feed_type": "high potash liquid feed",
+    "feed_interval_days": 14,
+    "frost_sensitive": true,
+    "preferred_position": "one of: full_sun, partial_shade, full_shade",
+    "companions": ["basil", "marigold"],
+    "avoid": ["fennel"],
+    "pest_window_start": 5,
+    "pest_window_end": 9,
+    "pest_notes": "brief pest notes",
+    "grower_notes": "key growing tips for UK growers"
+  },
+  "variety": {
+    "name": "corrected variety name or null if not provided",
+    "classification": "e.g. Cherry, Maincrop, Heritage — or null",
+    "days_to_maturity_min": 65,
+    "days_to_maturity_max": 75,
+    "notes": "what makes this variety distinctive"
+  }
+}
+
+If the crop is not valid, return:
+{ "valid": false, "rejection_reason": "brief reason", "crop": null, "variety": null }
+
+Use null for any fields you don't have reliable data for. All month values are integers 1-12. Base everything on UK growing conditions.`;
+
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type":      "application/json",
+        "x-api-key":         process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model:      "claude-sonnet-4-20250514",
+        max_tokens: 1500,
+        messages:   [{ role: "user", content: prompt }],
+      }),
+    });
+
+    const raw = await response.json();
+    const text = raw.content?.[0]?.text || "";
+
+    let parsed;
+    try {
+      parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+    } catch {
+      throw new Error(`Claude returned unparseable JSON: ${text.slice(0, 200)}`);
+    }
+
+    // Store raw response for debugging
+    await db.from("pending_crops").update({ claude_response: parsed }).eq("id", pending.id);
+
+    if (!parsed.valid) {
+      await db.from("pending_crops").update({
+        status:           "rejected",
+        rejection_reason: parsed.rejection_reason,
+        resolved_at:      new Date().toISOString(),
+      }).eq("id", pending.id);
+      console.log(`[Enrich] Rejected "${submittedName}": ${parsed.rejection_reason}`);
+      return;
+    }
+
+    const cropData = parsed.crop;
+    const varietyData = parsed.variety;
+
+    // ── Check if crop already exists (case-insensitive) ──────────────────────
+    let cropDefId;
+    const { data: existing } = await db.from("crop_definitions")
+      .select("id").ilike("name", cropData.name).maybeSingle();
+
+    if (existing) {
+      cropDefId = existing.id;
+      console.log(`[Enrich] Crop "${cropData.name}" already exists — using existing`);
+    } else {
+      // Insert new crop definition
+      const { data: newCrop, error: cropErr } = await db.from("crop_definitions").insert({
+        name:                  cropData.name,
+        category:              cropData.category,
+        default_establishment: cropData.default_establishment,
+        is_perennial:          cropData.is_perennial || false,
+        sow_indoors_start:     cropData.sow_indoors_start,
+        sow_indoors_end:       cropData.sow_indoors_end,
+        sow_direct_start:      cropData.sow_direct_start,
+        sow_direct_end:        cropData.sow_direct_end,
+        plant_out_start:       cropData.plant_out_start,
+        plant_out_end:         cropData.plant_out_end,
+        harvest_month_start:   cropData.harvest_month_start,
+        harvest_month_end:     cropData.harvest_month_end,
+        days_to_maturity_min:  cropData.days_to_maturity_min,
+        days_to_maturity_max:  cropData.days_to_maturity_max,
+        feed_type:             cropData.feed_type,
+        feed_interval_days:    cropData.feed_interval_days,
+        frost_sensitive:       cropData.frost_sensitive,
+        preferred_position:    cropData.preferred_position,
+        companions:            cropData.companions || [],
+        avoid:                 cropData.avoid || [],
+        pest_window_start:     cropData.pest_window_start,
+        pest_window_end:       cropData.pest_window_end,
+        pest_notes:            cropData.pest_notes,
+        grower_notes:          cropData.grower_notes,
+      }).select("id").single();
+
+      if (cropErr) throw new Error(`Crop insert failed: ${cropErr.message}`);
+      cropDefId = newCrop.id;
+      console.log(`[Enrich] Added new crop "${cropData.name}" (${cropDefId})`);
+    }
+
+    // ── Insert variety if provided ────────────────────────────────────────────
+    let varietyId = null;
+    if (varietyData?.name) {
+      // Check if variety already exists for this crop
+      const { data: existingVar } = await db.from("varieties")
+        .select("id").eq("crop_def_id", cropDefId).ilike("name", varietyData.name).maybeSingle();
+
+      if (existingVar) {
+        varietyId = existingVar.id;
+        console.log(`[Enrich] Variety "${varietyData.name}" already exists`);
+      } else {
+        const { data: newVar, error: varErr } = await db.from("varieties").insert({
+          crop_def_id:          cropDefId,
+          name:                 varietyData.name,
+          classification:       varietyData.classification || null,
+          days_to_maturity_min: varietyData.days_to_maturity_min || null,
+          days_to_maturity_max: varietyData.days_to_maturity_max || null,
+          notes:                varietyData.notes || null,
+          is_default:           false,
+          active:               true,
+        }).select("id").single();
+
+        if (varErr) throw new Error(`Variety insert failed: ${varErr.message}`);
+        varietyId = newVar.id;
+        console.log(`[Enrich] Added new variety "${varietyData.name}" (${varietyId})`);
+      }
+    }
+
+    // ── Update the crop instance with the real linked records ─────────────────
+    await db.from("crop_instances").update({
+      name:        cropData.name,   // corrected spelling
+      crop_def_id: cropDefId,
+      variety_id:  varietyId,
+      variety:     varietyData?.name || null,
+      updated_at:  new Date().toISOString(),
+    }).eq("id", cropInstanceId);
+
+    // ── Mark pending as complete ──────────────────────────────────────────────
+    await db.from("pending_crops").update({
+      status:               "completed",
+      result_crop_def_id:   cropDefId,
+      result_variety_id:    varietyId,
+      resolved_at:          new Date().toISOString(),
+    }).eq("id", pending.id);
+
+    console.log(`[Enrich] ✓ Completed enrichment for instance ${cropInstanceId}`);
+
+  } catch (err) {
+    console.error("[Enrich] Error:", err.message);
+    await supabaseService.from("pending_crops").update({
+      status:      "failed",
+      rejection_reason: err.message,
+      resolved_at: new Date().toISOString(),
+    }).eq("id", pending.id);
+  }
+}
+
+// =============================================================================
 // CROPS
 // =============================================================================
 
@@ -275,6 +495,7 @@ app.post("/crops", requireAuth,
       sown_date, transplanted_date, planted_out_date,
       establishment_method, quantity, notes,
       start_date_confidence, source,
+      is_other_crop, is_other_variety,  // flags from UI "Other" selections
     } = req.body;
 
     // Derive location_id from area
@@ -295,15 +516,21 @@ app.post("/crops", requireAuth,
       establishment_method: establishment_method || null,
       quantity:             quantity || 1,
       notes:                notes || null,
-      photo_url:            null, // set via PUT /crops/:id after upload
+      photo_url:            null,
       start_date_confidence:start_date_confidence || "exact",
       source:               source || "manual",
     }).select().single();
 
     if (error) return res.status(500).json({ error: error.message });
-    // Run synchronously before responding — setImmediate is killed by Vercel serverless
+
+    // If user typed a custom crop or variety name, enrich synchronously before responding
+    // Fire-and-forget doesn't work on Vercel — process exits before it completes
+    if (is_other_crop || is_other_variety) {
+      await enrichCrop(data.id, name, variety || null);
+    }
+
     await runRuleEngine(req.user.id);
-    res.status(201).json(data);
+    res.status(201).json({ ...data, enriching: !!(is_other_crop || is_other_variety) });
   }
 );
 
@@ -322,6 +549,16 @@ app.put("/crops/:id", requireAuth, async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
   if (req.body.stage) await runRuleEngine(req.user.id);
   res.json(data);
+});
+
+app.get("/crops/:id/enrichment", requireAuth, async (req, res) => {
+  const { data, error } = await req.db.from("pending_crops")
+    .select("status, rejection_reason, result_crop_def_id, result_variety_id")
+    .eq("crop_instance_id", req.params.id)
+    .order("created_at", { ascending: false })
+    .limit(1).maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || { status: "none" });
 });
 
 app.delete("/crops/:id", requireAuth, async (req, res) => {
