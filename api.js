@@ -523,14 +523,16 @@ app.post("/crops", requireAuth,
 
     if (error) return res.status(500).json({ error: error.message });
 
-    // If user typed a custom crop or variety name, enrich synchronously before responding
-    // Fire-and-forget doesn't work on Vercel — process exits before it completes
-    if (is_other_crop || is_other_variety) {
+    // Trigger enrichment if:
+    // - crop is unknown (no crop_def_id), OR
+    // - variety was typed as free text (variety present but no variety_id)
+    const needsEnrichment = !data.crop_def_id || (!data.variety_id && data.variety);
+    if (needsEnrichment) {
       await enrichCrop(data.id, name, variety || null);
     }
 
     await runRuleEngine(req.user.id);
-    res.status(201).json({ ...data, enriching: !!(is_other_crop || is_other_variety) });
+    res.status(201).json({ ...data, enriching: needsEnrichment });
   }
 );
 
@@ -547,6 +549,12 @@ app.put("/crops/:id", requireAuth, async (req, res) => {
   const { data, error } = await req.db.from("crop_instances")
     .update(updates).eq("id", req.params.id).eq("user_id", req.user.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
+
+  // Trigger enrichment if variety was just set as free text with no variety_id
+  if (updates.variety && !updates.variety_id && !data.variety_id) {
+    await enrichCrop(data.id, data.name, updates.variety);
+  }
+
   if (req.body.stage) await runRuleEngine(req.user.id);
   res.json(data);
 });
