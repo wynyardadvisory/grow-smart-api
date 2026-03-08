@@ -803,9 +803,12 @@ app.get("/dashboard", requireAuth, async (req, res) => {
   // ── Weather + frost risk (7-day) ──────────────────────────────────────────
   let weather = null;
   try {
-    const postcode = profile?.postcode;
-    if (postcode) {
-      // Check cache first (includes 7-day frost data)
+    const rawPostcode = profile?.postcode;
+    if (rawPostcode) {
+      // Always use outward code only (e.g. "TS22" not "TS22 5BQ") — OpenWeather requires it
+      const postcode = rawPostcode.trim().split(" ")[0].toUpperCase();
+
+      // Check cache first
       const { data: cached } = await supabaseService.from("weather_cache")
         .select("temp_c, condition, frost_risk, frost_risk_7day, icon_code, expires_at")
         .eq("postcode", postcode)
@@ -815,14 +818,14 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       if (cached) {
         weather = cached;
       } else {
-        // Fetch fresh from OpenWeather forecast API (5-day/3-hour = 40 slots)
+        // Fetch fresh from OpenWeather forecast API
         const apiKey = process.env.OPENWEATHER_API_KEY;
         const r    = await fetch(`https://api.openweathermap.org/data/2.5/forecast?q=${postcode},GB&appid=${apiKey}&units=metric&cnt=40`);
         const json = await r.json();
 
         if (json.list) {
           const allSlots   = json.list;
-          const next7days  = allSlots.slice(0, 56); // up to 7 days of 3h slots
+          const next7days  = allSlots.slice(0, 56);
           const minTemp7d  = Math.min(...next7days.map(f => f.main.temp_min));
           const minTemp24h = Math.min(...allSlots.slice(0, 8).map(f => f.main.temp_min));
 
@@ -831,8 +834,8 @@ app.get("/dashboard", requireAuth, async (req, res) => {
             temp_c:          Math.round(json.list[0].main.temp),
             condition:       json.list[0].weather[0].description,
             icon_code:       json.list[0].weather[0].icon,
-            frost_risk:      minTemp24h <= 2,      // tonight / tomorrow
-            frost_risk_7day: minTemp7d,             // lowest temp in 7 days
+            frost_risk:      minTemp24h <= 2,
+            frost_risk_7day: minTemp7d,
             rain_mm:         allSlots.slice(0, 8).reduce((s, f) => s + (f.rain?.["3h"] || 0), 0),
             data:            json,
             expires_at:      new Date(Date.now() + 3600000).toISOString(),
