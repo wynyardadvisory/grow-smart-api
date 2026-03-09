@@ -894,6 +894,129 @@ app.delete("/feeds/:id", requireAuth, async (req, res) => {
   res.json({ success: true });
 });
 
+
+// =============================================================================
+// HARVEST LOG
+// Users log harvests from the forecast screen. Photos stored in Supabase Storage.
+// =============================================================================
+
+// GET /harvest-log — list user's harvest entries
+app.get("/harvest-log", requireAuth, async (req, res) => {
+  const { year } = req.query;
+  let query = req.db.from("harvest_log")
+    .select("*")
+    .eq("user_id", req.user.id)
+    .order("harvested_at", { ascending: false });
+
+  if (year) {
+    query = query
+      .gte("harvested_at", `${year}-01-01`)
+      .lte("harvested_at", `${year}-12-31`);
+  }
+
+  const { data, error } = await query;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// POST /harvest-log — create a harvest entry + mark crop as harvested
+app.post("/harvest-log", requireAuth,
+  [body("crop_name").trim().notEmpty()],
+  async (req, res) => {
+    if (!validate(req, res)) return;
+    const {
+      crop_instance_id, crop_name, variety,
+      harvested_at, yield_score, quality_score,
+      quantity_value, quantity_unit, notes,
+    } = req.body;
+
+    const { data, error } = await req.db.from("harvest_log").insert({
+      user_id:          req.user.id,
+      crop_instance_id: crop_instance_id || null,
+      crop_name,
+      variety:          variety || null,
+      harvested_at:     harvested_at || new Date().toISOString().split("T")[0],
+      yield_score:      yield_score || null,
+      quality_score:    quality_score || null,
+      quantity_value:   quantity_value || null,
+      quantity_unit:    quantity_unit || null,
+      notes:            notes || null,
+    }).select().single();
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    // Mark crop instance as harvested
+    if (crop_instance_id) {
+      await req.db.from("crop_instances")
+        .update({ status: "harvested", updated_at: new Date().toISOString() })
+        .eq("id", crop_instance_id)
+        .eq("user_id", req.user.id);
+    }
+
+    res.status(201).json(data);
+  }
+);
+
+// DELETE /harvest-log/:id — undo a harvest entry + revert crop status
+app.delete("/harvest-log/:id", requireAuth, async (req, res) => {
+  // Get the entry first so we know the crop_instance_id
+  const { data: entry, error: fetchErr } = await req.db.from("harvest_log")
+    .select("*")
+    .eq("id", req.params.id)
+    .eq("user_id", req.user.id)
+    .single();
+
+  if (fetchErr || !entry) return res.status(404).json({ error: "Not found" });
+
+  const { error } = await req.db.from("harvest_log")
+    .delete()
+    .eq("id", req.params.id)
+    .eq("user_id", req.user.id);
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Revert crop status back to growing
+  if (entry.crop_instance_id) {
+    await req.db.from("crop_instances")
+      .update({ status: "growing", updated_at: new Date().toISOString() })
+      .eq("id", entry.crop_instance_id)
+      .eq("user_id", req.user.id);
+  }
+
+  res.json({ success: true, reverted_crop: entry.crop_instance_id });
+});
+
+// POST /harvest-log/:id/photo — upload a photo for a harvest entry
+app.post("/harvest-log/:id/photo", requireAuth, async (req, res) => {
+  const { base64, filename, mime_type } = req.body;
+  if (!base64 || !filename) return res.status(400).json({ error: "base64 and filename required" });
+
+  try {
+    const buffer = Buffer.from(base64, "base64");
+    const path   = `${req.user.id}/${req.params.id}/${filename}`;
+
+    const { error: uploadErr } = await supabaseService.storage
+      .from("harvest-photos")
+      .upload(path, buffer, { contentType: mime_type || "image/jpeg", upsert: true });
+
+    if (uploadErr) return res.status(500).json({ error: uploadErr.message });
+
+    const { data: urlData } = supabaseService.storage
+      .from("harvest-photos")
+      .getPublicUrl(path);
+
+    // Save URL to harvest log entry
+    await req.db.from("harvest_log")
+      .update({ photo_url: urlData.publicUrl, updated_at: new Date().toISOString() })
+      .eq("id", req.params.id)
+      .eq("user_id", req.user.id);
+
+    res.json({ photo_url: urlData.publicUrl });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // =============================================================================
 // WEATHER
 // Weather is fetched and cached per location postcode.
