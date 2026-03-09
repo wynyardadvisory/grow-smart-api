@@ -385,11 +385,13 @@ class RuleEngine {
       const activeIds = (activeCrops || []).map(c => c.id);
 
       // Find tasks whose crop_instance_id is not in the active list
+      // Use raw filter for NOT IN with UUID array
+      const safeIds = activeIds.length ? activeIds : ["00000000-0000-0000-0000-000000000000"];
       const { data: orphanTasks } = await this.supabase
         .from("tasks")
         .select("id, crop_instance_id")
         .eq("user_id", userId)
-        .not("crop_instance_id", "in", `(${activeIds.length ? activeIds.map(id => `"${id}"`).join(",") : '"00000000-0000-0000-0000-000000000000"'})`);
+        .not("crop_instance_id", "in", `(${safeIds.join(",")})`)
 
       if (orphanTasks?.length) {
         const orphanIds = orphanTasks.map(t => t.id);
