@@ -131,12 +131,13 @@ class RuleEngine {
       await this._cleanupOrphanedTasks(userId);
     }
 
-    const [crops, rules, weatherByLocation, recentLog, envModifiers] = await Promise.all([
+    const [crops, rules, weatherByLocation, recentLog, envModifiers, userFeeds] = await Promise.all([
       this._loadCrops(userId),
       this._loadRules(),
       this._loadWeatherByLocation(userId),
       this._loadRuleLog(userId),
       this._loadEnvModifiers(),
+      this._loadUserFeeds(userId),
     ]);
 
     const newTasks = [];
@@ -304,11 +305,28 @@ class RuleEngine {
                             crop.stage_confidence       === "inferred")
                            ? "estimated" : "exact";
 
+        // For feed tasks — personalise action with user's matched feed
+        let action = rule.action;
+        if (rule.task_type === "feed") {
+          const cropFeedType = crop.crop_def?.feed_type;
+          const matchedFeed  = this._matchFeed(cropFeedType, userFeeds);
+          if (matchedFeed) {
+            const productLabel = [matchedFeed.brand, matchedFeed.product_name].filter(Boolean).join(" ");
+            let dosageNote = "";
+            if (matchedFeed.form === "liquid" && matchedFeed.dilution_ml_per_litre) {
+              dosageNote = ` — ${matchedFeed.dilution_ml_per_litre}ml per litre of water`;
+            } else if (matchedFeed.form === "granular" || matchedFeed.form === "powder") {
+              dosageNote = matchedFeed.notes ? ` — follow pack instructions` : "";
+            }
+            action = `Time to feed your ${crop.name} with ${productLabel}${dosageNote}`;
+          }
+        }
+
         const task = {
           user_id:          crop.user_id,
           crop_instance_id: crop.id,
           area_id:          crop.area_id,
-          action:           rule.action,
+          action,
           task_type:        rule.task_type,
           urgency:          rule.urgency,
           due_date:         todayISO(),
@@ -377,6 +395,42 @@ class RuleEngine {
     } catch (err) {
       console.error("[RuleEngine] Persist error:", err.message);
     }
+  }
+
+  // ── Feed matching ────────────────────────────────────────────────────────────
+  // Match a crop's feed_type to the best user feed available.
+  // Returns the best matching feed or null if none found.
+
+  _matchFeed(cropFeedType, userFeeds) {
+    if (!cropFeedType || !userFeeds?.length) return null;
+
+    // Normalise crop feed type to a keyword list for fuzzy matching
+    const cropKeywords = cropFeedType.toLowerCase();
+
+    // Score each feed — higher = better match
+    const scored = userFeeds.map(feed => {
+      let score = 0;
+      const feedType = (feed.feed_type || "").toLowerCase();
+      const suitableTypes = feed.suitable_crop_types || [];
+
+      // Exact feed_type match is best
+      if (feedType.includes("high_potash") && cropKeywords.includes("potash")) score += 10;
+      if (feedType.includes("high_nitrogen") && cropKeywords.includes("nitrogen")) score += 10;
+      if (feedType.includes("balanced") && cropKeywords.includes("balanced")) score += 10;
+      if (feedType.includes("specialist_tomato") && cropKeywords.includes("potash")) score += 15;
+      if (feedType.includes("seaweed")) score += 2; // seaweed is generally beneficial
+      if (feedType.includes("organic_general")) score += 3;
+
+      // Partial keyword overlaps
+      if (cropKeywords.includes("potash") && feedType.includes("potash")) score += 5;
+      if (cropKeywords.includes("general") && feedType.includes("balanced")) score += 5;
+
+      return { feed, score };
+    }).filter(s => s.score > 0);
+
+    if (!scored.length) return null;
+    scored.sort((a, b) => b.score - a.score);
+    return scored[0].feed;
   }
 
   // ── Cleanup ─────────────────────────────────────────────────────────────────
@@ -484,6 +538,17 @@ class RuleEngine {
       acc[m.area_type][m.modifier_type] = m.value;
       return acc;
     }, {});
+  }
+
+  async _loadUserFeeds(userId) {
+    if (!this.supabase) return [];
+    const { data } = await this.supabase
+      .from("user_feeds")
+      .select("id, brand, product_name, form, feed_type, npk, dilution_ml_per_litre, frequency_days, suitable_crop_types, application_method, notes, enriched")
+      .eq("user_id", userId)
+      .eq("active", true)
+      .eq("enriched", true);
+    return data || [];
   }
 
   async _loadRuleLog(userId) {
