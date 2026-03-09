@@ -149,8 +149,9 @@ class RuleEngine {
 
       // ── PLANNED CROPS: generate sow prompt when in sow window ────────────────
       if (cropStatus === "planned") {
-        const sowStart       = crop.crop_def?.sow_window_start;
-        const sowEnd         = crop.crop_def?.sow_window_end;
+        // Prefer variety-level sow window if set (e.g. late maincrop vs early variety)
+        const sowStart       = crop.variety?.sow_window_start       ?? crop.crop_def?.sow_window_start;
+        const sowEnd         = crop.variety?.sow_window_end         ?? crop.crop_def?.sow_window_end;
         const frostSensitive = effective.frost_sensitive;
 
         if (sowStart && sowEnd && m >= sowStart && m <= sowEnd) {
@@ -371,7 +372,9 @@ class RuleEngine {
         variety:variety_id (
           days_to_maturity_min, days_to_maturity_max,
           frost_sensitive_override, feed_interval_days_override,
-          pest_window_start_override, pest_window_end_override
+          pest_window_start_override, pest_window_end_override,
+          sow_window_start, sow_window_end,
+          transplant_window_start, transplant_window_end
         )
       `)
       .eq("user_id", userId)
