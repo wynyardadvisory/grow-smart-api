@@ -451,16 +451,26 @@ Use null for any fields you don't have reliable data for. All month values are i
         varietyId = existingVar.id;
         console.log(`[Enrich] Variety "${varietyData.name}" already exists`);
       } else {
+        // Fall back to crop-level sow windows if variety doesn't have its own
+        const varSowStart = varietyData.sow_window_start
+          || cropData.sow_direct_start
+          || cropData.sow_indoors_start
+          || null;
+        const varSowEnd = varietyData.sow_window_end
+          || cropData.sow_direct_end
+          || cropData.sow_indoors_end
+          || null;
+
         const { data: newVar, error: varErr } = await db.from("varieties").insert({
           crop_def_id:             cropDefId,
           name:                    varietyData.name,
           classification:          varietyData.classification || null,
           days_to_maturity_min:    varietyData.days_to_maturity_min || null,
           days_to_maturity_max:    varietyData.days_to_maturity_max || null,
-          sow_window_start:        varietyData.sow_window_start || null,
-          sow_window_end:          varietyData.sow_window_end || null,
-          transplant_window_start: varietyData.transplant_window_start || null,
-          transplant_window_end:   varietyData.transplant_window_end || null,
+          sow_window_start:        varSowStart,
+          sow_window_end:          varSowEnd,
+          transplant_window_start: varietyData.transplant_window_start || cropData.plant_out_start || null,
+          transplant_window_end:   varietyData.transplant_window_end   || cropData.plant_out_end   || null,
           notes:                   varietyData.notes || null,
           is_default:              false,
           active:                  true,
