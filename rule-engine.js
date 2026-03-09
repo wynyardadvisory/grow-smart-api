@@ -337,14 +337,14 @@ class RuleEngine {
 
   async _persistTaskWithKey(task, crop, ruleKey) {
     try {
-      // Dedup check — don't insert if an incomplete task with same rule already exists
-      const { data: existing } = await this.supabase
+      // Dedup check — don't insert if any task with same rule_id exists for this crop
+      const { data: existingTasks } = await this.supabase
         .from("tasks")
         .select("id")
         .eq("crop_instance_id", crop.id)
         .eq("rule_id", ruleKey)
-        .eq("completed", false)
-        .maybeSingle();
+        .limit(1);
+      const existing = existingTasks?.[0] || null;
       if (existing) {
         console.log(`[RuleEngine] Skipping duplicate task ${ruleKey} for ${crop.name}`);
         return;
