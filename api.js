@@ -320,17 +320,24 @@ Respond ONLY with a JSON object — no markdown, no explanation. Use this exact 
   },
   "variety": {
     "name": "corrected variety name or null if not provided",
-    "classification": "e.g. Cherry, Maincrop, Heritage, Earlybird, Maincrop, Late — or null",
+    "classification": "e.g. Early, Maincrop, Late, Heritage, F1 — or null",
     "days_to_maturity_min": 65,
     "days_to_maturity_max": 75,
-    "sow_window_start": null,
-    "sow_window_end": null,
+    "sow_window_start": 5,
+    "sow_window_end": 6,
     "transplant_window_start": null,
     "transplant_window_end": null,
-    "notes": "what makes this variety distinctive, including any key timing differences from the base crop"
+    "notes": "what makes this variety distinctive"
   }
 
-IMPORTANT: If this variety has meaningfully different sow or harvest timing from the base crop (e.g. a late maincrop variety vs an early variety), set sow_window_start/end on the variety. Otherwise leave as null to inherit from the crop definition.
+CRITICAL RULE FOR VARIETY SOW WINDOWS:
+You MUST set sow_window_start and sow_window_end on the variety whenever you have reliable knowledge of that variety's sow timing.
+Do NOT default to null — most named varieties have known sow windows.
+Examples:
+- Tweed F1 Swede: sow_window_start=5, sow_window_end=6 (late maincrop, sow May-June)
+- Gardener's Delight Tomato: sow_window_start=2, sow_window_end=4 (sow Feb-Apr indoors)
+- Early Nantes Carrot: sow_window_start=3, sow_window_end=6 (early variety, sow Mar-Jun)
+Only use null if you genuinely have no information about that specific variety's timing.
 }
 
 If the crop is not valid, return:
