@@ -214,6 +214,7 @@ class RuleEngine {
               source:           "rule_engine",
               rule_id:          "sow_prompt",
               date_confidence:  "exact",
+              meta:             JSON.stringify({ status_transition: "sown", sow_method: sowMethod }),
             };
             newTasks.push({ ...task, crop_name: crop.name, rule_id: "sow_prompt" });
             if (!this.dryRun && this.supabase) {
