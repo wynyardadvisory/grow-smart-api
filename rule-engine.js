@@ -126,6 +126,11 @@ class RuleEngine {
   // ── Main entry point ────────────────────────────────────────────────────────
 
   async runForUser(userId) {
+    // ── Cleanup: remove tasks for inactive/deleted crops ──────────────────────
+    if (this.supabase) {
+      await this._cleanupOrphanedTasks(userId);
+    }
+
     const [crops, rules, weatherByLocation, recentLog, envModifiers] = await Promise.all([
       this._loadCrops(userId),
       this._loadRules(),
@@ -363,6 +368,37 @@ class RuleEngine {
       });
     } catch (err) {
       console.error("[RuleEngine] Persist error:", err.message);
+    }
+  }
+
+  // ── Cleanup ─────────────────────────────────────────────────────────────────
+
+  async _cleanupOrphanedTasks(userId) {
+    try {
+      // Get all active crop instance IDs for this user
+      const { data: activeCrops } = await this.supabase
+        .from("crop_instances")
+        .select("id")
+        .eq("user_id", userId)
+        .eq("active", true);
+
+      const activeIds = (activeCrops || []).map(c => c.id);
+
+      // Find tasks whose crop_instance_id is not in the active list
+      const { data: orphanTasks } = await this.supabase
+        .from("tasks")
+        .select("id, crop_instance_id")
+        .eq("user_id", userId)
+        .not("crop_instance_id", "in", `(${activeIds.length ? activeIds.map(id => `"${id}"`).join(",") : '"00000000-0000-0000-0000-000000000000"'})`);
+
+      if (orphanTasks?.length) {
+        const orphanIds = orphanTasks.map(t => t.id);
+        await this.supabase.from("rule_log").delete().in("task_id", orphanIds);
+        await this.supabase.from("tasks").delete().in("id", orphanIds);
+        console.log(`[RuleEngine] Cleaned up ${orphanIds.length} orphaned tasks`);
+      }
+    } catch (err) {
+      console.error("[RuleEngine] Cleanup error:", err.message);
     }
   }
 
