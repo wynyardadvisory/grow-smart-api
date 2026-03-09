@@ -565,7 +565,8 @@ app.put("/crops/:id", requireAuth, async (req, res) => {
     await enrichCrop(data.id, data.name, updates.variety);
   }
 
-  if (req.body.stage) await runRuleEngine(req.user.id);
+  // Always run rule engine after any crop update — status/sow_date changes affect task generation
+  await runRuleEngine(req.user.id);
   res.json(data);
 });
 
