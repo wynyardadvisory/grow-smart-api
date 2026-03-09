@@ -1045,11 +1045,9 @@ async function uploadPhoto(bucket, path, base64, mimeType) {
     .upload(path, buffer, { contentType: mimeType || "image/jpeg", upsert: true });
   if (error) throw new Error(error.message);
 
-  // Generate a long-lived signed URL (10 years)
-  const { data } = await supabaseService.storage
-    .from(bucket)
-    .createSignedUrl(path, 60 * 60 * 24 * 365 * 10);
-  return data.signedUrl;
+  // Use public URL (buckets are set to public)
+  const { data } = supabaseService.storage.from(bucket).getPublicUrl(path);
+  return data.publicUrl;
 }
 
 // POST /photos/profile — upload profile photo
