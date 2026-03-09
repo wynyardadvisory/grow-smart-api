@@ -830,6 +830,16 @@ If the product is not a real plant feed, return: { "valid": false }`;
   }
 }
 
+// GET /feed-catalog — return the full product catalog for dropdowns
+app.get("/feed-catalog", requireAuth, async (req, res) => {
+  const { data, error } = await req.db.from("feed_catalog")
+    .select("brand, product_name, form, feed_type, npk, dilution_ml_per_litre, frequency_days, suitable_crop_types, application_method, notes")
+    .eq("active", true)
+    .order("brand").order("product_name");
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
 // GET /feeds — list user's feeds
 app.get("/feeds", requireAuth, async (req, res) => {
   const { data, error } = await req.db.from("user_feeds")
@@ -846,24 +856,31 @@ app.post("/feeds", requireAuth,
   [body("product_name").trim().notEmpty()],
   async (req, res) => {
     if (!validate(req, res)) return;
-    const { brand, product_name, form, notes } = req.body;
+    const { brand, product_name, form, notes, feed_type, npk,
+            dilution_ml_per_litre, frequency_days, suitable_crop_types,
+            application_method, pre_enriched } = req.body;
 
     const { data, error } = await req.db.from("user_feeds").insert({
-      user_id:      req.user.id,
-      brand:        brand || null,
+      user_id:               req.user.id,
+      brand:                 brand || null,
       product_name,
-      form:         form || "liquid",
-      notes:        notes || null,
-      feed_type:    "balanced", // will be updated by enrichment
-      enriched:     false,
+      form:                  form || "liquid",
+      notes:                 notes || null,
+      feed_type:             feed_type || "balanced",
+      npk:                   npk || null,
+      dilution_ml_per_litre: dilution_ml_per_litre || null,
+      frequency_days:        frequency_days || null,
+      suitable_crop_types:   suitable_crop_types || [],
+      application_method:    application_method || "drench",
+      enriched:              pre_enriched ? true : false,
     }).select().single();
 
     if (error) return res.status(500).json({ error: error.message });
 
-    // Enrich in background
-    enrichFeed(data.id, brand, product_name);
+    // Only enrich if not already known
+    if (!pre_enriched) enrichFeed(data.id, brand, product_name);
 
-    res.status(201).json({ ...data, enriching: true });
+    res.status(201).json({ ...data, enriching: !pre_enriched });
   }
 );
 
