@@ -149,41 +149,70 @@ class RuleEngine {
 
       // ── PLANNED CROPS: generate sow prompt when in sow window ────────────────
       if (cropStatus === "planned") {
-        const sowStart = crop.crop_def?.sow_window_start;
-        const sowEnd   = crop.crop_def?.sow_window_end;
-        console.log(`[RuleEngine] Planned crop: ${crop.name}, sowStart=${sowStart}, sowEnd=${sowEnd}, month=${m}`);
+        const sowStart       = crop.crop_def?.sow_window_start;
+        const sowEnd         = crop.crop_def?.sow_window_end;
+        const frostSensitive = effective.frost_sensitive;
+
         if (sowStart && sowEnd && m >= sowStart && m <= sowEnd) {
+
+          // ── Frost-aware suppression for outdoor sowing ──────────────────────
+          // frost_risk_7day is the actual minimum °C forecast over 7 days.
+          // We use it to suppress or warn on outdoor sowing for frost-sensitive crops.
+          // Indoors sowing is never blocked by frost.
+          const min7        = weather?.frost_risk_7day ?? null;
+          const isOutdoor   = sowMethod === "outdoors" || sowMethod === "either";
+          const frostHigh   = frostSensitive && isOutdoor && min7 !== null && min7 <= 0;
+          const frostMedium = frostSensitive && isOutdoor && min7 !== null && min7 > 0 && min7 <= 3;
+
+          // Hard block: frost forecast and crop is frost-sensitive outdoor sow
+          if (frostHigh) continue; // suppress entirely — try again on daily cron
+
           const logKey  = `${crop.id}:sow_prompt`;
           const lastRun = recentLog.get(logKey);
-          const cooldown = 7 * 86400000;
+          // Re-prompt sooner when frost is marginal so user gets updated once it clears
+          const cooldown = frostMedium ? 3 * 86400000 : 7 * 86400000;
+
           if (!lastRun || (Date.now() - lastRun.getTime()) >= cooldown) {
-            let action;
+            let action, urgency;
+
             if (sowMethod === "indoors") {
-              action = `Time to sow ${crop.name} indoors — start on a windowsill or in the greenhouse`;
+              action  = `Time to sow ${crop.name} indoors — start on a windowsill or in the greenhouse`;
+              urgency = "medium";
             } else if (sowMethod === "outdoors") {
-              action = `Time to direct sow ${crop.name} outdoors`;
+              if (frostMedium) {
+                action  = `Almost time to direct sow ${crop.name} outdoors — frost risk still marginal, wait for a settled spell`;
+                urgency = "low";
+              } else {
+                action  = `Time to direct sow ${crop.name} outdoors`;
+                urgency = "medium";
+              }
             } else {
-              action = `Time to sow ${crop.name} — sow indoors for earlier start or direct sow outdoors`;
+              // either — always offer indoors option even if outdoor is marginal
+              if (frostMedium) {
+                action  = `Time to sow ${crop.name} — sow indoors now or wait a little longer before direct sowing outdoors`;
+                urgency = "medium";
+              } else {
+                action  = `Time to sow ${crop.name} — sow indoors for an earlier start or direct sow outdoors`;
+                urgency = "medium";
+              }
             }
+
             const task = {
               user_id:          crop.user_id,
               crop_instance_id: crop.id,
               area_id:          crop.area_id,
               action,
               task_type:        "sow",
-              urgency:          "medium",
+              urgency,
               due_date:         todayISO(),
               source:           "rule_engine",
               rule_id:          "sow_prompt",
               date_confidence:  "exact",
             };
-            console.log(`[RuleEngine] Generating sow task for ${crop.name}`);
             newTasks.push({ ...task, crop_name: crop.name, rule_id: "sow_prompt" });
             if (!this.dryRun && this.supabase) {
               await this._persistTaskWithKey(task, crop, "sow_prompt");
             }
-          } else {
-            console.log(`[RuleEngine] Sow prompt for ${crop.name} on cooldown`);
           }
         }
         continue;
@@ -374,7 +403,7 @@ class RuleEngine {
       if (!loc.postcode) continue;
       const { data: cached } = await this.supabase
         .from("weather_cache")
-        .select("temp_c, frost_risk, rain_mm, condition")
+        .select("temp_c, frost_risk, frost_risk_7day, rain_mm, condition")
         .eq("postcode", loc.postcode)
         .gt("expires_at", new Date().toISOString())
         .single();
