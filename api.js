@@ -895,6 +895,77 @@ app.delete("/feeds/:id", requireAuth, async (req, res) => {
 });
 
 
+
+// =============================================================================
+// PHOTO UPLOADS
+// Profile, location, and area photos stored in Supabase Storage.
+// All photos are base64 encoded on upload, stored privately, served via signed URLs.
+// =============================================================================
+
+async function uploadPhoto(bucket, path, base64, mimeType) {
+  const buffer = Buffer.from(base64, "base64");
+  const { error } = await supabaseService.storage
+    .from(bucket)
+    .upload(path, buffer, { contentType: mimeType || "image/jpeg", upsert: true });
+  if (error) throw new Error(error.message);
+
+  // Generate a long-lived signed URL (10 years)
+  const { data } = await supabaseService.storage
+    .from(bucket)
+    .createSignedUrl(path, 60 * 60 * 24 * 365 * 10);
+  return data.signedUrl;
+}
+
+// POST /photos/profile — upload profile photo
+app.post("/photos/profile", requireAuth, async (req, res) => {
+  const { base64, mime_type } = req.body;
+  if (!base64) return res.status(400).json({ error: "base64 required" });
+  try {
+    const path = `${req.user.id}/profile.jpg`;
+    const url  = await uploadPhoto("profile-photos", path, base64, mime_type);
+    await req.db.from("profiles")
+      .update({ photo_url: url, updated_at: new Date().toISOString() })
+      .eq("id", req.user.id);
+    res.json({ photo_url: url });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /photos/location/:id — upload location photo
+app.post("/photos/location/:id", requireAuth, async (req, res) => {
+  const { base64, mime_type } = req.body;
+  if (!base64) return res.status(400).json({ error: "base64 required" });
+  try {
+    const path = `${req.user.id}/location-${req.params.id}.jpg`;
+    const url  = await uploadPhoto("garden-photos", path, base64, mime_type);
+    await req.db.from("locations")
+      .update({ photo_url: url })
+      .eq("id", req.params.id)
+      .eq("user_id", req.user.id);
+    res.json({ photo_url: url });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /photos/area/:id — upload area photo
+app.post("/photos/area/:id", requireAuth, async (req, res) => {
+  const { base64, mime_type } = req.body;
+  if (!base64) return res.status(400).json({ error: "base64 required" });
+  try {
+    const path = `${req.user.id}/area-${req.params.id}.jpg`;
+    const url  = await uploadPhoto("garden-photos", path, base64, mime_type);
+    // Find area and verify ownership via location
+    const { data: area } = await req.db.from("growing_areas")
+      .select("id, location_id, locations(user_id)")
+      .eq("id", req.params.id)
+      .single();
+    if (!area || area.locations?.user_id !== req.user.id)
+      return res.status(403).json({ error: "Not authorised" });
+    await req.db.from("growing_areas")
+      .update({ photo_url: url })
+      .eq("id", req.params.id);
+    res.json({ photo_url: url });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // =============================================================================
 // HARVEST LOG
 // Users log harvests from the forecast screen. Photos stored in Supabase Storage.
@@ -1091,7 +1162,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     req.db.from("crop_instances")
       .select("id, name, variety, variety_id, sown_date, area_id, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, pest_window_start, pest_window_end, pest_notes)")
       .eq("user_id", req.user.id).eq("active", true),
-    req.db.from("profiles").select("name, plan, postcode").eq("id", req.user.id).single(),
+    req.db.from("profiles").select("name, plan, postcode, photo_url").eq("id", req.user.id).single(),
     req.db.from("harvest_log")
       .select("id, harvested_at, quantity_g, crop:crop_instance_id(name)")
       .eq("user_id", req.user.id)
@@ -1196,6 +1267,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
 
   res.json({
     user:             profile?.name,
+    profile_photo:    profile?.photo_url || null,
     plan:             profile?.plan || "free",
     tasks: {
       today:     tasks.filter(t => t.due_date === today),
