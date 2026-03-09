@@ -320,11 +320,17 @@ Respond ONLY with a JSON object — no markdown, no explanation. Use this exact 
   },
   "variety": {
     "name": "corrected variety name or null if not provided",
-    "classification": "e.g. Cherry, Maincrop, Heritage — or null",
+    "classification": "e.g. Cherry, Maincrop, Heritage, Earlybird, Maincrop, Late — or null",
     "days_to_maturity_min": 65,
     "days_to_maturity_max": 75,
-    "notes": "what makes this variety distinctive"
+    "sow_window_start": null,
+    "sow_window_end": null,
+    "transplant_window_start": null,
+    "transplant_window_end": null,
+    "notes": "what makes this variety distinctive, including any key timing differences from the base crop"
   }
+
+IMPORTANT: If this variety has meaningfully different sow or harvest timing from the base crop (e.g. a late maincrop variety vs an early variety), set sow_window_start/end on the variety. Otherwise leave as null to inherit from the crop definition.
 }
 
 If the crop is not valid, return:
@@ -396,6 +402,14 @@ Use null for any fields you don't have reliable data for. All month values are i
         sow_indoors_end:       cropData.sow_indoors_end,
         sow_direct_start:      cropData.sow_direct_start,
         sow_direct_end:        cropData.sow_direct_end,
+        // Map to rule engine columns
+        sow_window_start:      cropData.sow_direct_start || cropData.sow_indoors_start || null,
+        sow_window_end:        cropData.sow_direct_end   || cropData.sow_indoors_end   || null,
+        sow_method:            cropData.sow_direct_start && cropData.sow_indoors_start ? "either"
+                             : cropData.sow_direct_start ? "outdoors"
+                             : cropData.sow_indoors_start ? "indoors" : "either",
+        transplant_window_start: cropData.plant_out_start || null,
+        transplant_window_end:   cropData.plant_out_end   || null,
         plant_out_start:       cropData.plant_out_start,
         plant_out_end:         cropData.plant_out_end,
         harvest_month_start:   cropData.harvest_month_start,
@@ -431,14 +445,18 @@ Use null for any fields you don't have reliable data for. All month values are i
         console.log(`[Enrich] Variety "${varietyData.name}" already exists`);
       } else {
         const { data: newVar, error: varErr } = await db.from("varieties").insert({
-          crop_def_id:          cropDefId,
-          name:                 varietyData.name,
-          classification:       varietyData.classification || null,
-          days_to_maturity_min: varietyData.days_to_maturity_min || null,
-          days_to_maturity_max: varietyData.days_to_maturity_max || null,
-          notes:                varietyData.notes || null,
-          is_default:           false,
-          active:               true,
+          crop_def_id:             cropDefId,
+          name:                    varietyData.name,
+          classification:          varietyData.classification || null,
+          days_to_maturity_min:    varietyData.days_to_maturity_min || null,
+          days_to_maturity_max:    varietyData.days_to_maturity_max || null,
+          sow_window_start:        varietyData.sow_window_start || null,
+          sow_window_end:          varietyData.sow_window_end || null,
+          transplant_window_start: varietyData.transplant_window_start || null,
+          transplant_window_end:   varietyData.transplant_window_end || null,
+          notes:                   varietyData.notes || null,
+          is_default:              false,
+          active:                  true,
         }).select("id").single();
 
         if (varErr) throw new Error(`Variety insert failed: ${varErr.message}`);
