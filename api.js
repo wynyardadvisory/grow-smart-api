@@ -41,7 +41,13 @@ const supabaseService = createClient(
 // ── App ───────────────────────────────────────────────────────────────────────
 const app = express();
 app.use(helmet());
-app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
+const allowedOrigins = [
+  "https://vercro.com",
+  "https://www.vercro.com",
+  "https://grow-smart-frontend.vercel.app",
+  process.env.FRONTEND_URL,
+].filter(Boolean);
+app.use(cors({ origin: (origin, cb) => cb(null, !origin || allowedOrigins.includes(origin)) }));
 app.use(express.json());
 app.use(morgan("dev"));
 
