@@ -48,7 +48,7 @@ const allowedOrigins = [
   process.env.FRONTEND_URL,
 ].filter(Boolean);
 app.use(cors({ origin: (origin, cb) => cb(null, !origin || allowedOrigins.includes(origin)) }));
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 app.use(morgan("dev"));
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1058,7 +1058,7 @@ app.post("/photos/profile", requireAuth, async (req, res) => {
     const path = `${req.user.id}/profile.jpg`;
     const url  = await uploadPhoto("profile-photos", path, base64, mime_type);
     await req.db.from("profiles")
-      .update({ photo_url: url, updated_at: new Date().toISOString() })
+      .update({ photo_url: url })
       .eq("id", req.user.id);
     res.json({ photo_url: url });
   } catch (e) { res.status(500).json({ error: e.message }); }
