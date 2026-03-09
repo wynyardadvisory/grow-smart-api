@@ -583,6 +583,10 @@ app.post("/crops", requireAuth,
     }
 
     await runRuleEngine(req.user.id);
+
+    // Clear planting suggestions for this area — bed is no longer empty
+    if (data.area_id) await clearSuggestions(data.area_id, req.db);
+
     res.status(201).json({ ...data, enriching: needsEnrichment });
   }
 );
@@ -895,6 +899,138 @@ app.delete("/feeds/:id", requireAuth, async (req, res) => {
 });
 
 
+
+
+// =============================================================================
+// PLANTING SUGGESTIONS
+// AI-powered suggestions for empty beds. Stored per area, cleared when a crop
+// is added. One generation per empty bed per planting cycle.
+// =============================================================================
+
+app.get("/areas/:id/suggestions", requireAuth, async (req, res) => {
+  // Verify ownership
+  const { data: area } = await req.db.from("growing_areas")
+    .select("id, name, type, location_id, locations(user_id)")
+    .eq("id", req.params.id).single();
+  if (!area || area.locations?.user_id !== req.user.id)
+    return res.status(403).json({ error: "Not authorised" });
+
+  const { data } = await req.db.from("planting_suggestions")
+    .select("*").eq("area_id", req.params.id).single();
+
+  res.json(data || null);
+});
+
+app.post("/areas/:id/suggestions/generate", requireAuth, async (req, res) => {
+  const db = req.db;
+
+  // Verify ownership + get area details
+  const { data: area } = await db.from("growing_areas")
+    .select("id, name, type, location_id, locations(user_id, postcode)")
+    .eq("id", req.params.id).single();
+  if (!area || area.locations?.user_id !== req.user.id)
+    return res.status(403).json({ error: "Not authorised" });
+
+  // Check area is actually empty
+  const { data: activeCrops } = await db.from("crop_instances")
+    .select("id").eq("area_id", req.params.id).eq("active", true)
+    .not("status", "eq", "harvested");
+  if (activeCrops?.length > 0)
+    return res.status(400).json({ error: "Area is not empty" });
+
+  // Check suggestions don't already exist
+  const { data: existing } = await db.from("planting_suggestions")
+    .select("id").eq("area_id", req.params.id).single();
+  if (existing)
+    return res.status(400).json({ error: "Suggestions already exist", existing });
+
+  // Get crop history for this area
+  const { data: history } = await db.from("crop_instances")
+    .select("name, variety, status, harvested_at")
+    .eq("area_id", req.params.id)
+    .eq("active", false)
+    .order("created_at", { ascending: false })
+    .limit(6);
+
+  // Get what user is growing elsewhere (to avoid duplication)
+  const { data: allCrops } = await db.from("crop_instances")
+    .select("name").eq("user_id", req.user.id).eq("active", true);
+
+  const month      = new Date().toLocaleString("en-GB", { month: "long" });
+  const areaType   = area.type?.replace(/_/g, " ") || "growing area";
+  const postcode   = area.locations?.postcode || "UK";
+  const historyStr = history?.length
+    ? history.map(c => `${c.name}${c.variety ? " (" + c.variety + ")" : ""}`).join(", ")
+    : "nothing previously recorded";
+  const currentStr = allCrops?.length
+    ? [...new Set(allCrops.map(c => c.name))].join(", ")
+    : "nothing currently";
+
+  try {
+    const prompt = `You are a UK horticultural expert advising a home grower or allotment holder.
+
+Area details:
+- Type: ${areaType}
+- Location postcode: ${postcode}
+- Current month: ${month}
+- Previously grown here: ${historyStr}
+- Currently growing elsewhere in their garden: ${currentStr}
+
+Suggest 4 crops that would be ideal to plant in this area right now, considering:
+1. Seasonality — what can realistically be sown or planted in ${month} in the UK
+2. Crop rotation — avoid repeating the same crop family as what was previously grown
+3. Companion planting — note any positive interactions with what they're already growing
+4. Variety of food types to keep the garden interesting
+
+Respond ONLY with a JSON array — no markdown, no explanation:
+[
+  {
+    "crop": "Crop name",
+    "reason": "One sentence why this is ideal right now for this area",
+    "rotation_note": "Brief rotation benefit or null",
+    "sow_note": "When/how to sow in one sentence",
+    "companion_note": "Companion benefit with existing crops or null"
+  }
+]`;
+
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1000,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+
+    const raw  = await response.json();
+    const text = raw.content?.[0]?.text || "";
+    const match = text.match(/\[[\s\S]*\]/);
+    if (!match) throw new Error("No JSON array in response");
+    const suggestions = JSON.parse(match[0]);
+
+    // Store suggestions
+    await db.from("planting_suggestions").upsert({
+      area_id:      req.params.id,
+      suggestions,
+      generated_at: new Date().toISOString(),
+    }, { onConflict: "area_id" });
+
+    res.json({ suggestions, generated_at: new Date().toISOString() });
+  } catch (e) {
+    console.error("[Suggestions] Error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE suggestions when a crop is added to the area (called internally)
+async function clearSuggestions(areaId, db) {
+  await db.from("planting_suggestions").delete().eq("area_id", areaId);
+}
 
 // =============================================================================
 // PHOTO UPLOADS
