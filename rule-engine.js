@@ -260,8 +260,15 @@ class RuleEngine {
       }
 
       // ── GROWING CROPS: run normal rules ──────────────────────────────────────
-      // Skip crops with no sow date for rules that need it
-      crop.stage = inferStage(crop, effective);
+      // Only infer stage from sow date for seed-grown crops.
+      // Perennial/vegetative establishments (runner, tuber, crown, cane) keep
+      // whatever stage is stored in the database — inferring from sow_date
+      // would incorrectly reset them to 'seed'.
+      const vegEstablishments = ["runner", "tuber", "crown", "cane"];
+      const useStoredStage = vegEstablishments.includes(crop.crop_def?.default_establishment);
+      if (!useStoredStage) {
+        crop.stage = inferStage(crop, effective);
+      }
 
       for (const rule of rules) {
         // 1. Crop match — NULL means applies to all crops
