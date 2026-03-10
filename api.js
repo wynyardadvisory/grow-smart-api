@@ -1080,6 +1080,54 @@ async function clearSuggestions(areaId, db) {
 // Checks Open Food Facts + UPC Item DB, then falls back to Claude enrichment
 // =============================================================================
 
+// POST /barcode/scan-image — Claude Vision reads barcode photo
+app.post("/barcode/scan-image", requireAuth, async (req, res) => {
+  const { image, mode = "crop" } = req.body;
+  if (!image) return res.status(400).json({ error: "image required" });
+
+  try {
+    const prompt = mode === "crop"
+      ? `This is a photo of a seed packet or product. Look for a barcode number AND identify the product name, brand, crop type and variety if visible. Respond ONLY with JSON: {"found":true,"name":"Carrot","variety":"Nantes 2","brand":"Thompson & Morgan","barcode":"1234567890","description":"Short growing note","sow_window":"Mar - Jun","is_seed":true} If you cannot identify it: {"found":false}`
+      : `This is a photo of a garden feed or fertiliser product. Identify the product name, brand, NPK values, and form. Respond ONLY with JSON: {"found":true,"name":"Tomorite","brand":"Levington","product_name":"Tomorite Concentrated Tomato Food","form":"liquid","feed_type":"tomato","npk":"4-3-8","barcode":"1234567890","description":"Short description","is_feed":true} If you cannot identify it: {"found":false}`;
+
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 500,
+        messages: [{ role: "user", content: [
+          { type: "image", source: { type: "base64", media_type: "image/jpeg", data: image } },
+          { type: "text", text: prompt },
+        ]}],
+      }),
+    });
+
+    const raw  = await r.json();
+    const text = raw.content?.[0]?.text || "";
+    const m    = text.match(/\{[\s\S]*\}/);
+    if (!m) return res.json({ found: false });
+    const parsed = JSON.parse(m[0]);
+    if (!parsed.found) return res.json({ found: false });
+
+    // Store barcode against DB entry if identified
+    if (parsed.barcode) {
+      if (mode === "crop" && parsed.name) {
+        const { data: cropDef } = await supabaseService.from("crop_definitions").select("id").ilike("name", parsed.name).maybeSingle();
+        if (cropDef?.id) { await supabaseService.from("crop_definitions").update({ barcode: parsed.barcode }).eq("id", cropDef.id); parsed.crop_def_id = cropDef.id; }
+      } else if (mode === "feed" && parsed.product_name) {
+        const { data: feedEntry } = await supabaseService.from("feed_catalog").select("id").ilike("product_name", parsed.product_name).maybeSingle();
+        if (feedEntry?.id) await supabaseService.from("feed_catalog").update({ barcode: parsed.barcode }).eq("id", feedEntry.id);
+      }
+    }
+
+    res.json(parsed);
+  } catch (e) {
+    console.error("[ScanImage]", e.message);
+    res.json({ found: false });
+  }
+});
+
 app.get("/barcode/:code", requireAuth, async (req, res) => {
   const { code } = req.params;
   const mode = req.query.mode || "crop"; // "crop" or "feed"
