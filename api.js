@@ -1310,6 +1310,158 @@ app.post("/feedback", requireAuth, async (req, res) => {
   res.status(201).json(data);
 });
 
+// GET /admin/metrics — full founder dashboard
+app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const db = supabaseService; // service role for cross-table queries
+    const now = new Date();
+    const day7ago  = new Date(now - 7  * 86400000).toISOString();
+    const day28ago = new Date(now - 28 * 86400000).toISOString();
+    const day1ago  = new Date(now - 1  * 86400000).toISOString();
+
+    const [
+      // User growth
+      { count: totalUsers },
+      { count: newUsersWeek },
+      { count: newUsersLastWeek },
+
+      // Engagement
+      { data: wauData },
+      { data: dauData },
+
+      // Garden usage
+      { count: totalLocations },
+      { count: totalAreas },
+      { count: totalCrops },
+
+      // Crop lifecycle
+      { count: cropsSown },
+      { count: cropsHarvested },
+      { count: harvestLogs },
+
+      // Task engine
+      { count: tasksGenerated },
+      { count: tasksCompleted },
+
+      // Feeds
+      { count: totalFeeds },
+
+      // Photos
+      { count: totalPhotos },
+
+      // Dataset
+      { count: totalVarieties },
+      { count: yieldDataPoints },
+
+    ] = await Promise.all([
+      db.from("profiles").select("*", { count: "exact", head: true }),
+      db.from("profiles").select("*", { count: "exact", head: true }).gte("created_at", day7ago),
+      db.from("profiles").select("*", { count: "exact", head: true }).gte("created_at", day28ago).lt("created_at", day7ago),
+
+      db.from("crop_instances").select("user_id").gte("updated_at", day7ago),
+      db.from("crop_instances").select("user_id").gte("updated_at", day1ago),
+
+      db.from("locations").select("*", { count: "exact", head: true }),
+      db.from("growing_areas").select("*", { count: "exact", head: true }),
+      db.from("crop_instances").select("*", { count: "exact", head: true }),
+
+      db.from("crop_instances").select("*", { count: "exact", head: true }).not("sown_date", "is", null),
+      db.from("crop_instances").select("*", { count: "exact", head: true }).eq("status", "harvested"),
+      db.from("harvest_log").select("*", { count: "exact", head: true }),
+
+      db.from("tasks").select("*", { count: "exact", head: true }),
+      db.from("tasks").select("*", { count: "exact", head: true }).eq("status", "completed"),
+
+      db.from("user_feeds").select("*", { count: "exact", head: true }),
+
+      db.from("crop_photos").select("*", { count: "exact", head: true }),
+
+      db.from("varieties").select("*", { count: "exact", head: true }),
+      db.from("harvest_log").select("*", { count: "exact", head: true }).not("quantity_value", "is", null),
+    ]);
+
+    // Unique active users
+    const wau = new Set((wauData || []).map(r => r.user_id)).size;
+    const dau = new Set((dauData || []).map(r => r.user_id)).size;
+
+    // Retention: users who signed up 7+ days ago and were active in last 7 days
+    const { data: oldUsers } = await db.from("profiles").select("id").lt("created_at", day7ago);
+    const oldUserIds = new Set((oldUsers || []).map(u => u.id));
+    const { data: recentActivity } = await db.from("crop_instances").select("user_id").gte("updated_at", day7ago);
+    const retainedWeek1 = (recentActivity || []).filter(r => oldUserIds.has(r.user_id));
+    const week1Retention = oldUserIds.size > 0 ? Math.round((new Set(retainedWeek1.map(r => r.user_id)).size / oldUserIds.size) * 100) : null;
+
+    // Week 4 retention
+    const { data: users28ago } = await db.from("profiles").select("id").lt("created_at", day28ago);
+    const users28agoIds = new Set((users28ago || []).map(u => u.id));
+    const retained28 = (recentActivity || []).filter(r => users28agoIds.has(r.user_id));
+    const week4Retention = users28agoIds.size > 0 ? Math.round((new Set(retained28.map(r => r.user_id)).size / users28agoIds.size) * 100) : null;
+
+    // Activation: users who added at least one crop
+    const { data: activatedUsers } = await db.from("crop_instances").select("user_id");
+    const activatedCount = new Set((activatedUsers || []).map(r => r.user_id)).size;
+    const activationRate = totalUsers > 0 ? Math.round((activatedCount / totalUsers) * 100) : 0;
+
+    // Average crops per user
+    const avgCropsPerUser = totalUsers > 0 ? (totalCrops / totalUsers).toFixed(1) : 0;
+
+    // Task completion rate
+    const taskCompletionRate = tasksGenerated > 0 ? Math.round((tasksCompleted / tasksGenerated) * 100) : 0;
+
+    // Week on week growth
+    const wowGrowth = newUsersLastWeek > 0 ? Math.round(((newUsersWeek - newUsersLastWeek) / newUsersLastWeek) * 100) : null;
+
+    // Average feeds per user
+    const avgFeedsPerUser = totalUsers > 0 ? (totalFeeds / totalUsers).toFixed(1) : 0;
+
+    res.json({
+      // User growth
+      totalUsers,
+      newUsersWeek,
+      wowGrowth,
+
+      // Engagement
+      wau,
+      dau,
+      dauWauRatio: wau > 0 ? (dau / wau).toFixed(2) : null,
+
+      // Garden usage
+      totalLocations,
+      totalAreas,
+      totalCrops,
+      avgCropsPerUser,
+      activationRate,
+      activatedCount,
+
+      // Crop lifecycle
+      cropsSown,
+      cropsHarvested,
+      harvestLogs,
+
+      // Tasks
+      tasksGenerated,
+      tasksCompleted,
+      taskCompletionRate,
+
+      // Feeds & photos
+      totalFeeds,
+      avgFeedsPerUser,
+      totalPhotos,
+
+      // Retention
+      week1Retention,
+      week4Retention,
+
+      // Dataset
+      totalVarieties,
+      yieldDataPoints,
+    });
+  } catch (e) {
+    console.error("[Metrics]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /admin/feedback — admin only
 app.get("/admin/feedback", requireAuth, requireAdmin, async (req, res) => {
   const { data, error } = await req.db
