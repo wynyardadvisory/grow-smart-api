@@ -1060,6 +1060,105 @@ async function clearSuggestions(areaId, db) {
 }
 
 // =============================================================================
+// BARCODE LOOKUP
+// Checks Open Food Facts + UPC Item DB, then falls back to Claude enrichment
+// =============================================================================
+
+app.get("/barcode/:code", requireAuth, async (req, res) => {
+  const { code } = req.params;
+  const mode = req.query.mode || "crop"; // "crop" or "feed"
+
+  try {
+    // 1. Check our own database first — crop_definitions for crops, feed_catalog for feeds
+    if (mode === "crop") {
+      const { data: existing } = await req.db
+        .from("crop_definitions")
+        .select("id, name, description, sow_window_start, sow_window_end")
+        .eq("barcode", code)
+        .single();
+      if (existing) {
+        const monthNames = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+        return res.json({
+          found: true,
+          source: "vercro",
+          crop_def_id: existing.id,
+          name: existing.name,
+          description: existing.description,
+          sow_window: existing.sow_window_start
+            ? `${monthNames[existing.sow_window_start-1]} – ${monthNames[existing.sow_window_end-1]}`
+            : null,
+        });
+      }
+    } else {
+      const { data: existing } = await req.db
+        .from("feed_catalog")
+        .select("*")
+        .eq("barcode", code)
+        .single();
+      if (existing) return res.json({ found: true, source: "vercro", ...existing });
+    }
+
+    // 2. Try Open Food Facts (good for garden products in UK)
+    const offRes = await fetch(`https://world.openfoodfacts.org/api/v0/product/${code}.json`);
+    const offData = await offRes.json();
+    if (offData.status === 1 && offData.product) {
+      const p = offData.product;
+      const name = p.product_name_en || p.product_name || p.generic_name || null;
+      if (name) {
+        // Use Claude to interpret whether it's a seed packet or feed
+        const profile = await enrichBarcodeWithClaude(name, p.brands || null, mode, code);
+        return res.json({ found: true, source: "openfoodfacts", ...profile });
+      }
+    }
+
+    // 3. Try UPC Item DB (free tier)
+    const upcRes = await fetch(`https://api.upcitemdb.com/prod/trial/lookup?upc=${code}`);
+    const upcData = await upcRes.json();
+    if (upcData.code === "OK" && upcData.items?.length > 0) {
+      const item = upcData.items[0];
+      const name = item.title || item.brand || null;
+      if (name) {
+        const profile = await enrichBarcodeWithClaude(name, item.brand || null, mode, code);
+        return res.json({ found: true, source: "upcitemdb", ...profile });
+      }
+    }
+
+    // 4. Not found in any database
+    res.json({ found: false, barcode: code });
+
+  } catch (e) {
+    console.error("[Barcode]", e.message);
+    res.json({ found: false, barcode: code, error: e.message });
+  }
+});
+
+async function enrichBarcodeWithClaude(productName, brand, mode, barcode) {
+  const prompt = mode === "crop"
+    ? `A UK gardener scanned a barcode. Product: "${productName}"${brand ? ` by ${brand}` : ""}. 
+Is this a seed packet? If yes, identify the crop and variety. If it is NOT a seed packet, say so.
+Respond ONLY with JSON: {"is_seed":true,"name":"Carrot","variety":"Nantes 2","description":"Brief growing note","sow_window":"Mar - Jun","brand":"${brand||""}"}`
+    : `A UK gardener scanned a barcode. Product: "${productName}"${brand ? ` by ${brand}` : ""}.
+Is this a garden feed or fertiliser? If yes, identify it. If NOT, say so.
+Respond ONLY with JSON: {"is_feed":true,"name":"Product name","brand":"${brand||""}","product_name":"${productName}","form":"liquid","feed_type":"tomato","npk":"4-3-8","description":"Brief description"}`;
+
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 400, messages: [{ role: "user", content: prompt }] }),
+  });
+  const raw  = await r.json();
+  const text = raw.content?.[0]?.text || "";
+  const m    = text.match(/\{[\s\S]*\}/);
+  if (!m) return { name: productName, brand };
+  const parsed = JSON.parse(m[0]);
+  // Store barcode against product for future lookups
+  if (mode === "crop" && parsed.is_seed && parsed.name) {
+    // Will be stored when crop is actually added
+  }
+  return { ...parsed, barcode };
+}
+
+// =============================================================================
 // FEEDBACK
 // =============================================================================
 
