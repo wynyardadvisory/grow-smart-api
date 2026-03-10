@@ -1087,8 +1087,8 @@ app.post("/barcode/scan-image", requireAuth, async (req, res) => {
 
   try {
     const prompt = mode === "crop"
-      ? `This is a photo of a seed packet or product. Look for a barcode number AND identify the product name, brand, crop type and variety if visible. Respond ONLY with JSON: {"found":true,"name":"Carrot","variety":"Nantes 2","brand":"Thompson & Morgan","barcode":"1234567890","description":"Short growing note","sow_window":"Mar - Jun","is_seed":true} If you cannot identify it: {"found":false}`
-      : `This is a photo of a garden feed or fertiliser product. Identify the product name, brand, NPK values, and form. Respond ONLY with JSON: {"found":true,"name":"Tomorite","brand":"Levington","product_name":"Tomorite Concentrated Tomato Food","form":"liquid","feed_type":"tomato","npk":"4-3-8","barcode":"1234567890","description":"Short description","is_feed":true} If you cannot identify it: {"found":false}`;
+      ? `This is a photo of a seed packet. Identify the crop name, variety, and brand from the text visible on the packet. Respond ONLY with JSON: {"found":true,"name":"Carrot","variety":"Nantes 2","brand":"Thompson & Morgan","description":"Short growing note","sow_window":"Mar - Jun","is_seed":true} If you cannot identify a crop: {"found":false}`
+      : `This is a photo of a garden feed or fertiliser product. Identify the product name, brand, NPK values, and form from the text on the packaging. Respond ONLY with JSON: {"found":true,"name":"Tomorite","brand":"Levington","product_name":"Tomorite Concentrated Tomato Food","form":"liquid","feed_type":"tomato","npk":"4-3-8","description":"Short description","is_feed":true} If you cannot identify it: {"found":false}`;
 
     const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
