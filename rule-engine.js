@@ -230,15 +230,50 @@ class RuleEngine {
       if (cropStatus === "sown_indoors") {
         const txStart = crop.crop_def?.transplant_window_start;
         const txEnd   = crop.crop_def?.transplant_window_end;
+        const isTuber = crop.crop_def?.sow_method === "tuber"; // potatoes, etc.
+
+        // ── Chitting tip for tubers (Jan–Feb, while still indoors) ──
+        if (isTuber && m >= 1 && m <= 2) {
+          const chitKey  = `${crop.id}:chitting_tip`;
+          const lastChit = recentLog.get(chitKey);
+          if (!lastChit || (Date.now() - lastChit.getTime()) >= 14 * 86400000) {
+            const task = {
+              user_id:          crop.user_id,
+              crop_instance_id: crop.id,
+              area_id:          crop.area_id,
+              action:           `${crop.name} chitting tip — stand seed potatoes rose-end up in egg boxes in a cool, light frost-free spot. Short stubby chits (2cm) are ideal before planting out`,
+              task_type:        "info",
+              urgency:          "low",
+              due_date:         todayISO(),
+              source:           "rule_engine",
+              rule_id:          "chitting_tip",
+              date_confidence:  "approximate",
+              meta:             JSON.stringify({ tip: true }),
+            };
+            newTasks.push({ ...task, crop_name: crop.name, rule_id: "chitting_tip" });
+            if (!this.dryRun && this.supabase) {
+              await this._persistTaskWithKey(task, crop, "chitting_tip");
+            }
+          }
+        }
+
+        // ── Plant out task (transplant window, frost-aware) ──
         if (txStart && txEnd && m >= txStart && m <= txEnd) {
           const frostRisk  = weather?.frost_risk === true;
           const logKey     = `${crop.id}:transplant_prompt`;
           const lastRun    = recentLog.get(logKey);
           const cooldown   = frostRisk ? 3 * 86400000 : 7 * 86400000;
           if (!lastRun || (Date.now() - lastRun.getTime()) >= cooldown) {
-            const action = frostRisk
-              ? `${crop.name} is ready to transplant but frost is forecast — hold off a few more days`
-              : `Time to transplant ${crop.name} outdoors — frosts should now be clear`;
+            let action;
+            if (isTuber) {
+              action = frostRisk
+                ? `${crop.name} are ready to plant out but frost is forecast — hold off a few more days to protect emerging shoots`
+                : `Time to plant out your ${crop.name} — chits look good, frosts should now be clear. Plant 10–15cm deep, 30cm apart`;
+            } else {
+              action = frostRisk
+                ? `${crop.name} is ready to transplant but frost is forecast — hold off a few more days`
+                : `Time to transplant ${crop.name} outdoors — frosts should now be clear`;
+            }
             const task = {
               user_id:          crop.user_id,
               crop_instance_id: crop.id,
