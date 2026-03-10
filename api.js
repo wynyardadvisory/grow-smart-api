@@ -1319,11 +1319,15 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
     const day28ago = new Date(now - 28 * 86400000).toISOString();
     const day1ago  = new Date(now - 1  * 86400000).toISOString();
 
+    // User growth — auth users (everyone) vs profiles (completed onboarding)
+    const { data: { users: authUsers } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
+    const totalSignups   = authUsers.length;
+    const newSignupsWeek = authUsers.filter(u => new Date(u.created_at) >= new Date(day7ago)).length;
+    const newSignupsLastWeek = authUsers.filter(u => new Date(u.created_at) >= new Date(day28ago) && new Date(u.created_at) < new Date(day7ago)).length;
+
     const [
-      // User growth
-      { count: totalUsers },
-      { count: newUsersWeek },
-      { count: newUsersLastWeek },
+      // Activated (completed onboarding = have a profile)
+      { count: totalActivated },
 
       // Engagement
       { data: wauData },
@@ -1355,8 +1359,6 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
 
     ] = await Promise.all([
       db.from("profiles").select("*", { count: "exact", head: true }),
-      db.from("profiles").select("*", { count: "exact", head: true }).gte("created_at", day7ago),
-      db.from("profiles").select("*", { count: "exact", head: true }).gte("created_at", day28ago).lt("created_at", day7ago),
 
       db.from("crop_instances").select("user_id").gte("updated_at", day7ago),
       db.from("crop_instances").select("user_id").gte("updated_at", day1ago),
@@ -1385,40 +1387,38 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
     const dau = new Set((dauData || []).map(r => r.user_id)).size;
 
     // Retention: users who signed up 7+ days ago and were active in last 7 days
-    const { data: oldUsers } = await db.from("profiles").select("id").lt("created_at", day7ago);
-    const oldUserIds = new Set((oldUsers || []).map(u => u.id));
+    const oldUserIds = new Set(authUsers.filter(u => new Date(u.created_at) < new Date(day7ago)).map(u => u.id));
     const { data: recentActivity } = await db.from("crop_instances").select("user_id").gte("updated_at", day7ago);
     const retainedWeek1 = (recentActivity || []).filter(r => oldUserIds.has(r.user_id));
     const week1Retention = oldUserIds.size > 0 ? Math.round((new Set(retainedWeek1.map(r => r.user_id)).size / oldUserIds.size) * 100) : null;
 
     // Week 4 retention
-    const { data: users28ago } = await db.from("profiles").select("id").lt("created_at", day28ago);
-    const users28agoIds = new Set((users28ago || []).map(u => u.id));
+    const users28agoIds = new Set(authUsers.filter(u => new Date(u.created_at) < new Date(day28ago)).map(u => u.id));
     const retained28 = (recentActivity || []).filter(r => users28agoIds.has(r.user_id));
     const week4Retention = users28agoIds.size > 0 ? Math.round((new Set(retained28.map(r => r.user_id)).size / users28agoIds.size) * 100) : null;
 
-    // Activation: users who added at least one crop
-    const { data: activatedUsers } = await db.from("crop_instances").select("user_id");
-    const activatedCount = new Set((activatedUsers || []).map(r => r.user_id)).size;
-    const activationRate = totalUsers > 0 ? Math.round((activatedCount / totalUsers) * 100) : 0;
+    // Activation: users who completed onboarding (have a profile)
+    const activationRate = totalSignups > 0 ? Math.round((totalActivated / totalSignups) * 100) : 0;
 
-    // Average crops per user
-    const avgCropsPerUser = totalUsers > 0 ? (totalCrops / totalUsers).toFixed(1) : 0;
+    // Average crops per activated user
+    const avgCropsPerUser = totalActivated > 0 ? (totalCrops / totalActivated).toFixed(1) : 0;
 
     // Task completion rate
     const taskCompletionRate = tasksGenerated > 0 ? Math.round((tasksCompleted / tasksGenerated) * 100) : 0;
 
     // Week on week growth
-    const wowGrowth = newUsersLastWeek > 0 ? Math.round(((newUsersWeek - newUsersLastWeek) / newUsersLastWeek) * 100) : null;
+    const wowGrowth = newSignupsLastWeek > 0 ? Math.round(((newSignupsWeek - newSignupsLastWeek) / newSignupsLastWeek) * 100) : null;
 
     // Average feeds per user
-    const avgFeedsPerUser = totalUsers > 0 ? (totalFeeds / totalUsers).toFixed(1) : 0;
+    const avgFeedsPerUser = totalActivated > 0 ? (totalFeeds / totalActivated).toFixed(1) : 0;
 
     res.json({
       // User growth
-      totalUsers,
-      newUsersWeek,
+      totalSignups,
+      totalActivated,
+      newSignupsWeek,
       wowGrowth,
+      activationRate,
 
       // Engagement
       wau,
@@ -1430,8 +1430,6 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
       totalAreas,
       totalCrops,
       avgCropsPerUser,
-      activationRate,
-      activatedCount,
 
       // Crop lifecycle
       cropsSown,
