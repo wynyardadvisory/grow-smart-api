@@ -569,6 +569,7 @@ app.post("/crops", requireAuth,
       establishment_method, quantity, notes,
       start_date_confidence, source, status,
       is_other_crop, is_other_variety,
+      barcode,
     } = req.body;
 
     // Derive location_id from area
@@ -600,6 +601,12 @@ app.post("/crops", requireAuth,
     }).select().single();
 
     if (error) return res.status(500).json({ error: error.message });
+
+    // Save barcode against crop_def for instant future lookups
+    if (barcode && crop_def_id) {
+      await req.db.from("crop_definitions")
+        .update({ barcode }).eq("id", crop_def_id);
+    }
 
     // Trigger enrichment if:
     // - crop is unknown (no crop_def_id), OR
@@ -889,7 +896,16 @@ app.post("/feeds", requireAuth,
     if (!validate(req, res)) return;
     const { brand, product_name, form, notes, feed_type, npk,
             dilution_ml_per_litre, frequency_days, suitable_crop_types,
-            application_method, pre_enriched } = req.body;
+            application_method, pre_enriched, barcode } = req.body;
+
+    // Save barcode against feed_catalog entry for instant future lookups
+    if (barcode && brand && product_name) {
+      const { data: catEntry } = await req.db.from("feed_catalog")
+        .select("id").eq("brand", brand).ilike("product_name", product_name).maybeSingle();
+      if (catEntry?.id) {
+        await req.db.from("feed_catalog").update({ barcode }).eq("id", catEntry.id);
+      }
+    }
 
     const { data, error } = await req.db.from("user_feeds").insert({
       user_id:               req.user.id,
@@ -1151,9 +1167,20 @@ Respond ONLY with JSON: {"is_feed":true,"name":"Product name","brand":"${brand||
   const m    = text.match(/\{[\s\S]*\}/);
   if (!m) return { name: productName, brand };
   const parsed = JSON.parse(m[0]);
-  // Store barcode against product for future lookups
+  // Store barcode against crop_def / feed_catalog for instant future lookups
   if (mode === "crop" && parsed.is_seed && parsed.name) {
-    // Will be stored when crop is actually added
+    const { data: cropDef } = await supabaseService
+      .from("crop_definitions").select("id").ilike("name", parsed.name).maybeSingle();
+    if (cropDef?.id) {
+      await supabaseService.from("crop_definitions").update({ barcode: code }).eq("id", cropDef.id);
+      parsed.crop_def_id = cropDef.id;
+    }
+  } else if (mode === "feed" && parsed.is_feed && parsed.product_name) {
+    const { data: feedEntry } = await supabaseService
+      .from("feed_catalog").select("id").ilike("product_name", parsed.product_name).maybeSingle();
+    if (feedEntry?.id) {
+      await supabaseService.from("feed_catalog").update({ barcode: code }).eq("id", feedEntry.id);
+    }
   }
   return { ...parsed, barcode };
 }
