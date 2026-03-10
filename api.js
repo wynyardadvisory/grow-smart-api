@@ -1112,39 +1112,35 @@ app.post("/admin/crop-queue/:id/reject", requireAuth, requireAdmin, async (req, 
 
 // GET /admin/users — all users with crop counts and last seen
 app.get("/admin/users", requireAuth, requireAdmin, async (req, res) => {
-  const { data: profiles } = await req.db
-    .from("profiles")
-    .select("id, name, email, created_at")
-    .order("created_at", { ascending: false });
+  // Use service role to access auth.users — covers users who never completed onboarding
+  const { data: authUsers } = await supabaseService.auth.admin.listUsers();
+  const users = authUsers?.users || [];
 
-  if (!profiles) return res.json([]);
+  // Get profiles for name lookup
+  const { data: profiles } = await req.db.from("profiles").select("id, name");
+  const profileMap = {};
+  (profiles || []).forEach(p => { profileMap[p.id] = p.name; });
 
   // Get crop counts per user
-  const { data: crops } = await req.db
-    .from("crop_instances")
-    .select("user_id")
-    .eq("active", true);
-
+  const { data: crops } = await req.db.from("crop_instances").select("user_id").eq("active", true);
   const cropCounts = {};
   (crops || []).forEach(c => { cropCounts[c.user_id] = (cropCounts[c.user_id] || 0) + 1; });
 
   // Get last task completion per user
-  const { data: tasks } = await req.db
-    .from("tasks")
-    .select("user_id, completed_at")
-    .eq("completed", true)
-    .order("completed_at", { ascending: false });
-
+  const { data: tasks } = await req.db.from("tasks").select("user_id, completed_at").eq("completed", true).order("completed_at", { ascending: false });
   const lastSeen = {};
-  (tasks || []).forEach(t => {
-    if (!lastSeen[t.user_id]) lastSeen[t.user_id] = t.completed_at;
-  });
+  (tasks || []).forEach(t => { if (!lastSeen[t.user_id]) lastSeen[t.user_id] = t.completed_at; });
 
-  const result = profiles.map(p => ({
-    ...p,
-    crop_count: cropCounts[p.id] || 0,
-    last_seen:  lastSeen[p.id]   || null,
-  }));
+  const result = users
+    .sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
+    .map(u => ({
+      id:         u.id,
+      email:      u.email,
+      name:       profileMap[u.id] || null,
+      created_at: u.created_at,
+      crop_count: cropCounts[u.id] || 0,
+      last_seen:  lastSeen[u.id]   || null,
+    }));
 
   res.json(result);
 });
