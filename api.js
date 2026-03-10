@@ -532,6 +532,33 @@ app.get("/crops/:id", requireAuth, async (req, res) => {
   res.json(data);
 });
 
+// POST /crops/preview — AI crop profile for confirmation screen
+app.post("/crops/preview", requireAuth, async (req, res) => {
+  const { name, variety } = req.body;
+  if (!name) return res.status(400).json({ error: "name required" });
+  try {
+    const label = name + (variety ? ` (${variety})` : "");
+    const prompt = `You are a UK horticultural expert. Build a concise growing profile for: ${label}
+
+Respond ONLY with a JSON object, no markdown:
+{"name":"Canonical crop name","description":"2 sentence description for UK home growers","sow_window":"e.g. Mar - May or null","harvest_window":"e.g. Jul - Sep or null","spacing_cm":25,"days_to_maturity":"60-80 days or null","sow_method":"indoors or outdoors or both or null","feeding_notes":"Brief feeding guidance or null","companion_plants":"2-3 companions or null","common_issues":"2-3 common problems or null","known":false}`;
+
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 600, messages: [{ role: "user", content: prompt }] }),
+    });
+    const raw  = await r.json();
+    const text = raw.content?.[0]?.text || "";
+    const m    = text.match(/\{[\s\S]*\}/);
+    if (!m) throw new Error("No JSON in response");
+    res.json(JSON.parse(m[0]));
+  } catch (e) {
+    console.error("[Preview]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/crops", requireAuth,
   [body("area_id").isUUID(), body("name").trim().notEmpty()],
   async (req, res) => {
