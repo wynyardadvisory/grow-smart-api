@@ -1076,6 +1076,65 @@ async function clearSuggestions(areaId, db) {
 }
 
 // =============================================================================
+// CROP PHOTOS — growth diary
+// =============================================================================
+
+// GET /crops/:id/photos
+app.get("/crops/:id/photos", requireAuth, async (req, res) => {
+  const { data, error } = await req.db.from("crop_photos")
+    .select("*")
+    .eq("crop_instance_id", req.params.id)
+    .eq("user_id", req.user.id)
+    .order("taken_at", { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// POST /crops/:id/photos
+app.post("/crops/:id/photos", requireAuth, async (req, res) => {
+  const { base64, caption } = req.body;
+  if (!base64) return res.status(400).json({ error: "base64 image required" });
+
+  // Verify crop belongs to user
+  const { data: crop } = await req.db.from("crop_instances")
+    .select("id").eq("id", req.params.id).eq("user_id", req.user.id).single();
+  if (!crop) return res.status(404).json({ error: "Crop not found" });
+
+  try {
+    const buffer   = Buffer.from(base64, "base64");
+    const filename = `${req.user.id}/${req.params.id}/${Date.now()}.jpg`;
+    const { error: uploadErr } = await supabaseService.storage
+      .from("crop-photos").upload(filename, buffer, { contentType: "image/jpeg", upsert: false });
+    if (uploadErr) throw new Error(uploadErr.message);
+
+    const { data: { publicUrl } } = supabaseService.storage
+      .from("crop-photos").getPublicUrl(filename);
+
+    const { data, error } = await req.db.from("crop_photos").insert({
+      crop_instance_id: req.params.id,
+      user_id:          req.user.id,
+      photo_url:        publicUrl,
+      caption:          caption?.trim() || null,
+    }).select().single();
+
+    if (error) throw new Error(error.message);
+    res.status(201).json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /crops/:id/photos/:photoId
+app.delete("/crops/:id/photos/:photoId", requireAuth, async (req, res) => {
+  const { error } = await req.db.from("crop_photos")
+    .delete()
+    .eq("id", req.params.photoId)
+    .eq("user_id", req.user.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ deleted: true });
+});
+
+// =============================================================================
 // BARCODE LOOKUP
 // Checks Open Food Facts + UPC Item DB, then falls back to Claude enrichment
 // =============================================================================
