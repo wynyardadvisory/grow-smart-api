@@ -1060,6 +1060,34 @@ async function clearSuggestions(areaId, db) {
 }
 
 // =============================================================================
+// FEEDBACK
+// =============================================================================
+
+// POST /feedback
+app.post("/feedback", requireAuth, async (req, res) => {
+  const { category, message, rating } = req.body;
+  if (!category || !message?.trim()) return res.status(400).json({ error: "category and message required" });
+  const { data, error } = await req.db.from("feedback").insert({
+    user_id:  req.user.id,
+    category: category,
+    message:  message.trim(),
+    rating:   rating || null,
+  }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
+});
+
+// GET /admin/feedback — admin only
+app.get("/admin/feedback", requireAuth, requireAdmin, async (req, res) => {
+  const { data, error } = await req.db
+    .from("feedback")
+    .select("*, profiles(name, email)")
+    .order("created_at", { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// =============================================================================
 // ADMIN ENDPOINTS — restricted to mark@wynyardadvisory.co.uk
 // =============================================================================
 
