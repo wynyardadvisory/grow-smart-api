@@ -1060,6 +1060,96 @@ async function clearSuggestions(areaId, db) {
 }
 
 // =============================================================================
+// ADMIN ENDPOINTS — restricted to mark@wynyardadvisory.co.uk
+// =============================================================================
+
+const ADMIN_EMAIL = "mark@wynyardadvisory.co.uk";
+
+async function requireAdmin(req, res, next) {
+  if (!req.user) return res.status(401).json({ error: "Unauthorised" });
+  const { data: profile } = await req.db.from("profiles").select("email").eq("id", req.user.id).single();
+  if (!profile || profile.email !== ADMIN_EMAIL) return res.status(403).json({ error: "Forbidden" });
+  next();
+}
+
+// GET /admin/crop-queue — AI-added crop_definitions pending review
+app.get("/admin/crop-queue", requireAuth, requireAdmin, async (req, res) => {
+  const { data, error } = await req.db
+    .from("crop_definitions")
+    .select("*, profiles(email)")
+    .eq("admin_approved", false)
+    .eq("ai_generated", true)
+    .order("created_at", { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+
+  const result = (data || []).map(c => ({
+    ...c,
+    added_by_email: c.profiles?.email || null,
+  }));
+  res.json(result);
+});
+
+// POST /admin/crop-queue/:id/approve
+app.post("/admin/crop-queue/:id/approve", requireAuth, requireAdmin, async (req, res) => {
+  const { error } = await req.db
+    .from("crop_definitions")
+    .update({ admin_approved: true, admin_reviewed_at: new Date().toISOString() })
+    .eq("id", req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+// POST /admin/crop-queue/:id/reject — deletes the definition
+app.post("/admin/crop-queue/:id/reject", requireAuth, requireAdmin, async (req, res) => {
+  const { error } = await req.db
+    .from("crop_definitions")
+    .delete()
+    .eq("id", req.params.id)
+    .eq("ai_generated", true); // safety — never delete hand-curated crops
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+// GET /admin/users — all users with crop counts and last seen
+app.get("/admin/users", requireAuth, requireAdmin, async (req, res) => {
+  const { data: profiles } = await req.db
+    .from("profiles")
+    .select("id, name, email, created_at")
+    .order("created_at", { ascending: false });
+
+  if (!profiles) return res.json([]);
+
+  // Get crop counts per user
+  const { data: crops } = await req.db
+    .from("crop_instances")
+    .select("user_id")
+    .eq("active", true);
+
+  const cropCounts = {};
+  (crops || []).forEach(c => { cropCounts[c.user_id] = (cropCounts[c.user_id] || 0) + 1; });
+
+  // Get last task completion per user
+  const { data: tasks } = await req.db
+    .from("tasks")
+    .select("user_id, completed_at")
+    .eq("completed", true)
+    .order("completed_at", { ascending: false });
+
+  const lastSeen = {};
+  (tasks || []).forEach(t => {
+    if (!lastSeen[t.user_id]) lastSeen[t.user_id] = t.completed_at;
+  });
+
+  const result = profiles.map(p => ({
+    ...p,
+    crop_count: cropCounts[p.id] || 0,
+    last_seen:  lastSeen[p.id]   || null,
+  }));
+
+  res.json(result);
+});
+
+// =============================================================================
 // PHOTO UPLOADS
 // Profile, location, and area photos stored in Supabase Storage.
 // All photos are base64 encoded on upload, stored privately, served via signed URLs.
