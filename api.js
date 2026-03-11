@@ -1019,22 +1019,40 @@ Area details:
 - Previously grown here: ${historyStr}
 - Currently growing elsewhere in their garden: ${currentStr}
 
-Suggest 4 crops that would be ideal to plant in this area right now, considering:
+Return exactly 3 suggestions: 2 crop suggestions and 1 bed preparation or companion suggestion.
+Consider:
 1. Seasonality — what can realistically be sown or planted in ${month} in the UK
 2. Crop rotation — avoid repeating the same crop family as what was previously grown
-3. Companion planting — note any positive interactions with what they're already growing
-4. Variety of food types to keep the garden interesting
+3. What the grower already likes (infer from what they grow elsewhere) — suggest complementary crops, avoid duplicates
+4. Suggest a specific named variety for each crop, not just the species name
 
-Respond ONLY with a JSON array — no markdown, no explanation:
+Respond ONLY with a JSON array of exactly 3 items — no markdown, no explanation:
 [
   {
+    "type": "crop",
     "crop": "Crop name",
-    "reason": "One sentence why this is ideal right now for this area",
-    "rotation_note": "Brief rotation benefit or null",
-    "sow_note": "When/how to sow in one sentence",
-    "companion_note": "Companion benefit with existing crops or null"
+    "variety": "Specific variety name e.g. Cobra, Black Beauty, Gardener's Delight",
+    "reason": "One sentence why this crop and variety is ideal right now for this grower",
+    "sow_note": "When and how to sow this variety in one sentence",
+    "companion_note": "Companion benefit with their existing crops or null"
+  },
+  {
+    "type": "crop",
+    "crop": "Crop name",
+    "variety": "Specific variety name",
+    "reason": "One sentence why this crop and variety is ideal right now",
+    "sow_note": "When and how to sow in one sentence",
+    "companion_note": "Companion benefit or null"
+  },
+  {
+    "type": "prep",
+    "title": "e.g. Add well-rotted manure, Sow green manure (Phacelia), Plant pot marigolds as companions",
+    "reason": "One sentence why this prep or companion planting benefits this bed right now",
+    "timing_note": "Brief note on when or how to do this"
   }
-]`;
+]
+
+The prep suggestion can be: soil enrichment (compost, manure, green manure), a companion plant (marigolds, nasturtiums, borage), or seasonal ground prep. Pick the most relevant given rotation history and season.`;
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -1045,7 +1063,7 @@ Respond ONLY with a JSON array — no markdown, no explanation:
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 1000,
+        max_tokens: 1200,
         messages: [{ role: "user", content: prompt }],
       }),
     });
@@ -1372,14 +1390,14 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
       db.from("harvest_log").select("*", { count: "exact", head: true }),
 
       db.from("tasks").select("*", { count: "exact", head: true }),
-      db.from("tasks").select("*", { count: "exact", head: true }).not("completed_at", "is", null),
+      db.from("tasks").select("*", { count: "exact", head: true }).eq("status", "completed"),
 
       db.from("user_feeds").select("*", { count: "exact", head: true }),
 
       db.from("crop_photos").select("*", { count: "exact", head: true }),
 
       db.from("varieties").select("*", { count: "exact", head: true }),
-      db.from("harvest_log").select("*", { count: "exact", head: true }).not("quantity_g", "is", null),
+      db.from("harvest_log").select("*", { count: "exact", head: true }).not("quantity_value", "is", null),
     ]);
 
     // Unique active users
@@ -1462,30 +1480,12 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
 
 // GET /admin/feedback — admin only
 app.get("/admin/feedback", requireAuth, requireAdmin, async (req, res) => {
-  const { data, error } = await supabaseService
+  const { data, error } = await req.db
     .from("feedback")
-    .select("*")
+    .select("*, profiles(name, email)")
     .order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
-
-  // Enrich with profile data separately to avoid FK join issues
-  const userIds = [...new Set((data || []).map(f => f.user_id).filter(Boolean))];
-  let profileMap = {};
-  if (userIds.length) {
-    const { data: profiles } = await supabaseService
-      .from("profiles")
-      .select("id, name, email")
-      .in("id", userIds);
-    (profiles || []).forEach(p => { profileMap[p.id] = p; });
-  }
-
-  const enriched = (data || []).map(f => ({
-    ...f,
-    user_name:  profileMap[f.user_id]?.name  || null,
-    user_email: profileMap[f.user_id]?.email || null,
-  }));
-
-  res.json(enriched);
+  res.json(data || []);
 });
 
 // =============================================================================
@@ -1503,28 +1503,17 @@ async function requireAdmin(req, res, next) {
 
 // GET /admin/crop-queue — AI-added crop_definitions pending review
 app.get("/admin/crop-queue", requireAuth, requireAdmin, async (req, res) => {
-  const { data, error } = await supabaseService
+  const { data, error } = await req.db
     .from("crop_definitions")
-    .select("*")
+    .select("*, profiles(email)")
     .eq("admin_approved", false)
     .eq("ai_generated", true)
     .order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
 
-  // Enrich with profile emails separately to avoid FK join issues
-  const userIds = [...new Set((data || []).map(c => c.created_by).filter(Boolean))];
-  let profileMap = {};
-  if (userIds.length) {
-    const { data: profiles } = await supabaseService
-      .from("profiles")
-      .select("id, email")
-      .in("id", userIds);
-    (profiles || []).forEach(p => { profileMap[p.id] = p; });
-  }
-
   const result = (data || []).map(c => ({
     ...c,
-    added_by_email: profileMap[c.created_by]?.email || null,
+    added_by_email: c.profiles?.email || null,
   }));
   res.json(result);
 });
@@ -1679,32 +1668,34 @@ app.get("/harvest-log", requireAuth, async (req, res) => {
 
 // POST /harvest-log — create a harvest entry + mark crop as harvested
 app.post("/harvest-log", requireAuth,
-  [body("crop_instance_id").optional()],
+  [body("crop_name").trim().notEmpty()],
   async (req, res) => {
     if (!validate(req, res)) return;
     const {
-      crop_instance_id,
+      crop_instance_id, crop_name, variety,
       harvested_at, yield_score, quality_score,
-      quantity_value, quantity_unit, quantity_notes, notes,
+      quantity_value, quantity_unit, notes,
     } = req.body;
 
     const { data, error } = await req.db.from("harvest_log").insert({
       user_id:          req.user.id,
       crop_instance_id: crop_instance_id || null,
+      crop_name,
+      variety:          variety || null,
       harvested_at:     harvested_at || new Date().toISOString().split("T")[0],
-      quality:          quality_score || yield_score || null,
-      quantity_g:       quantity_value || null,
-      quantity_units:   quantity_unit  || null,
-      quantity_notes:   quantity_notes || null,
+      yield_score:      yield_score || null,
+      quality_score:    quality_score || null,
+      quantity_value:   quantity_value || null,
+      quantity_unit:    quantity_unit || null,
       notes:            notes || null,
     }).select().single();
 
     if (error) return res.status(500).json({ error: error.message });
 
-    // Mark crop instance as harvested and inactive so it disappears from active lists
+    // Mark crop instance as harvested
     if (crop_instance_id) {
       await req.db.from("crop_instances")
-        .update({ status: "harvested", active: false, updated_at: new Date().toISOString() })
+        .update({ status: "harvested", updated_at: new Date().toISOString() })
         .eq("id", crop_instance_id)
         .eq("user_id", req.user.id);
     }
@@ -1734,7 +1725,7 @@ app.delete("/harvest-log/:id", requireAuth, async (req, res) => {
   // Revert crop status back to growing
   if (entry.crop_instance_id) {
     await req.db.from("crop_instances")
-      .update({ status: "growing", active: true, updated_at: new Date().toISOString() })
+      .update({ status: "growing", updated_at: new Date().toISOString() })
       .eq("id", entry.crop_instance_id)
       .eq("user_id", req.user.id);
   }
@@ -1844,7 +1835,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
 
   const [tasksRes, cropsRes, profileRes, harvestRes] = await Promise.all([
     req.db.from("tasks")
-      .select("*, crop:crop_instance_id(name, variety, sown_date), area:area_id(name)")
+      .select("*, crop:crop_instance_id(name, variety), area:area_id(name)")
       .eq("user_id", req.user.id).is("completed_at", null)
       .order("urgency",  { ascending: false })
       .order("due_date", { ascending: true }),
@@ -1870,11 +1861,8 @@ app.get("/dashboard", requireAuth, async (req, res) => {
   const harvestForecast = crops
     .filter(c => c.crop_def?.harvest_month_start)
     .map(c => ({
-      crop:             c.name,
-      variety:          c.variety || null,
-      crop_instance_id: c.id,
-      area_name:        c.area?.name || null,
-      sown_date:        c.sown_date  || null,
+      crop:         c.name,
+      variety:      c.variety || null,
       window_start: new Date(year, c.crop_def.harvest_month_start - 1, 1).toISOString().split("T")[0],
       window_end:   new Date(year, c.crop_def.harvest_month_end   - 1, 28).toISOString().split("T")[0],
     }));
