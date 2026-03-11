@@ -1844,7 +1844,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
 
   const [tasksRes, cropsRes, profileRes, harvestRes] = await Promise.all([
     req.db.from("tasks")
-      .select("*, crop:crop_instance_id(name, variety), area:area_id(name)")
+      .select("*, crop:crop_instance_id(name, variety, sown_date), area:area_id(name)")
       .eq("user_id", req.user.id).is("completed_at", null)
       .order("urgency",  { ascending: false })
       .order("due_date", { ascending: true }),
