@@ -601,7 +601,8 @@ class RuleEngine {
           days_to_maturity_min, days_to_maturity_max,
           feed_interval_days, pest_window_start, pest_window_end,
           sow_window_start, sow_window_end,
-          transplant_window_start, transplant_window_end
+          transplant_window_start, transplant_window_end,
+          harvest_month_start, harvest_month_end, feed_type
         ),
         variety:variety_id (
           days_to_maturity_min, days_to_maturity_max,
