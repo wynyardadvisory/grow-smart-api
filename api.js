@@ -517,7 +517,7 @@ Use null for any fields you don't have reliable data for. All month values are i
 
 app.get("/crops", requireAuth, async (req, res) => {
   const { data, error } = await req.db.from("crop_instances")
-    .select("*, area:area_id(name, type), crop_def:crop_def_id(name, harvest_month_start, harvest_month_end, days_to_maturity_min), variety:variety_id(name, days_to_maturity_min)")
+    .select("*, area:area_id(name, type), crop_def:crop_def_id(name, harvest_month_start, harvest_month_end, days_to_maturity_min, sow_method), variety:variety_id(name, days_to_maturity_min)")
     .eq("user_id", req.user.id).eq("active", true)
     .order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
