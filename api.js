@@ -1462,12 +1462,30 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
 
 // GET /admin/feedback — admin only
 app.get("/admin/feedback", requireAuth, requireAdmin, async (req, res) => {
-  const { data, error } = await req.db
+  const { data, error } = await supabaseService
     .from("feedback")
-    .select("*, profiles(name, email)")
+    .select("*")
     .order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
+
+  // Enrich with profile data separately to avoid FK join issues
+  const userIds = [...new Set((data || []).map(f => f.user_id).filter(Boolean))];
+  let profileMap = {};
+  if (userIds.length) {
+    const { data: profiles } = await supabaseService
+      .from("profiles")
+      .select("id, name, email")
+      .in("id", userIds);
+    (profiles || []).forEach(p => { profileMap[p.id] = p; });
+  }
+
+  const enriched = (data || []).map(f => ({
+    ...f,
+    user_name:  profileMap[f.user_id]?.name  || null,
+    user_email: profileMap[f.user_id]?.email || null,
+  }));
+
+  res.json(enriched);
 });
 
 // =============================================================================
@@ -1485,17 +1503,28 @@ async function requireAdmin(req, res, next) {
 
 // GET /admin/crop-queue — AI-added crop_definitions pending review
 app.get("/admin/crop-queue", requireAuth, requireAdmin, async (req, res) => {
-  const { data, error } = await req.db
+  const { data, error } = await supabaseService
     .from("crop_definitions")
-    .select("*, profiles(email)")
+    .select("*")
     .eq("admin_approved", false)
     .eq("ai_generated", true)
     .order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
 
+  // Enrich with profile emails separately to avoid FK join issues
+  const userIds = [...new Set((data || []).map(c => c.created_by).filter(Boolean))];
+  let profileMap = {};
+  if (userIds.length) {
+    const { data: profiles } = await supabaseService
+      .from("profiles")
+      .select("id, email")
+      .in("id", userIds);
+    (profiles || []).forEach(p => { profileMap[p.id] = p; });
+  }
+
   const result = (data || []).map(c => ({
     ...c,
-    added_by_email: c.profiles?.email || null,
+    added_by_email: profileMap[c.created_by]?.email || null,
   }));
   res.json(result);
 });
