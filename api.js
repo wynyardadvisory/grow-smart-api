@@ -296,7 +296,7 @@ Respond ONLY with a JSON object — no markdown, no explanation. Use this exact 
     "name": "corrected crop name",
     "category": "one of: fruiting, root, brassica, legume, allium, salad, herb, perennial, fruit",
     "default_establishment": "one of: indoors, direct_sow, tuber, crown, runner, cane",
-    "is_perennial": false,
+    "is_perennial": false,  // true for fruit trees, bushes, asparagus, rhubarb, artichokes — anything that lives for multiple years
     "sow_indoors_start": 2,
     "sow_indoors_end": 4,
     "sow_direct_start": null,
@@ -1847,11 +1847,14 @@ app.get("/dashboard", requireAuth, async (req, res) => {
 
   // ── Missing data prompts ──────────────────────────────────────────────────
   const missingData = crops
-    .filter(c => (!c.variety_id && !c.variety) || !c.sown_date)
+    .filter(c => (!c.variety_id && !c.variety) || (!c.sown_date && c.status !== "planned" && !c.crop_def?.is_perennial))
     .map(c => ({
       id:      c.id,
       name:    c.name,
-      missing: [(!c.variety_id && !c.variety) && "variety", !c.sown_date && "sow date"].filter(Boolean),
+      missing: [
+        (!c.variety_id && !c.variety) && "variety not set",
+        (!c.sown_date && c.status !== "planned" && !c.crop_def?.is_perennial) && "sow date not recorded yet"
+      ].filter(Boolean),
     }));
 
   // ── Pest risk — how many crops are in their peak pest window this month ───
