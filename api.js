@@ -1872,8 +1872,11 @@ app.get("/dashboard", requireAuth, async (req, res) => {
   const harvestForecast = crops
     .filter(c => c.crop_def?.harvest_month_start)
     .map(c => ({
-      crop:         c.name,
-      variety:      c.variety || null,
+      crop:             c.name,
+      variety:          c.variety || null,
+      crop_instance_id: c.id,
+      area_name:        c.area?.name || null,
+      sown_date:        c.sown_date  || null,
       window_start: new Date(year, c.crop_def.harvest_month_start - 1, 1).toISOString().split("T")[0],
       window_end:   new Date(year, c.crop_def.harvest_month_end   - 1, 28).toISOString().split("T")[0],
     }));
