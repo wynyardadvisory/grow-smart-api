@@ -246,48 +246,111 @@ class RuleEngine {
         const sowEnd         = crop.variety?.sow_window_end         ?? crop.crop_def?.sow_window_end;
         const frostSensitive = effective.frost_sensitive;
 
-        if (sowStart && sowEnd && m >= sowStart && m <= sowEnd) {
+        // ── Potato variety-aware plant-out offset ────────────────────────────
+        // first_early: plant out Mar–Apr, second_early: Apr–May, maincrop: Apr–May (later)
+        const potatoType = crop.variety?.potato_type || null;
+        let effectiveSowStart = sowStart;
+        let effectiveSowEnd   = sowEnd;
+        if (sowMethod === "tuber" && potatoType) {
+          if (potatoType === "first_early")   { effectiveSowStart = 3; effectiveSowEnd = 4; }
+          if (potatoType === "second_early")  { effectiveSowStart = 3; effectiveSowEnd = 5; }
+          if (potatoType === "maincrop")      { effectiveSowStart = 4; effectiveSowEnd = 5; }
+        }
+
+        // ── User sow preference override ────────────────────────────────────
+        // sow_preference = 'outdoors' means user has opted out of indoors recommendation
+        const userPreference = crop.sow_preference || null;
+
+        // Determine effective sow method — user preference overrides recommendation
+        let effectiveSowMethod = sowMethod;
+        if (userPreference === "outdoors" && (sowMethod === "indoors" || sowMethod === "either")) {
+          effectiveSowMethod = "outdoors";
+          // Outdoor sow window starts later — use direct sow window if available
+          const outdoorStart = crop.crop_def?.sow_direct_start ?? sowStart;
+          const outdoorEnd   = crop.crop_def?.sow_direct_end   ?? sowEnd;
+          effectiveSowStart  = outdoorStart;
+          effectiveSowEnd    = outdoorEnd;
+        }
+
+        if (effectiveSowStart && effectiveSowEnd && m >= effectiveSowStart && m <= effectiveSowEnd) {
 
           // ── Frost-aware suppression for outdoor sowing ──────────────────────
-          // frost_risk_7day is the actual minimum °C forecast over 7 days.
-          // We use it to suppress or warn on outdoor sowing for frost-sensitive crops.
-          // Indoors sowing is never blocked by frost.
           const min7        = weather?.frost_risk_7day ?? null;
-          const isOutdoor   = sowMethod === "outdoors" || sowMethod === "either";
+          const isOutdoor   = effectiveSowMethod === "outdoors" || effectiveSowMethod === "direct_sow" || effectiveSowMethod === "either";
           const frostHigh   = frostSensitive && isOutdoor && min7 !== null && min7 <= 0;
           const frostMedium = frostSensitive && isOutdoor && min7 !== null && min7 > 0 && min7 <= 3;
 
           // Hard block: frost forecast and crop is frost-sensitive outdoor sow
-          if (frostHigh) continue; // suppress entirely — try again on daily cron
+          if (frostHigh) continue;
 
           const logKey  = `${crop.id}:sow_prompt`;
           const lastRun = recentLog.get(logKey);
-          // Re-prompt sooner when frost is marginal so user gets updated once it clears
           const cooldown = frostMedium ? 3 * 86400000 : 7 * 86400000;
 
           if (!lastRun || (Date.now() - lastRun.getTime()) >= cooldown) {
-            let action, urgency;
+            let action, urgency, why, sowMeta;
 
-            if (sowMethod === "indoors") {
-              action  = `Time to sow ${crop.name} indoors — start on a windowsill or in the greenhouse`;
+            // ── Month name helpers ───────────────────────────────────────────
+            const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+            const windowStr = effectiveSowStart && effectiveSowEnd
+              ? `${MONTHS[effectiveSowStart-1]}–${MONTHS[effectiveSowEnd-1]}`
+              : null;
+
+            if (effectiveSowMethod === "indoors") {
+              // Recommend indoors with clear reasoning
+              why    = "Starting indoors now gives stronger plants, an earlier harvest, and better protection from slugs and late frosts.";
+              action = `Sow ${crop.name} indoors now — ${why}${windowStr ? ` Sowing window: ${windowStr}.` : ""}`;
               urgency = "medium";
-            } else if (sowMethod === "outdoors") {
-              if (frostMedium) {
-                action  = `Almost time to direct sow ${crop.name} outdoors — frost risk still marginal, wait for a settled spell`;
-                urgency = "low";
+              sowMeta = { status_transition: "sown_indoors", sow_method: "indoors", can_prefer_outdoors: true };
+
+            } else if (effectiveSowMethod === "outdoors" || effectiveSowMethod === "direct_sow") {
+              if (userPreference === "outdoors") {
+                // User chose outdoors — respect it, note timing
+                if (frostMedium) {
+                  action  = `Almost time to direct sow ${crop.name} outdoors — frost risk still present, wait for a settled spell.${windowStr ? ` Sowing window: ${windowStr}.` : ""}`;
+                  urgency = "low";
+                } else {
+                  action  = `Time to direct sow ${crop.name} outdoors.${windowStr ? ` Sowing window: ${windowStr}.` : ""}`;
+                  urgency = "medium";
+                }
               } else {
-                action  = `Time to direct sow ${crop.name} outdoors`;
-                urgency = "medium";
+                if (frostMedium) {
+                  action  = `Almost time to direct sow ${crop.name} outdoors — frost risk still marginal, wait for a settled spell.`;
+                  urgency = "low";
+                } else {
+                  action  = `Time to direct sow ${crop.name} outdoors.${windowStr ? ` Sowing window: ${windowStr}.` : ""}`;
+                  urgency = "medium";
+                }
               }
+              sowMeta = { status_transition: "sown", sow_method: "outdoors" };
+
+            } else if (effectiveSowMethod === "tuber") {
+              // Potato plant-out
+              const typeLabel = potatoType === "first_early" ? "first early"
+                              : potatoType === "second_early" ? "second early"
+                              : potatoType === "maincrop" ? "maincrop"
+                              : null;
+              const typeNote  = typeLabel ? ` (${typeLabel})` : "";
+              action  = `Plant out ${crop.name}${typeNote} tubers now — chitting should be complete. Earth up as shoots emerge.${windowStr ? ` Plant-out window: ${windowStr}.` : ""}`;
+              urgency = "medium";
+              sowMeta = { status_transition: "planted_out", sow_method: "tuber" };
+
             } else {
-              // either — always offer indoors option even if outdoor is marginal
-              if (frostMedium) {
-                action  = `Time to sow ${crop.name} — sow indoors now or wait a little longer before direct sowing outdoors`;
-                urgency = "medium";
-              } else {
-                action  = `Time to sow ${crop.name} — sow indoors for an earlier start or direct sow outdoors`;
-                urgency = "medium";
-              }
+              // "either" — recommend indoors by default unless user has opted out
+              why    = "Starting indoors gives stronger plants and an earlier harvest.";
+              action = `Sow ${crop.name} indoors now for best results — ${why}${windowStr ? ` Sowing window: ${windowStr}.` : ""}`;
+              urgency = "medium";
+              sowMeta = { status_transition: "sown_indoors", sow_method: "indoors", can_prefer_outdoors: true };
+            }
+
+            // ── Succession sowing note ───────────────────────────────────────
+            // Encourage adding a second instance for crops with a long sow window
+            const windowLength = (effectiveSowEnd - effectiveSowStart);
+            const successionNote = windowLength >= 2
+              ? ` Sowing window runs ${windowStr} — add another ${crop.name} to your garden in a few weeks for a succession harvest.`
+              : "";
+            if (successionNote && !action.includes("Sowing window")) {
+              action = action.trimEnd() + successionNote;
             }
 
             const task = {
@@ -301,7 +364,7 @@ class RuleEngine {
               source:           "rule_engine",
               rule_id:          "sow_prompt",
               date_confidence:  "exact",
-              meta:             JSON.stringify({ status_transition: "sown", sow_method: sowMethod }),
+              meta:             JSON.stringify(sowMeta || { status_transition: "sown", sow_method: effectiveSowMethod }),
             };
             newTasks.push({ ...task, crop_name: crop.name, rule_id: "sow_prompt" });
             if (!this.dryRun && this.supabase) {
@@ -609,7 +672,8 @@ class RuleEngine {
           frost_sensitive_override, feed_interval_days_override,
           pest_window_start_override, pest_window_end_override,
           sow_window_start, sow_window_end,
-          transplant_window_start, transplant_window_end
+          transplant_window_start, transplant_window_end,
+          potato_type
         )
       `)
       .eq("user_id", userId)
