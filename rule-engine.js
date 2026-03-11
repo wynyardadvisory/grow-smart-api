@@ -153,6 +153,92 @@ class RuleEngine {
       const m          = currentMonth();
       const sowMethod  = crop.crop_def?.sow_method || "either";
 
+      // ── PERENNIALS: fruit trees, bushes, established plants ─────────────────
+      // Skip the seed cycle entirely. Generate harvest alerts and feed reminders
+      // based on harvest window and feed schedule, not days since sowing.
+      if (effective.is_perennial) {
+        const harvestStart = crop.crop_def?.harvest_month_start;
+        const harvestEnd   = crop.crop_def?.harvest_month_end;
+        const feedSchedule = crop.crop_def?.feed_type;
+
+        // Harvest alert — when in harvest window
+        if (harvestStart && harvestEnd && m >= harvestStart && m <= harvestEnd) {
+          const logKey  = `${crop.id}:perennial_harvest`;
+          const lastRun = recentLog.get(logKey);
+          if (!lastRun || (Date.now() - lastRun.getTime()) >= 14 * 86400000) {
+            const task = {
+              user_id:          crop.user_id,
+              crop_instance_id: crop.id,
+              area_id:          crop.area_id,
+              action:           `${crop.name} should be ready to harvest — check for ripeness and pick regularly to encourage more fruit`,
+              task_type:        "harvest",
+              urgency:          "medium",
+              due_date:         todayISO(),
+              source:           "rule_engine",
+              rule_id:          "perennial_harvest",
+              date_confidence:  "approximate",
+              meta:             JSON.stringify({}),
+            };
+            newTasks.push({ ...task, crop_name: crop.name, rule_id: "perennial_harvest" });
+            if (!this.dryRun && this.supabase) {
+              await this._persistTaskWithKey(task, crop, "perennial_harvest");
+            }
+          }
+        }
+
+        // Spring feed reminder — March/April for most perennials
+        if (m >= 3 && m <= 4 && feedSchedule) {
+          const logKey  = `${crop.id}:perennial_spring_feed`;
+          const lastRun = recentLog.get(logKey);
+          if (!lastRun || (Date.now() - lastRun.getTime()) >= 21 * 86400000) {
+            const task = {
+              user_id:          crop.user_id,
+              crop_instance_id: crop.id,
+              area_id:          crop.area_id,
+              action:           `Feed ${crop.name} now growth is starting — apply ${feedSchedule} around the base and water in well`,
+              task_type:        "feed",
+              urgency:          "low",
+              due_date:         todayISO(),
+              source:           "rule_engine",
+              rule_id:          "perennial_spring_feed",
+              date_confidence:  "approximate",
+              meta:             JSON.stringify({}),
+            };
+            newTasks.push({ ...task, crop_name: crop.name, rule_id: "perennial_spring_feed" });
+            if (!this.dryRun && this.supabase) {
+              await this._persistTaskWithKey(task, crop, "perennial_spring_feed");
+            }
+          }
+        }
+
+        // Summer feed reminder — June/July during fruiting
+        if (m >= 6 && m <= 7 && feedSchedule) {
+          const logKey  = `${crop.id}:perennial_summer_feed`;
+          const lastRun = recentLog.get(logKey);
+          if (!lastRun || (Date.now() - lastRun.getTime()) >= 21 * 86400000) {
+            const task = {
+              user_id:          crop.user_id,
+              crop_instance_id: crop.id,
+              area_id:          crop.area_id,
+              action:           `Feed ${crop.name} to support fruiting — apply ${feedSchedule} and keep well watered`,
+              task_type:        "feed",
+              urgency:          "low",
+              due_date:         todayISO(),
+              source:           "rule_engine",
+              rule_id:          "perennial_summer_feed",
+              date_confidence:  "approximate",
+              meta:             JSON.stringify({}),
+            };
+            newTasks.push({ ...task, crop_name: crop.name, rule_id: "perennial_summer_feed" });
+            if (!this.dryRun && this.supabase) {
+              await this._persistTaskWithKey(task, crop, "perennial_summer_feed");
+            }
+          }
+        }
+
+        continue; // perennials skip the rest of the rule engine
+      }
+
       // ── PLANNED CROPS: generate sow prompt when in sow window ────────────────
       if (cropStatus === "planned") {
         // Prefer variety-level sow window if set (e.g. late maincrop vs early variety)
