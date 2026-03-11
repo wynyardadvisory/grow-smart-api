@@ -1379,7 +1379,7 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
       db.from("crop_photos").select("*", { count: "exact", head: true }),
 
       db.from("varieties").select("*", { count: "exact", head: true }),
-      db.from("harvest_log").select("*", { count: "exact", head: true }).not("quantity_value", "is", null),
+      db.from("harvest_log").select("*", { count: "exact", head: true }).not("quantity_g", "is", null),
     ]);
 
     // Unique active users
@@ -1679,25 +1679,23 @@ app.get("/harvest-log", requireAuth, async (req, res) => {
 
 // POST /harvest-log — create a harvest entry + mark crop as harvested
 app.post("/harvest-log", requireAuth,
-  [body("crop_name").trim().notEmpty()],
+  [body("crop_instance_id").optional()],
   async (req, res) => {
     if (!validate(req, res)) return;
     const {
-      crop_instance_id, crop_name, variety,
+      crop_instance_id,
       harvested_at, yield_score, quality_score,
-      quantity_value, quantity_unit, notes,
+      quantity_value, quantity_unit, quantity_notes, notes,
     } = req.body;
 
     const { data, error } = await req.db.from("harvest_log").insert({
       user_id:          req.user.id,
       crop_instance_id: crop_instance_id || null,
-      crop_name,
-      variety:          variety || null,
       harvested_at:     harvested_at || new Date().toISOString().split("T")[0],
-      yield_score:      yield_score || null,
-      quality_score:    quality_score || null,
-      quantity_value:   quantity_value || null,
-      quantity_unit:    quantity_unit || null,
+      quality:          quality_score || yield_score || null,
+      quantity_g:       quantity_value || null,
+      quantity_units:   quantity_unit  || null,
+      quantity_notes:   quantity_notes || null,
       notes:            notes || null,
     }).select().single();
 
