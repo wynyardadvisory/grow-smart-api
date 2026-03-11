@@ -44,6 +44,7 @@ app.use(helmet());
 const allowedOrigins = [
   "https://vercro.com",
   "https://www.vercro.com",
+  "https://app.vercro.com",
   "https://grow-smart-frontend.vercel.app",
   process.env.FRONTEND_URL,
 ].filter(Boolean);
