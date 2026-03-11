@@ -1701,10 +1701,10 @@ app.post("/harvest-log", requireAuth,
 
     if (error) return res.status(500).json({ error: error.message });
 
-    // Mark crop instance as harvested
+    // Mark crop instance as harvested and inactive so it disappears from active lists
     if (crop_instance_id) {
       await req.db.from("crop_instances")
-        .update({ status: "harvested", updated_at: new Date().toISOString() })
+        .update({ status: "harvested", active: false, updated_at: new Date().toISOString() })
         .eq("id", crop_instance_id)
         .eq("user_id", req.user.id);
     }
@@ -1734,7 +1734,7 @@ app.delete("/harvest-log/:id", requireAuth, async (req, res) => {
   // Revert crop status back to growing
   if (entry.crop_instance_id) {
     await req.db.from("crop_instances")
-      .update({ status: "growing", updated_at: new Date().toISOString() })
+      .update({ status: "growing", active: true, updated_at: new Date().toISOString() })
       .eq("id", entry.crop_instance_id)
       .eq("user_id", req.user.id);
   }
