@@ -1810,6 +1810,10 @@ app.get("/weather", requireAuth, async (req, res) => {
 app.get("/dashboard", requireAuth, async (req, res) => {
   const today   = todayISO();
   const weekEnd = weekEndISO();
+  // Always run rule engine on dashboard load — ensures tasks are fresh
+  // without requiring user to edit/save a crop manually
+  await runRuleEngine(req.user.id);
+
 
   const [tasksRes, cropsRes, profileRes, harvestRes] = await Promise.all([
     req.db.from("tasks")
@@ -2071,6 +2075,35 @@ app.post("/run-rules", requireAuth, async (req, res) => {
   const tasks = await runRuleEngine(req.user.id);
   res.json({ generated: tasks.length, tasks });
 });
+
+// =============================================================================
+// ADMIN — reset all tasks and regenerate for every user
+// Hit this once after deploying rule engine fixes to clear stale dedup locks
+// =============================================================================
+
+app.post("/admin/reset-tasks", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    // Delete all incomplete tasks and rule_log entries for all users
+    await supabaseService.from("rule_log").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+    await supabaseService.from("tasks").delete().is("completed_at", null);
+
+    // Re-run rule engine for every user with a profile
+    const { data: profiles } = await supabaseService.from("profiles").select("id");
+    if (!profiles?.length) return res.json({ reset: true, users: 0, tasks_generated: 0 });
+
+    let total = 0;
+    for (const p of profiles) {
+      const tasks = await runRuleEngine(p.id);
+      total += tasks.length;
+    }
+
+    res.json({ reset: true, users: profiles.length, tasks_generated: total });
+  } catch (err) {
+    console.error("[AdminResetTasks]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 // =============================================================================
 // CRON — called by Vercel Cron at 06:00 UTC daily
