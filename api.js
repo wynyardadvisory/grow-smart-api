@@ -1391,7 +1391,7 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
       db.from("harvest_log").select("*", { count: "exact", head: true }),
 
       db.from("tasks").select("*", { count: "exact", head: true }),
-      db.from("tasks").select("*", { count: "exact", head: true }).eq("status", "completed"),
+      db.from("tasks").select("*", { count: "exact", head: true }).not("completed_at", "is", null),
 
       db.from("user_feeds").select("*", { count: "exact", head: true }),
 

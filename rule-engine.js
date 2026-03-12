@@ -622,22 +622,34 @@ class RuleEngine {
   async _cleanupOrphanedTasks(userId) {
     try {
       // Get all active crop instance IDs for this user
-      const { data: activeCrops } = await this.supabase
+      const { data: activeCrops, error: cropError } = await this.supabase
         .from("crop_instances")
         .select("id")
         .eq("user_id", userId)
         .eq("active", true);
 
-      const activeIds = (activeCrops || []).map(c => c.id);
+      // Safety — if the crop query failed or returned nothing, don't delete anything
+      if (cropError || !activeCrops) {
+        console.log("[RuleEngine] Skipping cleanup — could not load crops");
+        return;
+      }
 
-      // Find tasks whose crop_instance_id is not in the active list
-      // Use raw filter for NOT IN with UUID array
-      const safeIds = activeIds.length ? activeIds : ["00000000-0000-0000-0000-000000000000"];
+      const activeIds = activeCrops.map(c => c.id);
+
+      // If user has no crops at all, skip cleanup entirely
+      if (activeIds.length === 0) {
+        console.log("[RuleEngine] Skipping cleanup — no active crops found");
+        return;
+      }
+
+      // Find incomplete tasks whose crop_instance_id is not in the active list
+      // Never delete completed tasks — they're needed for metrics history
       const { data: orphanTasks } = await this.supabase
         .from("tasks")
         .select("id, crop_instance_id")
         .eq("user_id", userId)
-        .not("crop_instance_id", "in", `(${safeIds.join(",")})`)
+        .is("completed_at", null)
+        .not("crop_instance_id", "in", `(${activeIds.join(",")})`)
 
       if (orphanTasks?.length) {
         const orphanIds = orphanTasks.map(t => t.id);
