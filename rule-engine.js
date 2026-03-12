@@ -214,18 +214,30 @@ class RuleEngine {
           const logKey  = `${crop.id}:perennial_spring_feed`;
           const lastRun = recentLog.get(logKey);
           if (!lastRun || (Date.now() - lastRun.getTime()) >= 21 * 86400000) {
+            const matchedFeed = this._matchFeed(feedSchedule, userFeeds);
+            let feedAction;
+            if (matchedFeed) {
+              const productLabel = [matchedFeed.brand, matchedFeed.product_name].filter(Boolean).join(" ");
+              const dosageNote = matchedFeed.form === "liquid" && matchedFeed.dilution_ml_per_litre
+                ? ` at ${matchedFeed.dilution_ml_per_litre}ml per litre of water`
+                : matchedFeed.form === "granular" ? " — follow pack instructions" : "";
+              feedAction = `Feed ${crop.name} now growth is starting — apply ${productLabel}${dosageNote} around the base and water in well`;
+            } else {
+              feedAction = `Feed ${crop.name} now growth is starting — apply ${feedSchedule} around the base and water in well. Add a suitable feed to your feeds section for personalised reminders`;
+            }
             const task = {
               user_id:          crop.user_id,
               crop_instance_id: crop.id,
               area_id:          crop.area_id,
-              action:           `Feed ${crop.name} now growth is starting — apply ${feedSchedule} around the base and water in well`,
+              action:           feedAction,
               task_type:        "feed",
               urgency:          "low",
               due_date:         todayISO(),
+              timing_status:    "peak",
               source:           "rule_engine",
               rule_id:          "perennial_spring_feed",
               date_confidence:  "approximate",
-              meta:             JSON.stringify({}),
+              meta:             JSON.stringify({ matched_feed: matchedFeed?.id || null }),
             };
             newTasks.push({ ...task, crop_name: crop.name, rule_id: "perennial_spring_feed" });
             if (!this.dryRun && this.supabase) {
@@ -239,18 +251,30 @@ class RuleEngine {
           const logKey  = `${crop.id}:perennial_summer_feed`;
           const lastRun = recentLog.get(logKey);
           if (!lastRun || (Date.now() - lastRun.getTime()) >= 21 * 86400000) {
+            const matchedFeed = this._matchFeed(feedSchedule, userFeeds);
+            let feedAction;
+            if (matchedFeed) {
+              const productLabel = [matchedFeed.brand, matchedFeed.product_name].filter(Boolean).join(" ");
+              const dosageNote = matchedFeed.form === "liquid" && matchedFeed.dilution_ml_per_litre
+                ? ` at ${matchedFeed.dilution_ml_per_litre}ml per litre of water`
+                : matchedFeed.form === "granular" ? " — follow pack instructions" : "";
+              feedAction = `Feed ${crop.name} to support fruiting — apply ${productLabel}${dosageNote} and keep well watered`;
+            } else {
+              feedAction = `Feed ${crop.name} to support fruiting — apply ${feedSchedule} and keep well watered. Add a suitable feed to your feeds section for personalised reminders`;
+            }
             const task = {
               user_id:          crop.user_id,
               crop_instance_id: crop.id,
               area_id:          crop.area_id,
-              action:           `Feed ${crop.name} to support fruiting — apply ${feedSchedule} and keep well watered`,
+              action:           feedAction,
               task_type:        "feed",
               urgency:          "low",
               due_date:         todayISO(),
+              timing_status:    "peak",
               source:           "rule_engine",
               rule_id:          "perennial_summer_feed",
               date_confidence:  "approximate",
-              meta:             JSON.stringify({}),
+              meta:             JSON.stringify({ matched_feed: matchedFeed?.id || null }),
             };
             newTasks.push({ ...task, crop_name: crop.name, rule_id: "perennial_summer_feed" });
             if (!this.dryRun && this.supabase) {

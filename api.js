@@ -2035,7 +2035,7 @@ app.get("/tips", requireAuth, async (req, res) => {
     return res.json({ tips: cached.tips, cached: true });
   }
 
-  // Load user's crops and areas for context
+  // Load user's crops, areas and feeds for context
   const { data: crops } = await req.db
     .from("crop_instances")
     .select("name, variety, status, area:area_id(name, type)")
@@ -2049,11 +2049,20 @@ app.get("/tips", requireAuth, async (req, res) => {
     .eq("id", userId)
     .single();
 
+  const { data: userFeeds } = await req.db
+    .from("user_feeds")
+    .select("brand, product_name, feed_type, form, dilution_ml_per_litre")
+    .eq("user_id", userId)
+    .limit(10);
+
   if (!crops?.length) {
     return res.json({ tips: [], cached: false });
   }
 
   const cropList = crops.map(c => `${c.name}${c.variety ? ` (${c.variety})` : ""} — ${c.status || "growing"} in ${c.area?.name || "unknown area"} (${c.area?.type || "garden"})`).join("\n");
+  const feedList = userFeeds?.length
+    ? userFeeds.map(f => `${[f.brand, f.product_name].filter(Boolean).join(" ")} (${f.feed_type}, ${f.form}${f.dilution_ml_per_litre ? `, ${f.dilution_ml_per_litre}ml/L` : ""})`).join("\n")
+    : null;
   const month = new Date().toLocaleString("en-GB", { month: "long" });
 
   try {
@@ -2074,9 +2083,11 @@ app.get("/tips", requireAuth, async (req, res) => {
 Their current crops:
 ${cropList}
 ${profile?.postcode ? `Location: ${profile.postcode}` : ""}
+${feedList ? `Their feeds/fertilisers:\n${feedList}` : "They have no feeds recorded yet."}
 
 Rules:
 - Each tip must be specific to their actual crops or growing setup
+- If a tip involves feeding, reference their actual product by name if they have a suitable one. If they don't have one, suggest the feed type and mention they can add it to their feeds section
 - Tips should be practical tasks or preparation advice (not generic advice)
 - Vary the topics: e.g. soil prep, pest prevention, companion planting, feeding, protection, tools
 - Keep each tip to 1-2 sentences max
