@@ -1832,6 +1832,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
   // Always run rule engine on dashboard load — ensures tasks are fresh
   // without requiring user to edit/save a crop manually
   await runRuleEngine(req.user.id);
+  await expireOverdueTasks(req.user.id, req.db);
 
 
   const [tasksRes, cropsRes, profileRes, harvestRes] = await Promise.all([
@@ -1841,7 +1842,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       .order("urgency",  { ascending: false })
       .order("due_date", { ascending: true }),
     req.db.from("crop_instances")
-      .select("id, name, variety, variety_id, sown_date, area_id, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, pest_window_start, pest_window_end, pest_notes)")
+      .select("id, name, variety, variety_id, sown_date, area_id, missed_task_note, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, pest_window_start, pest_window_end, pest_notes)")
       .eq("user_id", req.user.id).eq("active", true),
     req.db.from("profiles").select("name, plan, postcode, photo_url").eq("id", req.user.id).single(),
     req.db.from("harvest_log")
@@ -1960,6 +1961,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       coming_up: tasks.filter(t => t.due_date > weekEnd),
     },
     crop_count:       crops.length,
+    crops_with_flags: crops.filter(c => c.missed_task_note).map(c => ({ id: c.id, name: c.name, missed_task_note: c.missed_task_note })),
     harvest_forecast: harvestForecast,
     missing_data:     missingData,
     recent_harvests:  harvestRes.data || [],
@@ -1975,9 +1977,131 @@ app.get("/dashboard", requireAuth, async (req, res) => {
 });
 
 // =============================================================================
-// HARVEST LOG
-// Phase 1: routes exist and data is stored. UI screen is Phase 2.
+// TASK EXPIRY — expire tasks whose window has passed, flag crop with red dot
 // =============================================================================
+
+async function expireOverdueTasks(userId, db) {
+  const today = todayISO();
+  try {
+    // Find incomplete tasks with a due_window_end that has passed
+    const { data: expiredTasks } = await db
+      .from("tasks")
+      .select("id, crop_instance_id, action, rule_id")
+      .eq("user_id", userId)
+      .is("completed_at", null)
+      .not("due_window_end", "is", null)
+      .lt("due_window_end", today);
+
+    if (!expiredTasks?.length) return;
+
+    for (const task of expiredTasks) {
+      // Mark task as expired (use a special completed_at marker)
+      await db.from("tasks")
+        .update({ completed_at: new Date().toISOString(), meta: JSON.stringify({ expired: true, reason: "Window passed" }) })
+        .eq("id", task.id);
+
+      // Flag the crop instance with a missed_task note
+      if (task.crop_instance_id) {
+        await db.from("crop_instances")
+          .update({ missed_task_note: `Missed: ${task.action}. Window has now passed — update this crop if you've since completed this task.` })
+          .eq("id", task.crop_instance_id);
+      }
+    }
+    console.log(`[Expiry] Expired ${expiredTasks.length} overdue tasks for user ${userId}`);
+  } catch (err) {
+    console.error("[Expiry] Error:", err.message);
+  }
+}
+
+// =============================================================================
+// TIPS — AI generated per user, cached weekly in Supabase
+// =============================================================================
+
+app.get("/tips", requireAuth, async (req, res) => {
+  const userId = req.user.id;
+  const oneWeekAgo = new Date(Date.now() - 7 * 86400000).toISOString();
+
+  // Check cache first
+  const { data: cached } = await req.db
+    .from("tips_cache")
+    .select("tips, created_at")
+    .eq("user_id", userId)
+    .gte("created_at", oneWeekAgo)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (cached?.tips) {
+    return res.json({ tips: cached.tips, cached: true });
+  }
+
+  // Load user's crops and areas for context
+  const { data: crops } = await req.db
+    .from("crop_instances")
+    .select("name, variety, status, area:area_id(name, type)")
+    .eq("user_id", userId)
+    .eq("active", true)
+    .limit(20);
+
+  const { data: profile } = await req.db
+    .from("profiles")
+    .select("postcode")
+    .eq("id", userId)
+    .single();
+
+  if (!crops?.length) {
+    return res.json({ tips: [], cached: false });
+  }
+
+  const cropList = crops.map(c => `${c.name}${c.variety ? ` (${c.variety})` : ""} — ${c.status || "growing"} in ${c.area?.name || "unknown area"} (${c.area?.type || "garden"})`).join("\n");
+  const month = new Date().toLocaleString("en-GB", { month: "long" });
+
+  try {
+    const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 800,
+        messages: [{
+          role: "user",
+          content: `You are a practical UK gardening advisor. Generate exactly 3 concise, actionable tips for a UK grower in ${month}.
+
+Their current crops:
+${cropList}
+${profile?.postcode ? `Location: ${profile.postcode}` : ""}
+
+Rules:
+- Each tip must be specific to their actual crops or growing setup
+- Tips should be practical tasks or preparation advice (not generic advice)
+- Vary the topics: e.g. soil prep, pest prevention, companion planting, feeding, protection, tools
+- Keep each tip to 1-2 sentences max
+- Respond ONLY with a JSON array, no preamble, no markdown. Format:
+[{"title":"Short title","tip":"The full tip text","emoji":"relevant emoji"}]`
+        }],
+      }),
+    });
+
+    const aiData = await aiRes.json();
+    const text = aiData.content?.[0]?.text || "[]";
+    const clean = text.replace(/```json|```/g, "").trim();
+    const tips = JSON.parse(clean);
+
+    // Cache the tips
+    await req.db.from("tips_cache").insert({ user_id: userId, tips });
+
+    return res.json({ tips, cached: false });
+  } catch (err) {
+    console.error("[Tips] Error:", err.message);
+    return res.json({ tips: [], cached: false });
+  }
+});
+
+
 
 app.get("/harvest", requireAuth, async (req, res) => {
   const { crop_instance_id } = req.query;

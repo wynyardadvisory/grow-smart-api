@@ -48,7 +48,30 @@ function resolveEffectiveValues(crop) {
   };
 }
 
-// ── Stage inference ───────────────────────────────────────────────────────────
+// ── Timing status ─────────────────────────────────────────────────────────────
+// Returns 'early', 'peak', or 'late' based on position within a month window
+// adjusted by frost risk and temperature.
+
+function timingStatus(windowStart, windowEnd, weather) {
+  const m = currentMonth();
+  if (!windowStart || !windowEnd) return "peak"; // no window = assume peak
+
+  const windowLen  = windowEnd - windowStart;
+  const posInWindow = m - windowStart; // 0 = first month, windowLen = last month
+
+  // Weather adjustments — frost risk pushes timing later
+  const min7      = weather?.frost_risk_7day ?? null;
+  const frostAdj  = (min7 !== null && min7 <= 2) ? 1 : 0; // add 1 to position if frost risk
+
+  const adjusted = posInWindow + frostAdj;
+
+  if (windowLen <= 1) return adjusted === 0 ? "peak" : "late";
+  if (adjusted === 0)                         return "early";
+  if (adjusted >= windowLen)                  return "late";
+  return "peak";
+}
+
+
 // Scales stage thresholds to the crop's days_to_maturity.
 // Falls back to generic thresholds when DTM is unknown.
 
@@ -361,10 +384,13 @@ class RuleEngine {
               task_type:        "sow",
               urgency,
               due_date:         todayISO(),
+              due_window_start: effectiveSowStart ? `${new Date().getFullYear()}-${String(effectiveSowStart).padStart(2,"0")}-01` : null,
+              due_window_end:   effectiveSowEnd   ? `${new Date().getFullYear()}-${String(effectiveSowEnd).padStart(2,"0")}-28`   : null,
               source:           "rule_engine",
               rule_id:          "sow_prompt",
               date_confidence:  "exact",
-              meta:             JSON.stringify(sowMeta || { status_transition: "sown", sow_method: effectiveSowMethod }),
+              timing_status:    timingStatus(effectiveSowStart, effectiveSowEnd, weather),
+              meta:             JSON.stringify({ ...(sowMeta || { status_transition: "sown", sow_method: effectiveSowMethod }), why: why || null }),
             };
             newTasks.push({ ...task, crop_name: crop.name, rule_id: "sow_prompt" });
             if (!this.dryRun && this.supabase) {
@@ -431,6 +457,9 @@ class RuleEngine {
               task_type:        "transplant",
               urgency:          frostRisk ? "low" : "medium",
               due_date:         todayISO(),
+              due_window_start: txStart ? `${new Date().getFullYear()}-${String(txStart).padStart(2,"0")}-01` : null,
+              due_window_end:   txEnd   ? `${new Date().getFullYear()}-${String(txEnd).padStart(2,"0")}-28`   : null,
+              timing_status:    timingStatus(txStart, txEnd, weather),
               source:           "rule_engine",
               rule_id:          "transplant_prompt",
               date_confidence:  "exact",
@@ -514,6 +543,7 @@ class RuleEngine {
           task_type:        rule.task_type,
           urgency:          rule.urgency,
           due_date:         todayISO(),
+          timing_status:    "peak", // general rules fire when conditions are met = peak
           source:           "rule_engine",
           rule_id:          rule.rule_id,
           date_confidence:  confidence,
