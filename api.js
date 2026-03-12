@@ -1954,7 +1954,8 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     profile_photo:    profile?.photo_url || null,
     plan:             profile?.plan || "free",
     tasks: {
-      today:     tasks.filter(t => t.due_date === today),
+      tasks:     tasks, // full list including overdue
+      today:     tasks.filter(t => t.due_date <= today),
       this_week: tasks.filter(t => t.due_date > today && t.due_date <= weekEnd),
       coming_up: tasks.filter(t => t.due_date > weekEnd),
     },
