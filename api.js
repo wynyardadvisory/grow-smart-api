@@ -518,7 +518,7 @@ Use null for any fields you don't have reliable data for. All month values are i
 
 app.get("/crops", requireAuth, async (req, res) => {
   const { data, error } = await req.db.from("crop_instances")
-    .select("*, area:area_id(name, type), crop_def:crop_def_id(name, harvest_month_start, harvest_month_end, days_to_maturity_min, sow_method), variety:variety_id(name, days_to_maturity_min)")
+    .select("*, area:area_id(name, type), crop_def:crop_def_id(name, harvest_month_start, harvest_month_end, days_to_maturity_min, days_to_maturity_max, sow_method), variety:variety_id(name, days_to_maturity_min, days_to_maturity_max)")
     .eq("user_id", req.user.id).eq("active", true)
     .order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
@@ -1481,9 +1481,9 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
 
 // GET /admin/feedback — admin only
 app.get("/admin/feedback", requireAuth, requireAdmin, async (req, res) => {
-  const { data, error } = await supabaseService
+  const { data, error } = await req.db
     .from("feedback")
-    .select("*, profiles(name)")
+    .select("*, profiles(name, email)")
     .order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
@@ -1547,7 +1547,7 @@ app.get("/admin/users", requireAuth, requireAdmin, async (req, res) => {
   const users = authUsers?.users || [];
 
   // Get profiles for name lookup
-  const { data: profiles } = await supabaseService.from("profiles").select("id, name");
+  const { data: profiles } = await req.db.from("profiles").select("id, name");
   const profileMap = {};
   (profiles || []).forEach(p => { profileMap[p.id] = p.name; });
 
