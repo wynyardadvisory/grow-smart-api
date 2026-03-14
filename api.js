@@ -518,7 +518,7 @@ Use null for any fields you don't have reliable data for. All month values are i
 
 app.get("/crops", requireAuth, async (req, res) => {
   const { data, error } = await req.db.from("crop_instances")
-    .select("*, area:area_id(name, type), crop_def:crop_def_id(name, harvest_month_start, harvest_month_end, days_to_maturity_min, days_to_maturity_max, sow_method), variety:variety_id(name, days_to_maturity_min, days_to_maturity_max)")
+    .select("*, area:area_id(name, type), crop_def:crop_def_id(name, harvest_month_start, harvest_month_end, days_to_maturity_min, sow_method), variety:variety_id(name, days_to_maturity_min)")
     .eq("user_id", req.user.id).eq("active", true)
     .order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
@@ -648,6 +648,45 @@ app.put("/crops/:id", requireAuth, async (req, res) => {
   // Always run rule engine after any crop update — status/sow_date changes affect task generation
   await runRuleEngine(req.user.id);
   res.json(data);
+});
+
+// POST /crops/:id/confirm-stage — lifecycle confirmation from Quick Crop Check
+app.post("/crops/:id/confirm-stage", requireAuth, async (req, res) => {
+  const { stage, confirmed } = req.body;
+  if (!stage) return res.status(400).json({ error: "stage required" });
+
+  const validStages = ["seed","seedling","vegetative","flowering","fruiting","harvesting","finished"];
+  if (!validStages.includes(stage)) return res.status(400).json({ error: "invalid stage" });
+
+  if (confirmed) {
+    // User confirmed — update the stage
+    const { data, error } = await req.db.from("crop_instances")
+      .update({
+        stage,
+        stage_confidence: "confirmed",
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", req.params.id)
+      .eq("user_id", req.user.id)
+      .select().single();
+    if (error) return res.status(500).json({ error: error.message });
+    // Run rule engine so new stage-specific tasks generate immediately
+    await runRuleEngine(req.user.id);
+    res.json({ confirmed: true, stage, crop: data });
+  } else {
+    // User said "not yet" — record a snooze so we don't prompt again for 7 days
+    const snoozeUntil = new Date(Date.now() + 7 * 86400000).toISOString();
+    const { data, error } = await req.db.from("crop_instances")
+      .update({
+        stage_check_snoozed_until: snoozeUntil,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", req.params.id)
+      .eq("user_id", req.user.id)
+      .select().single();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ confirmed: false, snoozed_until: snoozeUntil, crop: data });
+  }
 });
 
 app.get("/crops/:id/enrichment", requireAuth, async (req, res) => {
@@ -1842,7 +1881,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       .order("urgency",  { ascending: false })
       .order("due_date", { ascending: true }),
     req.db.from("crop_instances")
-      .select("id, name, variety, variety_id, sown_date, area_id, missed_task_note, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, pest_window_start, pest_window_end, pest_notes)")
+      .select("id, name, variety, variety_id, sown_date, stage, stage_check_snoozed_until, area_id, missed_task_note, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, days_to_maturity_max, pest_window_start, pest_window_end, pest_notes)")
       .eq("user_id", req.user.id).eq("active", true),
     req.db.from("profiles").select("name, plan, postcode, photo_url").eq("id", req.user.id).single(),
     req.db.from("harvest_log")
@@ -1962,6 +2001,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     },
     crop_count:       crops.length,
     crops_with_flags: crops.filter(c => c.missed_task_note).map(c => ({ id: c.id, name: c.name, missed_task_note: c.missed_task_note })),
+    crops:            crops,
     harvest_forecast: harvestForecast,
     missing_data:     missingData,
     recent_harvests:  harvestRes.data || [],
