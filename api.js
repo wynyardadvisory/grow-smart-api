@@ -2313,6 +2313,115 @@ app.post("/admin/reset-tasks", requireAuth, requireAdmin, async (req, res) => {
 
 
 // =============================================================================
+// SHARE GARDEN — data endpoint for Share My Garden card
+// =============================================================================
+app.get("/share/garden-data", requireAuth, async (req, res) => {
+  const { mode = "recent" } = req.query;
+  const now       = new Date();
+  const today     = now.toISOString().split("T")[0];
+  const dayOfMonth = now.getDate();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split("T")[0];
+  const monthEnd   = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().split("T")[0];
+  const prevMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1).toISOString().split("T")[0];
+  const prevMonthEnd   = new Date(now.getFullYear(), now.getMonth(), 0).toISOString().split("T")[0];
+  const threeDaysAgo   = new Date(Date.now() - 3 * 86400000).toISOString().split("T")[0];
+  const fourteenDaysAgo = new Date(Date.now() - 14 * 86400000).toISOString().split("T")[0];
+  const isEarlyMonth   = dayOfMonth <= 5;
+
+  let completedQuery, upcomingQuery;
+
+  if (mode === "recent") {
+    // Completed: last 3 days, fallback to 14 days
+    const { data: recent } = await req.db.from("tasks")
+      .select("action, task_type, crop:crop_instance_id(name)")
+      .eq("user_id", req.user.id)
+      .gte("completed_at", threeDaysAgo)
+      .not("completed_at", "is", null)
+      .order("completed_at", { ascending: false })
+      .limit(3);
+
+    let completed = recent || [];
+
+    if (completed.length === 0) {
+      const { data: fallback } = await req.db.from("tasks")
+        .select("action, task_type, crop:crop_instance_id(name)")
+        .eq("user_id", req.user.id)
+        .gte("completed_at", fourteenDaysAgo)
+        .not("completed_at", "is", null)
+        .order("completed_at", { ascending: false })
+        .limit(3);
+      completed = fallback || [];
+    }
+
+    // Upcoming: next 2 tasks
+    const { data: upcoming } = await req.db.from("tasks")
+      .select("action, task_type, due_date, crop:crop_instance_id(name)")
+      .eq("user_id", req.user.id)
+      .is("completed_at", null)
+      .gt("due_date", today)
+      .order("due_date", { ascending: true })
+      .limit(2);
+
+    completedQuery = completed;
+    upcomingQuery  = upcoming || [];
+
+  } else {
+    // This month mode
+    const completedFrom = isEarlyMonth ? prevMonthStart : monthStart;
+    const completedTo   = isEarlyMonth ? prevMonthEnd   : today;
+    const upcomingFrom  = isEarlyMonth ? monthStart     : today;
+    const upcomingTo    = monthEnd;
+
+    const { data: completed } = await req.db.from("tasks")
+      .select("action, task_type, crop:crop_instance_id(name), completed_at")
+      .eq("user_id", req.user.id)
+      .gte("completed_at", completedFrom)
+      .lte("completed_at", completedTo)
+      .not("completed_at", "is", null)
+      .order("completed_at", { ascending: false })
+      .limit(5);
+
+    const { data: upcoming } = await req.db.from("tasks")
+      .select("action, task_type, due_date, crop:crop_instance_id(name)")
+      .eq("user_id", req.user.id)
+      .is("completed_at", null)
+      .gt("due_date", upcomingFrom)
+      .lte("due_date", upcomingTo)
+      .order("due_date", { ascending: true })
+      .limit(3);
+
+    completedQuery = completed || [];
+    upcomingQuery  = upcoming  || [];
+  }
+
+  // Profile for name + location
+  const { data: profile } = await req.db.from("profiles")
+    .select("name, postcode").eq("id", req.user.id).single();
+
+  // Crop count
+  const { count: cropCount } = await req.db.from("crop_instances")
+    .select("*", { count: "exact", head: true })
+    .eq("user_id", req.user.id).eq("active", true);
+
+  // Harvest count this month
+  const { count: harvestCount } = await req.db.from("harvest_log")
+    .select("*", { count: "exact", head: true })
+    .eq("user_id", req.user.id)
+    .gte("harvested_at", monthStart);
+
+  res.json({
+    mode,
+    is_early_month: isEarlyMonth,
+    profile: { name: profile?.name || null, postcode: profile?.postcode || null },
+    completed: completedQuery,
+    upcoming:  upcomingQuery,
+    stats: { crop_count: cropCount || 0, harvest_count: harvestCount || 0, completed_count: completedQuery.length },
+    month_name: now.toLocaleString("en-GB", { month: "long" }),
+    prev_month_name: new Date(now.getFullYear(), now.getMonth() - 1, 1).toLocaleString("en-GB", { month: "long" }),
+  });
+});
+
+// =============================================================================
 // CRON — called by Vercel Cron at 06:00 UTC daily
 // Protected by CRON_SECRET header.
 // Configure in vercel.json: { "crons": [{ "path": "/cron/daily", "schedule": "0 6 * * *" }] }
