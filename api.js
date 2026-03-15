@@ -2001,10 +2001,19 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     else                frostRisk = "low";
   }
 
+  // Count tasks completed this week
+  const weekStart = new Date(Date.now() - 7 * 86400000).toISOString().split("T")[0];
+  const { count: tasksCompletedThisWeek } = await req.db.from("tasks")
+    .select("*", { count: "exact", head: true })
+    .eq("user_id", req.user.id)
+    .gte("completed_at", weekStart)
+    .not("completed_at", "is", null);
+
   res.json({
     user:             profile?.name,
     profile_photo:    profile?.photo_url || null,
     plan:             profile?.plan || "free",
+    tasks_completed_this_week: tasksCompletedThisWeek || 0,
     tasks: {
       tasks:     tasks, // full list including overdue
       today:     tasks.filter(t => t.due_date <= today),
