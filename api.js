@@ -674,18 +674,30 @@ app.post("/crops/:id/confirm-stage", requireAuth, async (req, res) => {
     await runRuleEngine(req.user.id);
     res.json({ confirmed: true, stage, crop: data });
   } else {
-    // User said "not yet" — record a snooze so we don't prompt again for 7 days
+    // User said "not yet" — snooze prompt for 7 days AND add 7 to stage_delay_days
+    // stage_delay_days shifts all downstream predictions (harvest estimate etc)
     const snoozeUntil = new Date(Date.now() + 7 * 86400000).toISOString();
+
+    // Get current delay so we can increment it
+    const { data: current } = await req.db.from("crop_instances")
+      .select("stage_delay_days")
+      .eq("id", req.params.id)
+      .eq("user_id", req.user.id)
+      .single();
+
+    const currentDelay = current?.stage_delay_days || 0;
+
     const { data, error } = await req.db.from("crop_instances")
       .update({
         stage_check_snoozed_until: snoozeUntil,
+        stage_delay_days: currentDelay + 7,
         updated_at: new Date().toISOString(),
       })
       .eq("id", req.params.id)
       .eq("user_id", req.user.id)
       .select().single();
     if (error) return res.status(500).json({ error: error.message });
-    res.json({ confirmed: false, snoozed_until: snoozeUntil, crop: data });
+    res.json({ confirmed: false, snoozed_until: snoozeUntil, stage_delay_days: currentDelay + 7, crop: data });
   }
 });
 
@@ -1881,7 +1893,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       .order("urgency",  { ascending: false })
       .order("due_date", { ascending: true }),
     req.db.from("crop_instances")
-      .select("id, name, variety, variety_id, sown_date, stage, stage_check_snoozed_until, area_id, missed_task_note, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, days_to_maturity_max, pest_window_start, pest_window_end, pest_notes)")
+      .select("id, name, variety, variety_id, sown_date, stage, stage_delay_days, stage_check_snoozed_until, area_id, missed_task_note, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, days_to_maturity_max, pest_window_start, pest_window_end, pest_notes)")
       .eq("user_id", req.user.id).eq("active", true),
     req.db.from("profiles").select("name, plan, postcode, photo_url").eq("id", req.user.id).single(),
     req.db.from("harvest_log")
