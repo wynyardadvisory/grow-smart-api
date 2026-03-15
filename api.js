@@ -2338,7 +2338,7 @@ app.get("/share/garden-data", requireAuth, async (req, res) => {
       .gte("completed_at", threeDaysAgo)
       .not("completed_at", "is", null)
       .order("completed_at", { ascending: false })
-      .limit(3);
+      .limit(8);
 
     let completed = recent || [];
 
@@ -2349,7 +2349,7 @@ app.get("/share/garden-data", requireAuth, async (req, res) => {
         .gte("completed_at", fourteenDaysAgo)
         .not("completed_at", "is", null)
         .order("completed_at", { ascending: false })
-        .limit(3);
+        .limit(8);
       completed = fallback || [];
     }
 
