@@ -2771,187 +2771,163 @@ app.post("/badges/mark-shown", requireAuth, async (req, res) => {
 // =============================================================================
 // ADMIN — One-time badge backfill for all existing users
 // =============================================================================
+// Rewritten to be fast: fetches all data in bulk, processes per user in memory
 app.post("/admin/backfill-badges", requireAuth, requireAdmin, async (req, res) => {
   try {
-    const { data: { users } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
-    if (!users?.length) return res.json({ ok: true, users: 0 });
+    const now         = new Date();
+    const monthKey    = now.toISOString().slice(0, 7);
+    const m           = now.getMonth() + 1;
+    const currentSeason = m>=3&&m<=5?"spring":m>=6&&m<=8?"summer":m>=9&&m<=11?"autumn":"winter";
+    const monthStart  = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split("T")[0];
+    const seasonStart = m>=3&&m<=5?`${now.getFullYear()}-03-01`:m>=6&&m<=8?`${now.getFullYear()}-06-01`:m>=9&&m<=11?`${now.getFullYear()}-09-01`:m===12?`${now.getFullYear()}-12-01`:`${now.getFullYear()-1}-12-01`;
+    const today       = now.toISOString().split("T")[0];
+    const yesterday   = new Date(Date.now()-86400000).toISOString().split("T")[0];
 
-    const results = [];
+    // 1. Get all users
+    const { data: { users } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
+    if (!users?.length) return res.json({ ok: true, processed: 0 });
+    const userIds = users.map(u => u.id);
+
+    // 2. Bulk fetch all data in parallel
+    const [
+      { data: allTasks },
+      { data: allCrops },
+      { data: allLocations },
+      { data: allAreas },
+      { data: allHarvests },
+      { data: allPhotos },
+      { data: allBadges },
+    ] = await Promise.all([
+      supabaseService.from("tasks").select("user_id, task_type, completed_at").not("completed_at", "is", null),
+      supabaseService.from("crop_instances").select("user_id, active").eq("active", true),
+      supabaseService.from("locations").select("id, user_id"),
+      supabaseService.from("growing_areas").select("id, location_id"),
+      supabaseService.from("harvest_log").select("user_id, harvested_at"),
+      supabaseService.from("crop_photos").select("user_id"),
+      supabaseService.from("badge_definitions").select("*").eq("is_active", true),
+    ]);
+
+    // 3. Build location→user map for areas
+    const locUserMap = {};
+    (allLocations || []).forEach(l => { locUserMap[l.id] = l.user_id; });
+
+    // 4. Process each user in memory
+    const counterUpserts = [];
+    const badgeUpserts   = [];
+    const unlockInserts  = [];
+    const results        = [];
 
     for (const user of users) {
       const uid = user.id;
-      try {
-        // Ensure counters row exists
-        const { data: existing } = await supabaseService
-          .from("user_activity_counters").select("user_id").eq("user_id", uid).single();
-        if (!existing) {
-          await supabaseService.from("user_activity_counters").insert({
-            user_id: uid,
-            current_month_key:  new Date().toISOString().slice(0, 7),
-            current_season_key: (() => { const m = new Date().getMonth() + 1; return m>=3&&m<=5?"spring":m>=6&&m<=8?"summer":m>=9&&m<=11?"autumn":"winter"; })(),
+
+      const userTasks    = (allTasks    || []).filter(t => t.user_id === uid);
+      const userCrops    = (allCrops    || []).filter(c => c.user_id === uid);
+      const userHarvests = (allHarvests || []).filter(h => h.user_id === uid);
+      const userPhotos   = (allPhotos   || []).filter(p => p.user_id === uid);
+      const userLocIds   = (allLocations|| []).filter(l => l.user_id === uid).map(l => l.id);
+      const userAreas    = (allAreas    || []).filter(a => userLocIds.includes(a.location_id));
+
+      // Task counts
+      const tasksTotal  = userTasks.length;
+      const tasksMonth  = userTasks.filter(t => t.completed_at >= monthStart).length;
+      const tasksSeason = userTasks.filter(t => t.completed_at >= seasonStart).length;
+      const sowTotal    = userTasks.filter(t => t.task_type === "sow").length;
+      const sowMonth    = userTasks.filter(t => t.task_type === "sow" && t.completed_at >= monthStart).length;
+      const sowSeason   = userTasks.filter(t => t.task_type === "sow" && t.completed_at >= seasonStart).length;
+
+      // Harvest counts
+      const harvestTotal = userHarvests.length;
+      const harvestMonth = userHarvests.filter(h => h.harvested_at >= monthStart).length;
+
+      // Streak
+      const distinctDays = [...new Set(userTasks.map(t => t.completed_at.split("T")[0]))].sort().reverse();
+      let streak = 0, longest = 0, cur = 0;
+      for (let i = 0; i < distinctDays.length; i++) {
+        if (i === 0) { cur = 1; continue; }
+        const diff = (new Date(distinctDays[i-1]) - new Date(distinctDays[i])) / 86400000;
+        if (diff === 1) cur++;
+        else { longest = Math.max(longest, cur); cur = 1; }
+      }
+      longest = Math.max(longest, cur);
+      if (distinctDays[0] === today || distinctDays[0] === yesterday) streak = cur;
+      const activeDatesMonth = distinctDays.filter(d => d >= monthStart);
+
+      const counters = {
+        user_id:                             uid,
+        tasks_completed_total:               tasksTotal,
+        tasks_completed_this_month:          tasksMonth,
+        tasks_completed_this_season:         tasksSeason,
+        tasks_completed_distinct_days_month: activeDatesMonth.length,
+        crops_added_total:                   userCrops.length,
+        growing_areas_created_total:         userAreas.length,
+        sowing_logged_total:                 sowTotal,
+        sowing_logged_this_month:            sowMonth,
+        sowing_logged_this_season:           sowSeason,
+        harvest_logged_total:                harvestTotal,
+        harvest_logged_this_month:           harvestMonth,
+        photos_uploaded_total:               userPhotos.length,
+        share_count_total:                   0,
+        current_streak_days:                 streak,
+        longest_streak_days:                 longest,
+        last_qualifying_activity_date:       distinctDays[0] || null,
+        active_dates_this_month:             activeDatesMonth,
+        current_month_key:                   monthKey,
+        current_season_key:                  currentSeason,
+        updated_at:                          now.toISOString(),
+      };
+      counterUpserts.push(counters);
+
+      // Badge progress
+      for (const badge of (allBadges || [])) {
+        const val       = counters[badge.threshold_type] || 0;
+        const completed = val >= badge.threshold_value;
+        const progress  = Math.min(val, badge.threshold_value);
+        if (progress === 0 && !completed) continue;
+
+        badgeUpserts.push({
+          user_id:               uid,
+          badge_id:              badge.id,
+          current_progress:      progress,
+          is_completed:          completed,
+          completed_at:          completed ? now.toISOString() : null,
+          month_key:             badge.time_scope === "monthly"  ? monthKey : "",
+          season_key:            badge.time_scope === "seasonal" ? currentSeason : "",
+          last_progress_event_at: now.toISOString(),
+        });
+
+        if (completed) {
+          unlockInserts.push({
+            user_id:      uid,
+            badge_id:     badge.id,
+            month_key:    badge.time_scope === "monthly"  ? monthKey  : null,
+            season_key:   badge.time_scope === "seasonal" ? currentSeason : null,
+            shown_to_user: true,
           });
         }
-
-        // Count tasks completed
-        const { count: tasksTotal } = await supabaseService.from("tasks")
-          .select("*", { count:"exact", head:true }).eq("user_id", uid).not("completed_at", "is", null);
-
-        // Count tasks this month
-        const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString();
-        const { count: tasksMonth } = await supabaseService.from("tasks")
-          .select("*", { count:"exact", head:true }).eq("user_id", uid)
-          .not("completed_at", "is", null).gte("completed_at", monthStart);
-
-        // Count tasks this season
-        const seasonMonths = { spring:[3,4,5], summer:[6,7,8], autumn:[9,10,11], winter:[12,1,2] };
-        const currentSeason = (() => { const m = new Date().getMonth() + 1; return m>=3&&m<=5?"spring":m>=6&&m<=8?"summer":m>=9&&m<=11?"autumn":"winter"; })();
-        const seasonStart = (() => {
-          const y = new Date().getFullYear(); const m = new Date().getMonth() + 1;
-          if (m>=3&&m<=5) return `${y}-03-01`;
-          if (m>=6&&m<=8) return `${y}-06-01`;
-          if (m>=9&&m<=11) return `${y}-09-01`;
-          return m===12 ? `${y}-12-01` : `${y-1}-12-01`;
-        })();
-        const { count: tasksSeason } = await supabaseService.from("tasks")
-          .select("*", { count:"exact", head:true }).eq("user_id", uid)
-          .not("completed_at", "is", null).gte("completed_at", seasonStart);
-
-        // Crops added
-        const { count: cropsTotal } = await supabaseService.from("crop_instances")
-          .select("*", { count:"exact", head:true }).eq("user_id", uid);
-
-        // Growing areas
-        const { count: areasTotal } = await supabaseService.from("growing_areas")
-          .select("*, location:location_id(user_id)", { count:"exact", head:true });
-        // Areas via locations
-        const { data: locations } = await supabaseService.from("locations").select("id").eq("user_id", uid);
-        const locIds = (locations || []).map(l => l.id);
-        let areasCount = 0;
-        if (locIds.length) {
-          const { count } = await supabaseService.from("growing_areas")
-            .select("*", { count:"exact", head:true }).in("location_id", locIds);
-          areasCount = count || 0;
-        }
-
-        // Sowing logged — tasks of type sow that are completed
-        const { count: sowTotal } = await supabaseService.from("tasks")
-          .select("*", { count:"exact", head:true }).eq("user_id", uid)
-          .eq("task_type", "sow").not("completed_at", "is", null);
-        const { count: sowMonth } = await supabaseService.from("tasks")
-          .select("*", { count:"exact", head:true }).eq("user_id", uid)
-          .eq("task_type", "sow").not("completed_at", "is", null).gte("completed_at", monthStart);
-        const { count: sowSeason } = await supabaseService.from("tasks")
-          .select("*", { count:"exact", head:true }).eq("user_id", uid)
-          .eq("task_type", "sow").not("completed_at", "is", null).gte("completed_at", seasonStart);
-
-        // Harvests
-        const { count: harvestTotal } = await supabaseService.from("harvest_log")
-          .select("*", { count:"exact", head:true }).eq("user_id", uid);
-        const { count: harvestMonth } = await supabaseService.from("harvest_log")
-          .select("*", { count:"exact", head:true }).eq("user_id", uid).gte("harvested_at", monthStart);
-
-        // Photos
-        const { count: photosTotal } = await supabaseService.from("crop_photos")
-          .select("*", { count:"exact", head:true }).eq("user_id", uid);
-
-        // Streak — calculate from distinct days of task completions
-        const { data: taskDates } = await supabaseService.from("tasks")
-          .select("completed_at").eq("user_id", uid).not("completed_at", "is", null)
-          .order("completed_at", { ascending: false });
-        const distinctDays = [...new Set((taskDates || []).map(t => t.completed_at.split("T")[0]))];
-        let streak = 0, longest = 0, cur = 0;
-        for (let i = 0; i < distinctDays.length; i++) {
-          if (i === 0) { cur = 1; continue; }
-          const diff = (new Date(distinctDays[i-1]) - new Date(distinctDays[i])) / 86400000;
-          if (diff === 1) cur++;
-          else { longest = Math.max(longest, cur); cur = 1; }
-        }
-        longest = Math.max(longest, cur);
-        // Current streak — only if last activity was today or yesterday
-        const today = new Date().toISOString().split("T")[0];
-        const yesterday = new Date(Date.now()-86400000).toISOString().split("T")[0];
-        if (distinctDays[0] === today || distinctDays[0] === yesterday) streak = cur;
-
-        // Active dates this month for distinct-day challenge
-        const activeDatesMonth = distinctDays.filter(d => d >= monthStart.split("T")[0]);
-
-        // Update counters
-        await supabaseService.from("user_activity_counters").update({
-          tasks_completed_total:               tasksTotal || 0,
-          tasks_completed_this_month:          tasksMonth || 0,
-          tasks_completed_this_season:         tasksSeason || 0,
-          tasks_completed_distinct_days_month: activeDatesMonth.length,
-          crops_added_total:                   cropsTotal || 0,
-          growing_areas_created_total:         areasCount,
-          sowing_logged_total:                 sowTotal || 0,
-          sowing_logged_this_month:            sowMonth || 0,
-          sowing_logged_this_season:           sowSeason || 0,
-          harvest_logged_total:                harvestTotal || 0,
-          harvest_logged_this_month:           harvestMonth || 0,
-          photos_uploaded_total:               photosTotal || 0,
-          share_count_total:                   0,
-          current_streak_days:                 streak,
-          longest_streak_days:                 longest,
-          last_qualifying_activity_date:       distinctDays[0] || null,
-          active_dates_this_month:             activeDatesMonth,
-          updated_at:                          new Date().toISOString(),
-        }).eq("user_id", uid);
-
-        // Now evaluate ALL badges for this user based on fresh counters
-        const { data: freshCounters } = await supabaseService
-          .from("user_activity_counters").select("*").eq("user_id", uid).single();
-        const { data: allBadges } = await supabaseService
-          .from("badge_definitions").select("*").eq("is_active", true);
-
-        for (const badge of (allBadges || [])) {
-          const val = freshCounters[badge.threshold_type] || 0;
-          const completed = val >= badge.threshold_value;
-          const progress  = Math.min(val, badge.threshold_value);
-          if (progress === 0 && !completed) continue;
-
-          const monthKey  = badge.time_scope === "monthly"  ? new Date().toISOString().slice(0,7) : "";
-          const seasonKey = badge.time_scope === "seasonal" ? currentSeason : "";
-
-          await supabaseService.from("user_badge_progress").upsert({
-            user_id:               uid,
-            badge_id:              badge.id,
-            current_progress:      progress,
-            is_completed:          completed,
-            completed_at:          completed ? new Date().toISOString() : null,
-            month_key:             monthKey,
-            season_key:            seasonKey,
-            last_progress_event_at: new Date().toISOString(),
-          }, { onConflict: "user_id,badge_id,month_key" });
-
-          // Log unlock event if completed (mark as already shown — this is historical)
-          if (completed) {
-            const { data: existingUnlock } = await supabaseService.from("badge_unlock_events")
-              .select("id").eq("user_id", uid).eq("badge_id", badge.id).maybeSingle();
-            if (!existingUnlock) {
-              await supabaseService.from("badge_unlock_events").insert({
-                user_id:      uid,
-                badge_id:     badge.id,
-                month_key:    monthKey || null,
-                season_key:   seasonKey || null,
-                shown_to_user: true, // historical — don't show celebration
-              });
-            }
-          }
-        }
-
-        results.push({ user_id: uid, email: user.email, tasks: tasksTotal, crops: cropsTotal, harvests: harvestTotal });
-      } catch (userErr) {
-        console.error(`Backfill error for ${uid}:`, userErr.message);
-        results.push({ user_id: uid, error: userErr.message });
       }
+
+      results.push({ user_id: uid, email: user.email, tasks: tasksTotal, crops: userCrops.length, harvests: harvestTotal });
     }
 
-    res.json({ ok: true, processed: results.length, results });
+    // 5. Bulk upsert everything
+    await supabaseService.from("user_activity_counters").upsert(counterUpserts, { onConflict: "user_id" });
+    if (badgeUpserts.length) {
+      await supabaseService.from("user_badge_progress").upsert(badgeUpserts, { onConflict: "user_id,badge_id,month_key" });
+    }
+    // Insert unlocks only if they don't already exist
+    for (const unlock of unlockInserts) {
+      await supabaseService.from("badge_unlock_events")
+        .upsert(unlock, { onConflict: "user_id,badge_id" })
+        .then(() => {}).catch(() => {});
+    }
+
+    res.json({ ok: true, processed: users.length, results });
   } catch (e) {
     console.error("[Backfill]", e.message);
     res.status(500).json({ error: e.message });
   }
 });
+
 
 // =============================================================================
 // CRON — called by Vercel Cron at 06:00 UTC daily
