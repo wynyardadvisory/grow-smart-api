@@ -189,6 +189,7 @@ app.post("/areas", requireAuth,
       .insert({ location_id, name, type, width_m, length_m, sun_exposure, notes })
       .select().single();
     if (error) return res.status(500).json({ error: error.message });
+    processBadgeEvent(req.user.id, "area_created").catch(console.error);
     res.status(201).json(data);
   }
 );
@@ -621,6 +622,8 @@ app.post("/crops", requireAuth,
 
     // Clear planting suggestions for this area — bed is no longer empty
     if (data.area_id) await clearSuggestions(data.area_id, req.db);
+    processBadgeEvent(req.user.id, "crop_added").catch(console.error);
+    if (data.sown_date) processBadgeEvent(req.user.id, "sow_logged").catch(console.error);
 
     res.status(201).json({ ...data, enriching: needsEnrichment });
   }
@@ -787,6 +790,8 @@ app.post("/tasks/:id/complete", requireAuth, async (req, res) => {
     }
   }
 
+  // Badge event
+  processBadgeEvent(req.user.id, "task_completed").catch(console.error);
   res.json(data);
 });
 
@@ -1188,6 +1193,7 @@ app.post("/crops/:id/photos", requireAuth, async (req, res) => {
     }).select().single();
 
     if (error) throw new Error(error.message);
+    processBadgeEvent(req.user.id, "photo_uploaded").catch(console.error);
     res.status(201).json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1752,6 +1758,7 @@ app.post("/harvest-log", requireAuth,
         .eq("user_id", req.user.id);
     }
 
+    processBadgeEvent(req.user.id, "harvest_logged").catch(console.error);
     res.status(201).json(data);
   }
 );
@@ -2418,6 +2425,7 @@ app.get("/share/garden-data", requireAuth, async (req, res) => {
     .eq("user_id", req.user.id)
     .gte("harvested_at", monthStart);
 
+  processBadgeEvent(req.user.id, "garden_shared").catch(console.error);
   res.json({
     mode,
     is_early_month: isEarlyMonth,
@@ -2428,6 +2436,335 @@ app.get("/share/garden-data", requireAuth, async (req, res) => {
     month_name: now.toLocaleString("en-GB", { month: "long" }),
     prev_month_name: new Date(now.getFullYear(), now.getMonth() - 1, 1).toLocaleString("en-GB", { month: "long" }),
   });
+});
+
+// =============================================================================
+// BADGES & CHALLENGES ENGINE
+// =============================================================================
+
+// Season helper
+function getCurrentSeason() {
+  const m = new Date().getMonth() + 1; // 1-12
+  if (m >= 3 && m <= 5)  return "spring";
+  if (m >= 6 && m <= 8)  return "summer";
+  if (m >= 9 && m <= 11) return "autumn";
+  return "winter";
+}
+
+function getMonthKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function getTodayISO() {
+  return new Date().toISOString().split("T")[0];
+}
+
+// Ensure user has a counters row
+async function ensureCounters(userId) {
+  const { data } = await supabaseService
+    .from("user_activity_counters")
+    .select("user_id")
+    .eq("user_id", userId)
+    .single();
+  if (!data) {
+    await supabaseService.from("user_activity_counters").insert({
+      user_id: userId,
+      current_month_key:  getMonthKey(),
+      current_season_key: getCurrentSeason(),
+    });
+  }
+}
+
+// Reset monthly/seasonal counters if month/season has rolled over
+async function checkAndResetCounters(userId) {
+  const { data: counters } = await supabaseService
+    .from("user_activity_counters")
+    .select("*")
+    .eq("user_id", userId)
+    .single();
+  if (!counters) return;
+
+  const updates = {};
+  const monthKey  = getMonthKey();
+  const seasonKey = getCurrentSeason();
+
+  if (counters.current_month_key !== monthKey) {
+    updates.tasks_completed_this_month          = 0;
+    updates.sowing_logged_this_month            = 0;
+    updates.harvest_logged_this_month           = 0;
+    updates.photos_uploaded_this_month          = 0;
+    updates.tasks_completed_distinct_days_month = 0;
+    updates.active_dates_this_month             = [];
+    updates.current_month_key                   = monthKey;
+  }
+  if (counters.current_season_key !== seasonKey) {
+    updates.tasks_completed_this_season  = 0;
+    updates.sowing_logged_this_season    = 0;
+    updates.current_season_key           = seasonKey;
+  }
+  if (Object.keys(updates).length > 0) {
+    await supabaseService.from("user_activity_counters").update(updates).eq("user_id", userId);
+  }
+}
+
+// Update streak
+async function updateStreak(userId, counters) {
+  const today = getTodayISO();
+  const last  = counters.last_qualifying_activity_date;
+  if (last === today) return {}; // already counted today
+
+  const yesterday = new Date(Date.now() - 86400000).toISOString().split("T")[0];
+  const newStreak = last === yesterday ? (counters.current_streak_days || 0) + 1 : 1;
+  const longest   = Math.max(counters.longest_streak_days || 0, newStreak);
+
+  return {
+    current_streak_days:           newStreak,
+    longest_streak_days:           longest,
+    last_qualifying_activity_date: today,
+  };
+}
+
+// Core badge evaluation — checks all relevant badges for an event type
+async function evaluateBadges(userId, eventType, counters) {
+  const unlocks = [];
+
+  // Map event type to relevant badge threshold_types
+  const relevantThresholds = {
+    task_completed:   ["tasks_completed_total", "tasks_completed_this_month", "tasks_completed_this_season", "current_streak_days"],
+    crop_added:       ["crops_added_total"],
+    area_created:     ["growing_areas_created_total"],
+    sow_logged:       ["sowing_logged_total", "sowing_logged_this_month", "sowing_logged_this_season", "current_streak_days"],
+    harvest_logged:   ["harvest_logged_total", "harvest_logged_this_month", "current_streak_days"],
+    photo_uploaded:   ["photos_uploaded_total", "photos_uploaded_this_month"],
+    garden_shared:    ["share_count_total"],
+  }[eventType] || [];
+
+  // Load relevant badge definitions
+  const { data: badges } = await supabaseService
+    .from("badge_definitions")
+    .select("*")
+    .in("threshold_type", relevantThresholds)
+    .eq("is_active", true);
+
+  if (!badges?.length) return unlocks;
+
+  const monthKey  = getMonthKey();
+  const seasonKey = getCurrentSeason();
+
+  for (const badge of badges) {
+    // Check if already completed (for this month/season if applicable)
+    const { data: existing } = await supabaseService
+      .from("user_badge_progress")
+      .select("is_completed, current_progress")
+      .eq("user_id", userId)
+      .eq("badge_id", badge.id)
+      .eq("month_key", badge.time_scope === "monthly" ? monthKey : "")
+      .maybeSingle();
+
+    if (existing?.is_completed) continue;
+
+    // Get current value for this badge's threshold
+    const currentValue = counters[badge.threshold_type] || 0;
+    const progress     = Math.min(currentValue, badge.threshold_value);
+    const completed    = currentValue >= badge.threshold_value;
+
+    // Upsert progress
+    await supabaseService.from("user_badge_progress").upsert({
+      user_id:               userId,
+      badge_id:              badge.id,
+      current_progress:      progress,
+      is_completed:          completed,
+      completed_at:          completed ? new Date().toISOString() : null,
+      month_key:             badge.time_scope === "monthly" ? monthKey : "",
+      season_key:            badge.time_scope === "seasonal" ? seasonKey : "",
+      last_progress_event_at: new Date().toISOString(),
+    }, { onConflict: "user_id,badge_id,month_key" });
+
+    if (completed && !existing?.is_completed) {
+      // Log unlock event
+      await supabaseService.from("badge_unlock_events").insert({
+        user_id:    userId,
+        badge_id:   badge.id,
+        month_key:  badge.time_scope === "monthly"  ? monthKey  : null,
+        season_key: badge.time_scope === "seasonal" ? seasonKey : null,
+      });
+
+      // Get next badge hint
+      let nextBadge = null;
+      if (badge.next_badge_id) {
+        const { data: nb } = await supabaseService
+          .from("badge_definitions")
+          .select("title")
+          .eq("id", badge.next_badge_id)
+          .single();
+        nextBadge = nb?.title || null;
+      }
+
+      unlocks.push({
+        badge_id:              badge.id,
+        title:                 badge.title,
+        description:           badge.description,
+        celebration_copy:      badge.celebration_copy,
+        icon_key:              badge.icon_key,
+        type:                  badge.type,
+        next_badge_title:      nextBadge,
+      });
+    }
+  }
+  return unlocks;
+}
+
+// Main badge event processor — called from various endpoints
+async function processBadgeEvent(userId, eventType, extraCounterUpdates = {}) {
+  try {
+    await ensureCounters(userId);
+    await checkAndResetCounters(userId);
+
+    const { data: counters } = await supabaseService
+      .from("user_activity_counters")
+      .select("*")
+      .eq("user_id", userId)
+      .single();
+
+    if (!counters) return [];
+
+    const today    = getTodayISO();
+    const monthKey = getMonthKey();
+
+    // Build counter increments based on event type
+    const updates = { updated_at: new Date().toISOString(), ...extraCounterUpdates };
+
+    if (eventType === "task_completed") {
+      updates.tasks_completed_total         = (counters.tasks_completed_total        || 0) + 1;
+      updates.tasks_completed_this_month    = (counters.tasks_completed_this_month   || 0) + 1;
+      updates.tasks_completed_this_season   = (counters.tasks_completed_this_season  || 0) + 1;
+      // Track distinct days
+      const activeDates = counters.active_dates_this_month || [];
+      if (!activeDates.includes(today)) {
+        updates.active_dates_this_month             = [...activeDates, today];
+        updates.tasks_completed_distinct_days_month = (counters.tasks_completed_distinct_days_month || 0) + 1;
+      }
+    } else if (eventType === "crop_added") {
+      updates.crops_added_total = (counters.crops_added_total || 0) + 1;
+    } else if (eventType === "area_created") {
+      updates.growing_areas_created_total = (counters.growing_areas_created_total || 0) + 1;
+    } else if (eventType === "sow_logged") {
+      updates.sowing_logged_total        = (counters.sowing_logged_total       || 0) + 1;
+      updates.sowing_logged_this_month   = (counters.sowing_logged_this_month  || 0) + 1;
+      updates.sowing_logged_this_season  = (counters.sowing_logged_this_season || 0) + 1;
+    } else if (eventType === "harvest_logged") {
+      updates.harvest_logged_total       = (counters.harvest_logged_total      || 0) + 1;
+      updates.harvest_logged_this_month  = (counters.harvest_logged_this_month || 0) + 1;
+    } else if (eventType === "photo_uploaded") {
+      updates.photos_uploaded_total      = (counters.photos_uploaded_total     || 0) + 1;
+      updates.photos_uploaded_this_month = (counters.photos_uploaded_this_month|| 0) + 1;
+    } else if (eventType === "garden_shared") {
+      updates.share_count_total = (counters.share_count_total || 0) + 1;
+    }
+
+    // Streak update for qualifying events
+    const qualifyingEvents = ["task_completed", "sow_logged", "harvest_logged", "crop_added", "photo_uploaded", "garden_shared"];
+    if (qualifyingEvents.includes(eventType)) {
+      const streakUpdates = await updateStreak(userId, { ...counters, ...updates });
+      Object.assign(updates, streakUpdates);
+    }
+
+    // Apply counter updates
+    await supabaseService.from("user_activity_counters").update(updates).eq("user_id", userId);
+
+    // Get fresh counters for badge evaluation
+    const freshCounters = { ...counters, ...updates };
+
+    // Evaluate badges
+    const unlocks = await evaluateBadges(userId, eventType, freshCounters);
+    return unlocks;
+  } catch (err) {
+    console.error("[BadgeEngine]", err.message);
+    return [];
+  }
+}
+
+// GET /badges — user's full badge state
+app.get("/badges", requireAuth, async (req, res) => {
+  try {
+    const userId    = req.user.id;
+    const monthKey  = getMonthKey();
+    const seasonKey = getCurrentSeason();
+
+    await ensureCounters(userId);
+    await checkAndResetCounters(userId);
+
+    const [{ data: allBadges }, { data: progress }, { data: counters }, { data: recentUnlocks }] = await Promise.all([
+      supabaseService.from("badge_definitions").select("*").eq("is_active", true).order("sort_order"),
+      supabaseService.from("user_badge_progress").select("*").eq("user_id", userId),
+      supabaseService.from("user_activity_counters").select("*").eq("user_id", userId).single(),
+      supabaseService.from("badge_unlock_events").select("*, badge:badge_id(*)").eq("user_id", userId).order("unlocked_at", { ascending: false }).limit(10),
+    ]);
+
+    // Build progress map
+    const progressMap = {};
+    (progress || []).forEach(p => { progressMap[p.badge_id + (p.month_key || "")] = p; });
+
+    // Enrich badges with user progress
+    const enriched = (allBadges || []).map(badge => {
+      const key = badge.id + (badge.time_scope === "monthly" ? monthKey : "");
+      const p   = progressMap[key];
+      const currentValue = counters ? (counters[badge.threshold_type] || 0) : 0;
+      return {
+        ...badge,
+        current_progress: p?.current_progress ?? Math.min(currentValue, badge.threshold_value),
+        is_completed:     p?.is_completed ?? false,
+        completed_at:     p?.completed_at ?? null,
+      };
+    });
+
+    // Monthly challenge progress (distinct days)
+    const monthlyChallenge = {
+      title:        `${new Date().toLocaleString("en-GB", { month: "long" })} Grower`,
+      description:  `Complete 12 garden tasks in ${new Date().toLocaleString("en-GB", { month: "long" })}`,
+      icon_key:     "🌿",
+      type:         "monthly",
+      threshold:    12,
+      progress:     counters?.tasks_completed_this_month || 0,
+      is_completed: (counters?.tasks_completed_this_month || 0) >= 12,
+    };
+
+    res.json({
+      badges:            enriched,
+      counters:          counters || {},
+      recent_unlocks:    recentUnlocks || [],
+      monthly_challenge: monthlyChallenge,
+      season:            seasonKey,
+      month_key:         monthKey,
+    });
+  } catch (e) {
+    console.error("[Badges]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /badges/pending-unlocks — unlocks not yet shown to user
+app.get("/badges/pending-unlocks", requireAuth, async (req, res) => {
+  const { data, error } = await supabaseService
+    .from("badge_unlock_events")
+    .select("*, badge:badge_id(*)")
+    .eq("user_id", req.user.id)
+    .eq("shown_to_user", false)
+    .order("unlocked_at", { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// POST /badges/mark-shown — mark unlock events as shown
+app.post("/badges/mark-shown", requireAuth, async (req, res) => {
+  const { ids } = req.body;
+  if (!ids?.length) return res.json({ ok: true });
+  await supabaseService.from("badge_unlock_events")
+    .update({ shown_to_user: true })
+    .in("id", ids)
+    .eq("user_id", req.user.id);
+  res.json({ ok: true });
 });
 
 // =============================================================================
