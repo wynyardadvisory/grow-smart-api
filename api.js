@@ -975,18 +975,18 @@ app.post("/areas/:id/suggestions/generate", requireAuth, async (req, res) => {
   if (!area || area.locations?.user_id !== req.user.id)
     return res.status(403).json({ error: "Not authorised" });
 
-  // Check area is actually empty
-  const { data: activeCrops } = await db.from("crop_instances")
-    .select("id").eq("area_id", req.params.id).eq("active", true)
+  // Get current crops in this area
+  const { data: areaCrops } = await db.from("crop_instances")
+    .select("name, variety, status")
+    .eq("area_id", req.params.id).eq("active", true)
     .not("status", "eq", "harvested");
-  if (activeCrops?.length > 0)
-    return res.status(400).json({ error: "Area is not empty" });
+  const hasExistingCrops = (areaCrops?.length || 0) > 0;
+  const currentAreaCropsStr = hasExistingCrops
+    ? areaCrops.map(c => `${c.name}${c.variety ? ` (${c.variety})` : ""}`).join(", ")
+    : null;
 
-  // Check suggestions don't already exist
-  const { data: existing } = await db.from("planting_suggestions")
-    .select("id").eq("area_id", req.params.id).single();
-  if (existing)
-    return res.status(400).json({ error: "Suggestions already exist", existing });
+  // Always regenerate — upsert replaces existing
+  // (suggestions are invalidated when crops change via clearSuggestions)
 
   // Get crop history for this area
   const { data: history } = await db.from("crop_instances")
@@ -1011,49 +1011,79 @@ app.post("/areas/:id/suggestions/generate", requireAuth, async (req, res) => {
     : "nothing currently";
 
   try {
-    const prompt = `You are a UK horticultural expert advising a home grower or allotment holder.
-
+    const prompt = hasExistingCrops
+      ? `You are a UK horticultural expert advising a home grower or allotment holder.
+Area details:
+- Type: ${areaType}
+- Location postcode: ${postcode}
+- Currently growing in this bed: ${currentAreaCropsStr}
+- Also growing elsewhere: ${currentStr}
+- Current month: ${month}
+This bed already has crops. Return exactly 3 suggestions to improve this bed — companion plants, interplanting ideas, and beneficial plants.
+For each suggestion explain clearly WHY it benefits the existing crops.
+Respond ONLY with a JSON array of exactly 3 items — no markdown, no explanation:
+[
+  {
+    "type": "companion",
+    "crop": "Plant name",
+    "variety": "Specific variety if relevant, or null",
+    "reason": "One clear sentence explaining exactly how this benefits the crops already in this bed",
+    "sow_note": "When and how to add this in one sentence",
+    "companion_note": "Which specific crop it helps most and how"
+  },
+  {
+    "type": "interplant",
+    "crop": "Crop name",
+    "variety": "Specific variety name",
+    "reason": "One sentence why this works well alongside the existing crops",
+    "sow_note": "When and how to sow in one sentence",
+    "companion_note": "How it fits with what is already growing"
+  },
+  {
+    "type": "beneficial",
+    "crop": "Plant name e.g. Lavender, Phacelia, Borage, Nasturtium, Marigold",
+    "variety": "Specific variety if relevant, or null",
+    "reason": "One sentence on the specific benefit — pest deterrent, pollinator attractor, or soil improver",
+    "sow_note": "When and how to plant in one sentence",
+    "companion_note": "Which pest it deters or which beneficial insect it attracts"
+  }
+]`
+      : `You are a UK horticultural expert advising a home grower or allotment holder.
 Area details:
 - Type: ${areaType}
 - Location postcode: ${postcode}
 - Current month: ${month}
 - Previously grown here: ${historyStr}
 - Currently growing elsewhere in their garden: ${currentStr}
-
-Return exactly 3 suggestions: 2 crop suggestions and 1 bed preparation or companion suggestion.
-Consider:
-1. Seasonality — what can realistically be sown or planted in ${month} in the UK
-2. Crop rotation — avoid repeating the same crop family as what was previously grown
-3. What the grower already likes (infer from what they grow elsewhere) — suggest complementary crops, avoid duplicates
-4. Suggest a specific named variety for each crop, not just the species name
-
+Return exactly 3 suggestions: 2 crop suggestions and 1 companion or beneficial plant.
+Consider crop rotation, seasonality, and what the grower already grows. Suggest specific named varieties.
 Respond ONLY with a JSON array of exactly 3 items — no markdown, no explanation:
 [
   {
     "type": "crop",
     "crop": "Crop name",
-    "variety": "Specific variety name e.g. Cobra, Black Beauty, Gardener's Delight",
-    "reason": "One sentence why this crop and variety is ideal right now for this grower",
-    "sow_note": "When and how to sow this variety in one sentence",
-    "companion_note": "Companion benefit with their existing crops or null"
+    "variety": "Specific variety name",
+    "reason": "One sentence why this is ideal right now for this grower",
+    "sow_note": "When and how to sow in one sentence",
+    "companion_note": "Companion benefit or null"
   },
   {
     "type": "crop",
     "crop": "Crop name",
     "variety": "Specific variety name",
-    "reason": "One sentence why this crop and variety is ideal right now",
+    "reason": "One sentence why this is ideal right now",
     "sow_note": "When and how to sow in one sentence",
     "companion_note": "Companion benefit or null"
   },
   {
-    "type": "prep",
-    "title": "e.g. Add well-rotted manure, Sow green manure (Phacelia), Plant pot marigolds as companions",
-    "reason": "One sentence why this prep or companion planting benefits this bed right now",
-    "timing_note": "Brief note on when or how to do this"
+    "type": "beneficial",
+    "crop": "Plant name e.g. Marigold, Nasturtium, Phacelia, Borage, Lavender",
+    "variety": "Specific variety or null",
+    "reason": "One sentence on why this benefits this bed",
+    "sow_note": "When and how to plant in one sentence",
+    "companion_note": "Specific pest it deters or pollinator it attracts"
   }
-]
-
-The prep suggestion can be: soil enrichment (compost, manure, green manure), a companion plant (marigolds, nasturtiums, borage), or seasonal ground prep. Pick the most relevant given rotation history and season.`;
+]`;
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
