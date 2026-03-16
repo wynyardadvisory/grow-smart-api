@@ -31,7 +31,6 @@ const { body, validationResult } = require("express-validator");
 require("dotenv").config();
 
 const { RuleEngine } = require("./rule-engine");
-const { runNotificationsForUser } = require("./notifications");
 
 // ── Supabase (service role — server only) ─────────────────────────────────────
 const supabaseService = createClient(
@@ -94,6 +93,16 @@ async function runRuleEngine(userId) {
     console.error("[RuleEngine] Error:", err.message);
     return [];
   }
+}
+
+// =============================================================================
+// ADMIN — email + middleware (defined early so all routes can use requireAdmin)
+// =============================================================================
+const ADMIN_EMAIL = "mark@wynyardadvisory.co.uk";
+async function requireAdmin(req, res, next) {
+  if (!req.user) return res.status(401).json({ error: "Unauthorised" });
+  if (req.user.email !== ADMIN_EMAIL) return res.status(403).json({ error: "Forbidden" });
+  next();
 }
 
 // =============================================================================
@@ -622,8 +631,7 @@ app.post("/crops", requireAuth,
 
     // Clear planting suggestions for this area — bed is no longer empty
     if (data.area_id) await clearSuggestions(data.area_id, req.db);
-    processBadgeEvent(req.user.id, "crop_added").catch(console.error);
-    if (data.sown_date) processBadgeEvent(req.user.id, "sow_logged").catch(console.error);
+
     res.status(201).json({ ...data, enriching: needsEnrichment });
   }
 );
@@ -698,12 +706,7 @@ app.get("/tasks", requireAuth, async (req, res) => {
     grouped: {
       today:     data.filter(t => t.due_date === today),
       this_week: data.filter(t => t.due_date > today && t.due_date <= weekEnd),
-      coming_up: data.filter(t => {
-        const vf = t.visible_from || t.due_date;
-        const upcoming56 = new Date(Date.now() + 56 * 86400000).toISOString().split("T")[0];
-        return !t.completed_at && vf <= today && t.due_date > weekEnd && t.due_date <= upcoming56;
-      }),
-      alerts: (data || []).filter(t => !t.completed_at && t.record_type === 'alert'),
+      coming_up: data.filter(t => t.due_date > weekEnd),
     },
   });
 });
@@ -718,7 +721,6 @@ app.post("/tasks/:id/complete", requireAuth, async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
 
   // Auto-update crop status + dates when lifecycle tasks are completed
-  processBadgeEvent(req.user.id, "task_completed").catch(console.error);
   if (data.crop_instance_id) {
     const meta = data.meta ? (typeof data.meta === "string" ? JSON.parse(data.meta) : data.meta) : {};
     const transition = meta.status_transition;
@@ -1489,7 +1491,7 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
 
 // GET /admin/feedback — admin only
 app.get("/admin/feedback", requireAuth, requireAdmin, async (req, res) => {
-  const { data, error } = await req.db
+  const { data, error } = await supabaseService
     .from("feedback")
     .select("*, profiles(name, email)")
     .order("created_at", { ascending: false });
@@ -1500,15 +1502,6 @@ app.get("/admin/feedback", requireAuth, requireAdmin, async (req, res) => {
 // =============================================================================
 // ADMIN ENDPOINTS — restricted to mark@wynyardadvisory.co.uk
 // =============================================================================
-
-const ADMIN_EMAIL = "mark@wynyardadvisory.co.uk";
-
-async function requireAdmin(req, res, next) {
-  if (!req.user) return res.status(401).json({ error: "Unauthorised" });
-  const { data: profile } = await req.db.from("profiles").select("email").eq("id", req.user.id).single();
-  if (!profile || profile.email !== ADMIN_EMAIL) return res.status(403).json({ error: "Forbidden" });
-  next();
-}
 
 // GET /admin/crop-queue — AI-added crop_definitions pending review
 app.get("/admin/crop-queue", requireAuth, requireAdmin, async (req, res) => {
@@ -1555,17 +1548,17 @@ app.get("/admin/users", requireAuth, requireAdmin, async (req, res) => {
   const users = authUsers?.users || [];
 
   // Get profiles for name lookup
-  const { data: profiles } = await req.db.from("profiles").select("id, name");
+  const { data: profiles } = await supabaseService.from("profiles").select("id, name");
   const profileMap = {};
   (profiles || []).forEach(p => { profileMap[p.id] = p.name; });
 
   // Get crop counts per user
-  const { data: crops } = await req.db.from("crop_instances").select("user_id").eq("active", true);
+  const { data: crops } = await supabaseService.from("crop_instances").select("user_id").eq("active", true);
   const cropCounts = {};
   (crops || []).forEach(c => { cropCounts[c.user_id] = (cropCounts[c.user_id] || 0) + 1; });
 
   // Get last task completion per user
-  const { data: tasks } = await req.db.from("tasks").select("user_id, completed_at").eq("completed", true).order("completed_at", { ascending: false });
+  const { data: tasks } = await supabaseService.from("tasks").select("user_id, completed_at").not("completed_at", "is", null).order("completed_at", { ascending: false });
   const lastSeen = {};
   (tasks || []).forEach(t => { if (!lastSeen[t.user_id]) lastSeen[t.user_id] = t.completed_at; });
 
@@ -1847,11 +1840,10 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     req.db.from("tasks")
       .select("*, crop:crop_instance_id(name, variety), area:area_id(name)")
       .eq("user_id", req.user.id).is("completed_at", null)
-      .not("status", "eq", "expired")
       .order("urgency",  { ascending: false })
       .order("due_date", { ascending: true }),
     req.db.from("crop_instances")
-      .select("id, name, variety, variety_id, sown_date, status, area_id, missed_task_note, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, pest_window_start, pest_window_end, pest_notes, is_perennial, default_establishment)")
+      .select("id, name, variety, variety_id, sown_date, area_id, missed_task_note, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, pest_window_start, pest_window_end, pest_notes)")
       .eq("user_id", req.user.id).eq("active", true),
     req.db.from("profiles").select("name, plan, postcode, photo_url").eq("id", req.user.id).single(),
     req.db.from("harvest_log")
@@ -1879,30 +1871,16 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     }));
 
   // ── Missing data prompts ──────────────────────────────────────────────────
-  // Establishments that are planted direct — missing sow date only matters once planted out
-  const directEstablishments = ["tuber","crown","runner","cane","sets"];
   const missingData = crops
-    .filter(c => {
-      const isDirect = directEstablishments.includes(c.crop_def?.default_establishment);
-      const missingSow = !c.sown_date && c.status !== "planned" && !c.crop_def?.is_perennial;
-      // Don't flag missing sow date for direct-planted crops that haven't been planted yet
-      const skipSowPrompt = isDirect && (c.status === "planned" || c.status === "sown_indoors");
-      const missingVariety = !c.variety_id && !c.variety;
-      return missingVariety || (missingSow && !skipSowPrompt);
-    })
-    .map(c => {
-      const isDirect = directEstablishments.includes(c.crop_def?.default_establishment);
-      const skipSowPrompt = isDirect && (c.status === "planned" || c.status === "sown_indoors");
-      return {
-        id:      c.id,
-        name:    c.name,
-        missing: [
-          (!c.variety_id && !c.variety) && "variety not set",
-          (!c.sown_date && c.status !== "planned" && !c.crop_def?.is_perennial && !skipSowPrompt) && "sow date not recorded yet"
-        ].filter(Boolean),
-      };
-    })
-    .filter(c => c.missing.length > 0);
+    .filter(c => (!c.variety_id && !c.variety) || (!c.sown_date && c.status !== "planned" && !c.crop_def?.is_perennial))
+    .map(c => ({
+      id:      c.id,
+      name:    c.name,
+      missing: [
+        (!c.variety_id && !c.variety) && "variety not set",
+        (!c.sown_date && c.status !== "planned" && !c.crop_def?.is_perennial) && "sow date not recorded yet"
+      ].filter(Boolean),
+    }));
 
   // ── Pest risk — how many crops are in their peak pest window this month ───
   const cropsInPestWindow = crops.filter(c => {
@@ -1973,59 +1951,16 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     else                frostRisk = "low";
   }
 
-  // Count tasks completed this week
-  const weekStart = new Date(Date.now() - 7 * 86400000).toISOString().split("T")[0];
-  const { count: tasksCompletedThisWeek } = await req.db.from("tasks")
-    .select("*", { count: "exact", head: true })
-    .eq("user_id", req.user.id)
-    .gte("completed_at", weekStart)
-    .not("completed_at", "is", null);
-
   res.json({
     user:             profile?.name,
     profile_photo:    profile?.photo_url || null,
     plan:             profile?.plan || "free",
-    tasks_completed_this_week: tasksCompletedThisWeek || 0,
-    tasks: (() => {
-      const URGENCY_RANK = { high: 3, medium: 2, low: 1 };
-      const incomplete = tasks.filter(t => !t.completed_at && t.status !== "expired");
-      const dedupByCrop = (items) => {
-        const seen = new Map();
-        for (const t of [...items].sort((a,b) => {
-          const uDiff = (URGENCY_RANK[b.urgency]||0) - (URGENCY_RANK[a.urgency]||0);
-          return uDiff !== 0 ? uDiff : a.due_date.localeCompare(b.due_date);
-        })) {
-          const key = t.crop?.name || t.rule_id || t.id;
-          if (!seen.has(key)) seen.set(key, t);
-        }
-        return [...seen.values()].sort((a,b) => {
-          const uDiff = (URGENCY_RANK[b.urgency]||0) - (URGENCY_RANK[a.urgency]||0);
-          return uDiff !== 0 ? uDiff : a.due_date.localeCompare(b.due_date);
-        });
-      };
-      return {
-      tasks:     tasks,
-      today:     dedupByCrop(incomplete.filter(t => t.due_date <= today)),
-      this_week: dedupByCrop(incomplete.filter(t => t.due_date > today && t.due_date <= weekEnd)),
-      coming_up: (() => {
-        const candidates = tasks.filter(t => {
-          if (t.completed_at || t.status === 'expired') return false;
-          const upcoming56 = new Date(Date.now() + 56 * 86400000).toISOString().split("T")[0];
-          return t.due_date > weekEnd && t.due_date <= upcoming56;
-        });
-        // One per crop NAME — keep only the earliest due date task
-        // When completed, the next task for that crop appears
-        const seen = new Map();
-        for (const t of candidates) {
-          const cropName = t.crop?.name || t.rule_id || "general";
-          const existing = seen.get(cropName);
-          if (!existing || t.due_date < existing.due_date) seen.set(cropName, t);
-        }
-        return [...seen.values()].sort((a, b) => a.due_date.localeCompare(b.due_date));
-      })(),
-      alerts: tasks.filter(t => !t.completed_at && t.record_type === 'alert' && t.status !== 'expired'),
-      };
-    })(),
+    tasks: {
+      tasks:     tasks, // full list including overdue
+      today:     tasks.filter(t => t.due_date <= today),
+      this_week: tasks.filter(t => t.due_date > today && t.due_date <= weekEnd),
+      coming_up: tasks.filter(t => t.due_date > weekEnd),
+    },
     crop_count:       crops.length,
     crops_with_flags: crops.filter(c => c.missed_task_note).map(c => ({ id: c.id, name: c.name, missed_task_note: c.missed_task_note })),
     harvest_forecast: harvestForecast,
@@ -2325,680 +2260,6 @@ app.post("/admin/reset-tasks", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-
-
-// =============================================================================
-// SHARE GARDEN — data endpoint for Share My Garden card
-// =============================================================================
-app.get("/share/garden-data", requireAuth, async (req, res) => {
-  const { mode = "recent" } = req.query;
-  const now        = new Date();
-  const today      = now.toISOString().split("T")[0];
-  const dayOfMonth = now.getDate();
-  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split("T")[0];
-  const monthEnd   = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().split("T")[0];
-  const prevMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1).toISOString().split("T")[0];
-  const prevMonthEnd   = new Date(now.getFullYear(), now.getMonth(), 0).toISOString().split("T")[0];
-  const threeDaysAgo   = new Date(Date.now() - 3 * 86400000).toISOString().split("T")[0];
-  const fourteenDaysAgo = new Date(Date.now() - 14 * 86400000).toISOString().split("T")[0];
-  const isEarlyMonth   = dayOfMonth <= 5;
-
-  let completedQuery, upcomingQuery;
-
-  if (mode === "recent") {
-    const { data: recent } = await req.db.from("tasks")
-      .select("action, task_type, crop:crop_instance_id(name)")
-      .eq("user_id", req.user.id)
-      .gte("completed_at", threeDaysAgo)
-      .not("completed_at", "is", null)
-      .order("completed_at", { ascending: false })
-      .limit(8);
-    let completed = recent || [];
-    if (completed.length === 0) {
-      const { data: fallback } = await req.db.from("tasks")
-        .select("action, task_type, crop:crop_instance_id(name)")
-        .eq("user_id", req.user.id)
-        .gte("completed_at", fourteenDaysAgo)
-        .not("completed_at", "is", null)
-        .order("completed_at", { ascending: false })
-        .limit(8);
-      completed = fallback || [];
-    }
-    const { data: upcoming } = await req.db.from("tasks")
-      .select("action, task_type, due_date, crop:crop_instance_id(name)")
-      .eq("user_id", req.user.id)
-      .is("completed_at", null)
-      .gt("due_date", today)
-      .order("due_date", { ascending: true })
-      .limit(2);
-    completedQuery = completed;
-    upcomingQuery  = upcoming || [];
-  } else {
-    const completedFrom = isEarlyMonth ? prevMonthStart : monthStart;
-    const completedTo   = isEarlyMonth ? prevMonthEnd   : today;
-    const { data: completed } = await req.db.from("tasks")
-      .select("action, task_type, crop:crop_instance_id(name), completed_at")
-      .eq("user_id", req.user.id)
-      .gte("completed_at", completedFrom)
-      .lte("completed_at", completedTo)
-      .not("completed_at", "is", null)
-      .order("completed_at", { ascending: false })
-      .limit(5);
-    const { data: upcoming } = await req.db.from("tasks")
-      .select("action, task_type, due_date, crop:crop_instance_id(name)")
-      .eq("user_id", req.user.id)
-      .is("completed_at", null)
-      .gt("due_date", today)
-      .lte("due_date", monthEnd)
-      .order("due_date", { ascending: true })
-      .limit(3);
-    completedQuery = completed || [];
-    upcomingQuery  = upcoming  || [];
-  }
-
-  const { data: profile } = await req.db.from("profiles")
-    .select("name, postcode").eq("id", req.user.id).single();
-  const { count: cropCount } = await req.db.from("crop_instances")
-    .select("*", { count: "exact", head: true })
-    .eq("user_id", req.user.id).eq("active", true);
-  const { count: harvestCount } = await req.db.from("harvest_log")
-    .select("*", { count: "exact", head: true })
-    .eq("user_id", req.user.id)
-    .gte("harvested_at", monthStart);
-
-  processBadgeEvent(req.user.id, "garden_shared").catch(console.error);
-
-  res.json({
-    mode,
-    is_early_month: isEarlyMonth,
-    profile: { name: profile?.name || null, postcode: profile?.postcode || null },
-    completed: completedQuery,
-    upcoming:  upcomingQuery,
-    stats: { crop_count: cropCount || 0, harvest_count: harvestCount || 0, completed_count: completedQuery.length },
-    month_name: now.toLocaleString("en-GB", { month: "long" }),
-    prev_month_name: new Date(now.getFullYear(), now.getMonth() - 1, 1).toLocaleString("en-GB", { month: "long" }),
-  });
-});
-
-// =============================================================================
-// BADGES & CHALLENGES ENGINE
-// =============================================================================
-
-function getCurrentSeason() {
-  const m = new Date().getMonth() + 1;
-  if (m >= 3 && m <= 5)  return "spring";
-  if (m >= 6 && m <= 8)  return "summer";
-  if (m >= 9 && m <= 11) return "autumn";
-  return "winter";
-}
-
-function getMonthKey() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-}
-
-function getTodayISO() {
-  return new Date().toISOString().split("T")[0];
-}
-
-async function ensureCounters(userId) {
-  const { data } = await supabaseService.from("user_activity_counters").select("user_id").eq("user_id", userId).single();
-  if (!data) {
-    await supabaseService.from("user_activity_counters").insert({
-      user_id: userId,
-      current_month_key:  getMonthKey(),
-      current_season_key: getCurrentSeason(),
-    });
-  }
-}
-
-async function checkAndResetCounters(userId) {
-  const { data: counters } = await supabaseService.from("user_activity_counters").select("*").eq("user_id", userId).single();
-  if (!counters) return;
-  const updates = {};
-  const monthKey  = getMonthKey();
-  const seasonKey = getCurrentSeason();
-  if (counters.current_month_key !== monthKey) {
-    updates.tasks_completed_this_month          = 0;
-    updates.sowing_logged_this_month            = 0;
-    updates.harvest_logged_this_month           = 0;
-    updates.photos_uploaded_this_month          = 0;
-    updates.tasks_completed_distinct_days_month = 0;
-    updates.active_dates_this_month             = [];
-    updates.current_month_key                   = monthKey;
-  }
-  if (counters.current_season_key !== seasonKey) {
-    updates.tasks_completed_this_season  = 0;
-    updates.sowing_logged_this_season    = 0;
-    updates.current_season_key           = seasonKey;
-  }
-  if (Object.keys(updates).length > 0) {
-    await supabaseService.from("user_activity_counters").update(updates).eq("user_id", userId);
-  }
-}
-
-async function updateStreak(userId, counters) {
-  const today = getTodayISO();
-  const last  = counters.last_qualifying_activity_date;
-  if (last === today) return {};
-  const yesterday = new Date(Date.now() - 86400000).toISOString().split("T")[0];
-  const newStreak = last === yesterday ? (counters.current_streak_days || 0) + 1 : 1;
-  const longest   = Math.max(counters.longest_streak_days || 0, newStreak);
-  return { current_streak_days: newStreak, longest_streak_days: longest, last_qualifying_activity_date: today };
-}
-
-async function evaluateBadges(userId, eventType, counters) {
-  const unlocks = [];
-  const relevantThresholds = {
-    task_completed:   ["tasks_completed_total","tasks_completed_this_month","tasks_completed_this_season","current_streak_days"],
-    crop_added:       ["crops_added_total"],
-    area_created:     ["growing_areas_created_total"],
-    sow_logged:       ["sowing_logged_total","sowing_logged_this_month","sowing_logged_this_season","current_streak_days"],
-    harvest_logged:   ["harvest_logged_total","harvest_logged_this_month","current_streak_days"],
-    photo_uploaded:   ["photos_uploaded_total","photos_uploaded_this_month"],
-    garden_shared:    ["share_count_total"],
-  }[eventType] || [];
-
-  const { data: badges } = await supabaseService.from("badge_definitions").select("*").in("threshold_type", relevantThresholds).eq("is_active", true);
-  if (!badges?.length) return unlocks;
-
-  const monthKey  = getMonthKey();
-  const seasonKey = getCurrentSeason();
-
-  for (const badge of badges) {
-    const { data: existing } = await supabaseService.from("user_badge_progress").select("is_completed, current_progress").eq("user_id", userId).eq("badge_id", badge.id).eq("month_key", badge.time_scope === "monthly" ? monthKey : "").maybeSingle();
-    if (existing?.is_completed) continue;
-    const currentValue = counters[badge.threshold_type] || 0;
-    const progress     = Math.min(currentValue, badge.threshold_value);
-    const completed    = currentValue >= badge.threshold_value;
-    await supabaseService.from("user_badge_progress").upsert({
-      user_id: userId, badge_id: badge.id, current_progress: progress, is_completed: completed,
-      completed_at: completed ? new Date().toISOString() : null,
-      month_key: badge.time_scope === "monthly" ? monthKey : "",
-      season_key: badge.time_scope === "seasonal" ? seasonKey : "",
-      last_progress_event_at: new Date().toISOString(),
-    }, { onConflict: "user_id,badge_id,month_key" });
-    if (completed && !existing?.is_completed) {
-      await supabaseService.from("badge_unlock_events").insert({
-        user_id: userId, badge_id: badge.id,
-        month_key: badge.time_scope === "monthly" ? monthKey : null,
-        season_key: badge.time_scope === "seasonal" ? seasonKey : null,
-      });
-      let nextBadge = null;
-      if (badge.next_badge_id) {
-        const { data: nb } = await supabaseService.from("badge_definitions").select("title").eq("id", badge.next_badge_id).single();
-        nextBadge = nb?.title || null;
-      }
-      unlocks.push({ badge_id: badge.id, title: badge.title, description: badge.description, celebration_copy: badge.celebration_copy, icon_key: badge.icon_key, type: badge.type, next_badge_title: nextBadge });
-    }
-  }
-  return unlocks;
-}
-
-async function processBadgeEvent(userId, eventType, extraCounterUpdates = {}) {
-  try {
-    await ensureCounters(userId);
-    await checkAndResetCounters(userId);
-    const { data: counters } = await supabaseService.from("user_activity_counters").select("*").eq("user_id", userId).single();
-    if (!counters) return [];
-    const today    = getTodayISO();
-    const updates  = { updated_at: new Date().toISOString(), ...extraCounterUpdates };
-    if (eventType === "task_completed") {
-      updates.tasks_completed_total         = (counters.tasks_completed_total        || 0) + 1;
-      updates.tasks_completed_this_month    = (counters.tasks_completed_this_month   || 0) + 1;
-      updates.tasks_completed_this_season   = (counters.tasks_completed_this_season  || 0) + 1;
-      const activeDates = counters.active_dates_this_month || [];
-      if (!activeDates.includes(today)) {
-        updates.active_dates_this_month             = [...activeDates, today];
-        updates.tasks_completed_distinct_days_month = (counters.tasks_completed_distinct_days_month || 0) + 1;
-      }
-    } else if (eventType === "crop_added") {
-      updates.crops_added_total = (counters.crops_added_total || 0) + 1;
-    } else if (eventType === "area_created") {
-      updates.growing_areas_created_total = (counters.growing_areas_created_total || 0) + 1;
-    } else if (eventType === "sow_logged") {
-      updates.sowing_logged_total        = (counters.sowing_logged_total       || 0) + 1;
-      updates.sowing_logged_this_month   = (counters.sowing_logged_this_month  || 0) + 1;
-      updates.sowing_logged_this_season  = (counters.sowing_logged_this_season || 0) + 1;
-    } else if (eventType === "harvest_logged") {
-      updates.harvest_logged_total       = (counters.harvest_logged_total      || 0) + 1;
-      updates.harvest_logged_this_month  = (counters.harvest_logged_this_month || 0) + 1;
-    } else if (eventType === "photo_uploaded") {
-      updates.photos_uploaded_total      = (counters.photos_uploaded_total     || 0) + 1;
-      updates.photos_uploaded_this_month = (counters.photos_uploaded_this_month|| 0) + 1;
-    } else if (eventType === "garden_shared") {
-      updates.share_count_total = (counters.share_count_total || 0) + 1;
-    }
-    const qualifyingEvents = ["task_completed","sow_logged","harvest_logged","crop_added","photo_uploaded","garden_shared"];
-    if (qualifyingEvents.includes(eventType)) {
-      const streakUpdates = await updateStreak(userId, { ...counters, ...updates });
-      Object.assign(updates, streakUpdates);
-    }
-    await supabaseService.from("user_activity_counters").update(updates).eq("user_id", userId);
-    const freshCounters = { ...counters, ...updates };
-    return await evaluateBadges(userId, eventType, freshCounters);
-  } catch (err) {
-    console.error("[BadgeEngine]", err.message);
-    return [];
-  }
-}
-
-// GET /badges
-app.get("/badges", requireAuth, async (req, res) => {
-  try {
-    const userId    = req.user.id;
-    const monthKey  = getMonthKey();
-    const seasonKey = getCurrentSeason();
-    await ensureCounters(userId);
-    await checkAndResetCounters(userId);
-    const [{ data: allBadges }, { data: progress }, { data: counters }, { data: recentUnlocks }] = await Promise.all([
-      supabaseService.from("badge_definitions").select("*").eq("is_active", true).order("sort_order"),
-      supabaseService.from("user_badge_progress").select("*").eq("user_id", userId),
-      supabaseService.from("user_activity_counters").select("*").eq("user_id", userId).single(),
-      supabaseService.from("badge_unlock_events").select("*, badge:badge_id(*)").eq("user_id", userId).order("unlocked_at", { ascending: false }).limit(10),
-    ]);
-    const progressMap = {};
-    (progress || []).forEach(p => { progressMap[p.badge_id + (p.month_key || "")] = p; });
-    const enriched = (allBadges || []).map(badge => {
-      const key = badge.id + (badge.time_scope === "monthly" ? monthKey : "");
-      const p   = progressMap[key];
-      const currentValue = counters ? (counters[badge.threshold_type] || 0) : 0;
-      return { ...badge, current_progress: p?.current_progress ?? Math.min(currentValue, badge.threshold_value), is_completed: p?.is_completed ?? false, completed_at: p?.completed_at ?? null };
-    });
-    const monthlyChallenge = {
-      title: `${new Date().toLocaleString("en-GB", { month: "long" })} Grower`,
-      description: `Complete 12 garden tasks in ${new Date().toLocaleString("en-GB", { month: "long" })}`,
-      icon_key: "🌿", type: "monthly", threshold: 12,
-      progress: counters?.tasks_completed_this_month || 0,
-      is_completed: (counters?.tasks_completed_this_month || 0) >= 12,
-    };
-    res.json({ badges: enriched, counters: counters || {}, recent_unlocks: recentUnlocks || [], monthly_challenge: monthlyChallenge, season: seasonKey, month_key: monthKey });
-  } catch (e) {
-    console.error("[Badges]", e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// GET /badges/pending-unlocks
-app.get("/badges/pending-unlocks", requireAuth, async (req, res) => {
-  const { data, error } = await supabaseService.from("badge_unlock_events").select("*, badge:badge_id(*)").eq("user_id", req.user.id).eq("shown_to_user", false).order("unlocked_at", { ascending: false });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
-});
-
-// POST /badges/mark-shown
-app.post("/badges/mark-shown", requireAuth, async (req, res) => {
-  const { ids } = req.body;
-  if (!ids?.length) return res.json({ ok: true });
-  await supabaseService.from("badge_unlock_events").update({ shown_to_user: true }).in("id", ids).eq("user_id", req.user.id);
-  res.json({ ok: true });
-});
-
-// =============================================================================
-// ADMIN — One-time badge backfill for all existing users
-// =============================================================================
-app.post("/admin/backfill-badges", requireAuth, requireAdmin, async (req, res) => {
-  try {
-    const now         = new Date();
-    const monthKey    = now.toISOString().slice(0, 7);
-    const m           = now.getMonth() + 1;
-    const currentSeason = m>=3&&m<=5?"spring":m>=6&&m<=8?"summer":m>=9&&m<=11?"autumn":"winter";
-    const monthStart  = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split("T")[0];
-    const seasonStart = m>=3&&m<=5?`${now.getFullYear()}-03-01`:m>=6&&m<=8?`${now.getFullYear()}-06-01`:m>=9&&m<=11?`${now.getFullYear()}-09-01`:m===12?`${now.getFullYear()}-12-01`:`${now.getFullYear()-1}-12-01`;
-    const today       = now.toISOString().split("T")[0];
-    const yesterday   = new Date(Date.now()-86400000).toISOString().split("T")[0];
-
-    const { data: { users } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
-    if (!users?.length) return res.json({ ok: true, processed: 0 });
-
-    const [{ data: allTasks }, { data: allCrops }, { data: allLocations }, { data: allAreas }, { data: allHarvests }, { data: allPhotos }, { data: allBadges }] = await Promise.all([
-      supabaseService.from("tasks").select("user_id, task_type, completed_at").not("completed_at", "is", null),
-      supabaseService.from("crop_instances").select("user_id, active").eq("active", true),
-      supabaseService.from("locations").select("id, user_id"),
-      supabaseService.from("growing_areas").select("id, location_id"),
-      supabaseService.from("harvest_log").select("user_id, harvested_at"),
-      supabaseService.from("crop_photos").select("user_id"),
-      supabaseService.from("badge_definitions").select("*").eq("is_active", true),
-    ]);
-
-    const locUserMap = {};
-    (allLocations || []).forEach(l => { locUserMap[l.id] = l.user_id; });
-
-    const counterUpserts = [], badgeUpserts = [], unlockInserts = [], results = [];
-
-    for (const user of users) {
-      const uid = user.id;
-      const userTasks    = (allTasks    || []).filter(t => t.user_id === uid);
-      const userCrops    = (allCrops    || []).filter(c => c.user_id === uid);
-      const userHarvests = (allHarvests || []).filter(h => h.user_id === uid);
-      const userPhotos   = (allPhotos   || []).filter(p => p.user_id === uid);
-      const userLocIds   = (allLocations|| []).filter(l => l.user_id === uid).map(l => l.id);
-      const userAreas    = (allAreas    || []).filter(a => userLocIds.includes(a.location_id));
-
-      const tasksTotal  = userTasks.length;
-      const tasksMonth  = userTasks.filter(t => t.completed_at >= monthStart).length;
-      const tasksSeason = userTasks.filter(t => t.completed_at >= seasonStart).length;
-      const sowTotal    = userTasks.filter(t => t.task_type === "sow").length;
-      const sowMonth    = userTasks.filter(t => t.task_type === "sow" && t.completed_at >= monthStart).length;
-      const sowSeason   = userTasks.filter(t => t.task_type === "sow" && t.completed_at >= seasonStart).length;
-      const harvestTotal = userHarvests.length;
-      const harvestMonth = userHarvests.filter(h => h.harvested_at >= monthStart).length;
-
-      const distinctDays = [...new Set(userTasks.map(t => t.completed_at.split("T")[0]))].sort().reverse();
-      let streak = 0, longest = 0, cur = 0;
-      for (let i = 0; i < distinctDays.length; i++) {
-        if (i === 0) { cur = 1; continue; }
-        const diff = (new Date(distinctDays[i-1]) - new Date(distinctDays[i])) / 86400000;
-        if (diff === 1) cur++;
-        else { longest = Math.max(longest, cur); cur = 1; }
-      }
-      longest = Math.max(longest, cur);
-      if (distinctDays[0] === today || distinctDays[0] === yesterday) streak = cur;
-      const activeDatesMonth = distinctDays.filter(d => d >= monthStart);
-
-      const counters = {
-        user_id: uid, tasks_completed_total: tasksTotal, tasks_completed_this_month: tasksMonth,
-        tasks_completed_this_season: tasksSeason, tasks_completed_distinct_days_month: activeDatesMonth.length,
-        crops_added_total: userCrops.length, growing_areas_created_total: userAreas.length,
-        sowing_logged_total: sowTotal, sowing_logged_this_month: sowMonth, sowing_logged_this_season: sowSeason,
-        harvest_logged_total: harvestTotal, harvest_logged_this_month: harvestMonth,
-        photos_uploaded_total: userPhotos.length, share_count_total: 0,
-        current_streak_days: streak, longest_streak_days: longest,
-        last_qualifying_activity_date: distinctDays[0] || null,
-        active_dates_this_month: activeDatesMonth,
-        current_month_key: monthKey, current_season_key: currentSeason, updated_at: now.toISOString(),
-      };
-      counterUpserts.push(counters);
-
-      for (const badge of (allBadges || [])) {
-        const val       = counters[badge.threshold_type] || 0;
-        const completed = val >= badge.threshold_value;
-        const progress  = Math.min(val, badge.threshold_value);
-        if (progress === 0 && !completed) continue;
-        badgeUpserts.push({
-          user_id: uid, badge_id: badge.id, current_progress: progress, is_completed: completed,
-          completed_at: completed ? now.toISOString() : null,
-          month_key: badge.time_scope === "monthly" ? monthKey : "",
-          season_key: badge.time_scope === "seasonal" ? currentSeason : "",
-          last_progress_event_at: now.toISOString(),
-        });
-        if (completed) {
-          unlockInserts.push({ user_id: uid, badge_id: badge.id, month_key: badge.time_scope === "monthly" ? monthKey : null, season_key: badge.time_scope === "seasonal" ? currentSeason : null, shown_to_user: true });
-        }
-      }
-      results.push({ user_id: uid, email: user.email, tasks: tasksTotal, crops: userCrops.length, harvests: harvestTotal });
-    }
-
-    await supabaseService.from("user_activity_counters").upsert(counterUpserts, { onConflict: "user_id" });
-    if (badgeUpserts.length) {
-      await supabaseService.from("user_badge_progress").upsert(badgeUpserts, { onConflict: "user_id,badge_id,month_key" });
-    }
-    for (const unlock of unlockInserts) {
-      await supabaseService.from("badge_unlock_events").upsert(unlock, { onConflict: "user_id,badge_id" }).then(() => {}).catch(() => {});
-    }
-    res.json({ ok: true, processed: users.length, results });
-  } catch (e) {
-    console.error("[Backfill]", e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-
-
-// =============================================================================
-// OBSERVATION LOGGING
-// Users log what they see in their garden. Engine reads these to adapt.
-// =============================================================================
-
-// POST /crops/:id/observe — log an observation and trigger engine response
-app.post("/crops/:id/observe", requireAuth, async (req, res) => {
-  const {
-    observation_type,   // 'pest' | 'disease' | 'growth' | 'harvest' | 'weather' | 'other'
-    symptom_code,       // e.g. 'flowering_confirmed', 'aphids_seen', 'struggling', 'harvest_started'
-    severity,           // 'mild' | 'moderate' | 'severe'
-    notes,
-    confirmed_stage,    // if this is a stage confirmation
-  } = req.body;
-
-  if (!observation_type) return res.status(400).json({ error: "observation_type required" });
-
-  // Verify crop ownership
-  const { data: crop, error: cropErr } = await req.db.from("crop_instances")
-    .select("id, name, status, stage, crop_def_id")
-    .eq("id", req.params.id)
-    .eq("user_id", req.user.id)
-    .single();
-  if (cropErr || !crop) return res.status(404).json({ error: "Crop not found" });
-
-  // Log the observation
-  const { data: obs, error: obsErr } = await req.db.from("observation_logs").insert({
-    user_id:          req.user.id,
-    crop_id:          req.params.id,
-    observed_at:      new Date().toISOString().split("T")[0],
-    observation_type,
-    symptom_code:     symptom_code || null,
-    severity:         severity     || null,
-    notes:            notes        || null,
-  }).select().single();
-
-  if (obsErr) return res.status(500).json({ error: obsErr.message });
-
-  // ── Engine response based on observation type ─────────────────────────────
-  const updates = {};
-  const engineActions = [];
-
-  if (symptom_code === "flowering_confirmed" || confirmed_stage === "flowering") {
-    updates.stage             = "flowering";
-    updates.stage_confidence  = "confirmed";
-    updates.stage_check_snoozed_until = null;
-    engineActions.push("stage_updated");
-  }
-
-  if (symptom_code === "fruit_set_confirmed" || confirmed_stage === "fruiting") {
-    updates.stage             = "fruiting";
-    updates.stage_confidence  = "confirmed";
-    updates.stage_check_snoozed_until = null;
-    engineActions.push("stage_updated");
-  }
-
-  if (symptom_code === "seedling_emerged" || confirmed_stage === "seedling") {
-    updates.stage             = "seedling";
-    updates.stage_confidence  = "confirmed";
-    updates.stage_check_snoozed_until = null;
-    engineActions.push("stage_updated");
-  }
-
-  if (symptom_code === "vegetative_confirmed" || confirmed_stage === "vegetative") {
-    updates.stage             = "vegetative";
-    updates.stage_confidence  = "confirmed";
-    updates.stage_check_snoozed_until = null;
-    engineActions.push("stage_updated");
-  }
-
-  if (symptom_code === "harvest_started") {
-    updates.status = "harvesting";
-    engineActions.push("harvest_started");
-    processBadgeEvent(req.user.id, "harvest_logged").catch(console.error);
-  }
-
-  if (symptom_code === "transplant_done") {
-    updates.status            = "transplanted";
-    updates.transplant_date   = new Date().toISOString().split("T")[0];
-    engineActions.push("transplant_done");
-  }
-
-  if (symptom_code === "plant_struggling") {
-    updates.missed_task_note  = "Plant reported as struggling — check growing conditions";
-    engineActions.push("struggling_flagged");
-  }
-
-  if (symptom_code === "looks_healthy") {
-    updates.missed_task_note  = null; // clear any struggle flag
-    engineActions.push("health_confirmed");
-  }
-
-  // Apply crop updates if any
-  if (Object.keys(updates).length > 0) {
-    updates.updated_at = new Date().toISOString();
-    await req.db.from("crop_instances")
-      .update(updates)
-      .eq("id", req.params.id)
-      .eq("user_id", req.user.id);
-  }
-
-  // Re-run rule engine — stage/status changes affect task generation
-  await runRuleEngine(req.user.id);
-
-  res.json({
-    observation: obs,
-    crop_updated: Object.keys(updates).length > 0,
-    engine_actions: engineActions,
-  });
-});
-
-// GET /crops/:id/observations — list observations for a crop
-app.get("/crops/:id/observations", requireAuth, async (req, res) => {
-  const { data, error } = await req.db.from("observation_logs")
-    .select("*")
-    .eq("crop_id", req.params.id)
-    .eq("user_id", req.user.id)
-    .order("observed_at", { ascending: false })
-    .limit(20);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
-});
-
-
-// =============================================================================
-// PUSH NOTIFICATIONS
-// =============================================================================
-
-// GET /notifications/vapid-key — public key for subscription
-app.get("/notifications/vapid-key", (_req, res) => {
-  if (!process.env.VAPID_PUBLIC_KEY) return res.status(503).json({ error: "Push not configured" });
-  res.json({ publicKey: process.env.VAPID_PUBLIC_KEY });
-});
-
-// POST /notifications/register-token — save device push token
-app.post("/notifications/register-token", requireAuth, async (req, res) => {
-  const { subscription, platform = "web", device_label } = req.body;
-  if (!subscription) return res.status(400).json({ error: "subscription required" });
-
-  const endpoint = subscription.endpoint;
-  const { error } = await supabaseService.from("device_push_tokens").upsert({
-    user_id:      req.user.id,
-    platform,
-    push_token:   JSON.stringify(subscription),
-    endpoint,
-    device_label: device_label || null,
-    is_active:    true,
-    last_seen_at: new Date().toISOString(),
-    updated_at:   new Date().toISOString(),
-  }, { onConflict: "user_id,endpoint" });
-
-  if (error) return res.status(500).json({ error: error.message });
-
-  // Ensure preferences row exists
-  await supabaseService.from("notification_preferences").upsert({
-    user_id:      req.user.id,
-    push_enabled: true,
-    updated_at:   new Date().toISOString(),
-  }, { onConflict: "user_id", ignoreDuplicates: true });
-
-  res.json({ ok: true });
-});
-
-// DELETE /notifications/token — unregister device
-app.delete("/notifications/token", requireAuth, async (req, res) => {
-  const { endpoint } = req.body;
-  if (!endpoint) return res.status(400).json({ error: "endpoint required" });
-  await supabaseService.from("device_push_tokens")
-    .update({ is_active: false })
-    .eq("user_id", req.user.id)
-    .eq("endpoint", endpoint);
-  res.json({ ok: true });
-});
-
-// GET /notifications/preferences — get user notification preferences
-app.get("/notifications/preferences", requireAuth, async (req, res) => {
-  const { data } = await supabaseService.from("notification_preferences")
-    .select("*").eq("user_id", req.user.id).single();
-  res.json(data || { push_enabled: false });
-});
-
-// PUT /notifications/preferences — update preferences
-app.put("/notifications/preferences", requireAuth, async (req, res) => {
-  const allowed = [
-    "push_enabled","due_today_enabled","coming_up_enabled","weather_alerts_enabled",
-    "pest_alerts_enabled","crop_checks_enabled","weekly_summary_enabled",
-    "daily_plan_enabled","milestones_enabled","morning_time_local","evening_time_local",
-    "do_not_disturb_start","do_not_disturb_end","critical_alerts_anytime","timezone"
-  ];
-  const updates = Object.fromEntries(Object.entries(req.body).filter(([k]) => allowed.includes(k)));
-  updates.updated_at = new Date().toISOString();
-
-  const { error } = await supabaseService.from("notification_preferences").upsert({
-    user_id: req.user.id,
-    ...updates,
-  }, { onConflict: "user_id" });
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ ok: true });
-});
-
-// POST /notifications/:id/opened — mark notification as opened
-app.post("/notifications/:id/opened", async (req, res) => {
-  await supabaseService.from("notification_events")
-    .update({ status: "opened", opened_at: new Date().toISOString() })
-    .eq("id", req.params.id);
-  res.json({ ok: true });
-});
-
-// POST /cron/push-morning — morning notifications (8:30am)
-app.post("/cron/push-morning", async (req, res) => {
-  if (req.headers["x-cron-secret"] !== process.env.CRON_SECRET) return res.status(401).json({ error: "Unauthorised" });
-  try {
-    const { data: profiles } = await supabaseService.from("profiles").select("id");
-    if (!profiles?.length) return res.json({ processed: 0 });
-    res.json({ ok: true, queued: profiles.length });
-    let sent = 0;
-    for (const p of profiles) {
-      try {
-        const result = await runNotificationsForUser(supabaseService, p.id, "morning");
-        if (result.sent > 0) sent++;
-      } catch(e) { console.error(`[PushMorning] ${p.id}:`, e.message); }
-    }
-    console.log(`[PushMorning] Sent to ${sent}/${profiles.length} users`);
-  } catch(e) {
-    console.error("[PushMorning]", e.message);
-  }
-});
-
-// POST /cron/push-evening — evening notifications (6pm)
-app.post("/cron/push-evening", async (req, res) => {
-  if (req.headers["x-cron-secret"] !== process.env.CRON_SECRET) return res.status(401).json({ error: "Unauthorised" });
-  try {
-    const { data: profiles } = await supabaseService.from("profiles").select("id");
-    if (!profiles?.length) return res.json({ processed: 0 });
-    res.json({ ok: true, queued: profiles.length });
-    let sent = 0;
-    for (const p of profiles) {
-      try {
-        const result = await runNotificationsForUser(supabaseService, p.id, "evening");
-        if (result.sent > 0) sent++;
-      } catch(e) { console.error(`[PushEvening] ${p.id}:`, e.message); }
-    }
-    console.log(`[PushEvening] Sent to ${sent}/${profiles.length} users`);
-  } catch(e) {
-    console.error("[PushEvening]", e.message);
-  }
-});
-
-// POST /notifications/test — send test push to current user (admin only)
-app.post("/notifications/test", requireAuth, requireAdmin, async (req, res) => {
-  const result = await runNotificationsForUser(supabaseService, req.user.id, "morning");
-  res.json(result);
-});
 
 // =============================================================================
 // CRON — called by Vercel Cron at 06:00 UTC daily
