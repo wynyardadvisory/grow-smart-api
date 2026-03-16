@@ -1831,9 +1831,7 @@ app.get("/weather", requireAuth, async (req, res) => {
 app.get("/dashboard", requireAuth, async (req, res) => {
   const today   = todayISO();
   const weekEnd = weekEndISO();
-  // Always run rule engine on dashboard load — ensures tasks are fresh
-  // without requiring user to edit/save a crop manually
-  await runRuleEngine(req.user.id);
+  // Run expiry only — rule engine runs on cron and crop changes, not every page view
   await expireOverdueTasks(req.user.id, req.db);
 
 
