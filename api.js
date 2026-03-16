@@ -1515,7 +1515,7 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
 
 // GET /admin/feedback — admin only
 app.get("/admin/feedback", requireAuth, requireAdmin, async (req, res) => {
-  const { data, error } = await req.db
+  const { data, error } = await supabaseService
     .from("feedback")
     .select("*, profiles(name, email)")
     .order("created_at", { ascending: false });
@@ -1580,7 +1580,7 @@ app.get("/admin/users", requireAuth, requireAdmin, async (req, res) => {
   const users = authUsers?.users || [];
 
   // Get profiles for name lookup
-  const { data: profiles } = await req.db.from("profiles").select("id, name");
+  const { data: profiles } = await supabaseService.from("profiles").select("id, name");
   const profileMap = {};
   (profiles || []).forEach(p => { profileMap[p.id] = p.name; });
 
