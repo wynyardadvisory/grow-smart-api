@@ -697,7 +697,12 @@ app.get("/tasks", requireAuth, async (req, res) => {
     grouped: {
       today:     data.filter(t => t.due_date === today),
       this_week: data.filter(t => t.due_date > today && t.due_date <= weekEnd),
-      coming_up: data.filter(t => t.due_date > weekEnd),
+      coming_up: data.filter(t => {
+        const vf = t.visible_from || t.due_date;
+        const upcoming56 = new Date(Date.now() + 56 * 86400000).toISOString().split("T")[0];
+        return !t.completed_at && vf <= today && t.due_date > weekEnd && t.due_date <= upcoming56;
+      }),
+      alerts: (data || []).filter(t => !t.completed_at && t.record_type === 'alert'),
     },
   });
 });
@@ -1841,6 +1846,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     req.db.from("tasks")
       .select("*, crop:crop_instance_id(name, variety), area:area_id(name)")
       .eq("user_id", req.user.id).is("completed_at", null)
+      .not("status", "eq", "expired")
       .order("urgency",  { ascending: false })
       .order("due_date", { ascending: true }),
     req.db.from("crop_instances")
@@ -1960,7 +1966,13 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       tasks:     tasks, // full list including overdue
       today:     tasks.filter(t => t.due_date <= today),
       this_week: tasks.filter(t => t.due_date > today && t.due_date <= weekEnd),
-      coming_up: tasks.filter(t => t.due_date > weekEnd),
+      coming_up: tasks.filter(t => {
+        if (t.completed_at || t.status === 'expired') return false;
+        const vf = t.visible_from || t.due_date;
+        const upcoming56 = new Date(Date.now() + 56 * 86400000).toISOString().split("T")[0];
+        return vf <= today && t.due_date > weekEnd && t.due_date <= upcoming56;
+      }),
+      alerts: tasks.filter(t => !t.completed_at && t.record_type === 'alert' && t.status !== 'expired'),
     },
     crop_count:       crops.length,
     crops_with_flags: crops.filter(c => c.missed_task_note).map(c => ({ id: c.id, name: c.name, missed_task_note: c.missed_task_note })),

@@ -23,13 +23,15 @@
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const LOOKAHEAD_DAYS = {
-  sow:        21,
-  transplant: 14,
+  sow:        42,  // 6 weeks — show sowing tasks well ahead
+  transplant: 56,  // 8 weeks — show transplant tasks ahead of May window
   feed:       14,
-  harvest:    10,
+  harvest:    21,
   prune:      30,
   seasonal:   30,
-  default:    14,
+  check:      14,
+  harden_off: 21,
+  default:    21,
 };
 
 const LEAD_TIME_DAYS = {
