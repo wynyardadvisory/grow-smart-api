@@ -112,7 +112,7 @@ function sourceKey(parts) {
 
 // ── Crop Context Builder ──────────────────────────────────────────────────────
 
-function buildCropContext(crop, weather, envMods, userFeeds) {
+function buildCropContext(crop, weather, envMods, userFeeds, observations = []) {
   const def = crop.crop_def || {};
   const variety = crop.variety || {};
 
@@ -191,6 +191,13 @@ function buildCropContext(crop, weather, envMods, userFeeds) {
   // Feed matching
   const matchedFeed = feedType ? matchFeed(feedType, userFeeds) : null;
 
+  // Recent observation signals
+  const recentPestObs      = observations.filter(o => o.observation_type === "pest" && !o.resolved_at);
+  const recentDiseaseObs   = observations.filter(o => o.observation_type === "disease" && !o.resolved_at);
+  const isStruggling       = observations.some(o => o.symptom_code === "plant_struggling" && !o.resolved_at);
+  const hasConfirmedStage  = observations.some(o => o.symptom_code?.includes("_confirmed"));
+  const lastHarvestObs     = observations.find(o => o.symptom_code === "harvest_started");
+
   return {
     // Identity
     cropId:     crop.id,
@@ -227,6 +234,14 @@ function buildCropContext(crop, weather, envMods, userFeeds) {
 
     // Potato type
     potatoType: variety.potato_type || null,
+
+    // Observations
+    observations,
+    recentPestObs,
+    recentDiseaseObs,
+    isStruggling,
+    hasConfirmedStage,
+    lastHarvestObs,
   };
 }
 
@@ -330,6 +345,22 @@ class ScheduledRuleEngine {
 
     // Finished crops — nothing to do
     if (ctx.stage === "finished") return candidates;
+
+    // Struggling crops — suppress non-urgent scheduled tasks
+    // (engine will still fire alerts and checks)
+    if (ctx.isStruggling) {
+      candidates.push(candidate(ctx, {
+        ruleId:       "struggling_flag",
+        taskType:     "check",
+        title:        `Check on ${ctx.cropName} — this plant was flagged as struggling. Inspect roots, leaves and growing conditions`,
+        scheduledFor: todayISO(),
+        urgency:      "high",
+        expiryDays:   7,
+        leadTimeDays: 0,
+        meta:         { lifecycle_check: true, stage: "struggling" },
+      }));
+      return candidates; // don't pile on more tasks while struggling
+    }
 
     // ── PERENNIALS ───────────────────────────────────────────────────────────
     if (ctx.isPerennial) {
@@ -1049,10 +1080,9 @@ class DynamicRiskEngine {
   }
 
   _assessRiskLevel(ctx, rule) {
-    const { tempC, rainMm, frostRisk7day } = ctx;
+    const { tempC, rainMm } = ctx;
 
     let score = 0;
-    const maxScore = 3;
 
     // Temperature check
     if (rule.temp_min_c !== null && tempC !== null && tempC >= rule.temp_min_c) score++;
@@ -1060,6 +1090,13 @@ class DynamicRiskEngine {
 
     // Rain check
     if (rule.rain_last_24h_min_mm !== null && rainMm !== null && rainMm >= rule.rain_last_24h_min_mm) score++;
+
+    // Observation boost — if user has confirmed pest of this type, escalate
+    const pestCode = rule.pest_code;
+    const confirmedByObs = (ctx.recentPestObs || []).some(o =>
+      o.symptom_code?.includes(pestCode) || (o.observation_type === "pest" && score > 0)
+    );
+    if (confirmedByObs) score += 2; // observation confirmation = strong signal
 
     // Season alone can give low risk
     const m = currentMonth();
@@ -1090,13 +1127,14 @@ class RuleEngine {
       await this._expireStaleItems(userId);
     }
 
-    const [crops, rules, weatherByLocation, envModifiers, userFeeds, pestRules] = await Promise.all([
+    const [crops, rules, weatherByLocation, envModifiers, userFeeds, pestRules, recentObservations] = await Promise.all([
       this._loadCrops(userId),
       this._loadRules(),
       this._loadWeatherByLocation(userId),
       this._loadEnvModifiers(),
       this._loadUserFeeds(userId),
       this._loadPestRules(),
+      this._loadRecentObservations(userId),
     ]);
 
     const allCandidates = [];
@@ -1108,7 +1146,8 @@ class RuleEngine {
       const envMods  = envModifiers[areaType] || {};
 
       // Build normalised context once per crop
-      const ctx = buildCropContext(crop, weather, envMods, userFeeds);
+      const cropObs = recentObservations.filter(o => o.crop_id === crop.id);
+      const ctx = buildCropContext(crop, weather, envMods, userFeeds, cropObs);
 
       // Scheduled engine — future tasks
       const scheduled = this.scheduled.evaluate(ctx, rules);

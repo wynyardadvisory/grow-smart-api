@@ -2743,6 +2743,130 @@ app.post("/admin/backfill-badges", requireAuth, requireAdmin, async (req, res) =
 });
 
 
+
+// =============================================================================
+// OBSERVATION LOGGING
+// Users log what they see in their garden. Engine reads these to adapt.
+// =============================================================================
+
+// POST /crops/:id/observe — log an observation and trigger engine response
+app.post("/crops/:id/observe", requireAuth, async (req, res) => {
+  const {
+    observation_type,   // 'pest' | 'disease' | 'growth' | 'harvest' | 'weather' | 'other'
+    symptom_code,       // e.g. 'flowering_confirmed', 'aphids_seen', 'struggling', 'harvest_started'
+    severity,           // 'mild' | 'moderate' | 'severe'
+    notes,
+    confirmed_stage,    // if this is a stage confirmation
+  } = req.body;
+
+  if (!observation_type) return res.status(400).json({ error: "observation_type required" });
+
+  // Verify crop ownership
+  const { data: crop, error: cropErr } = await req.db.from("crop_instances")
+    .select("id, name, status, stage, crop_def_id")
+    .eq("id", req.params.id)
+    .eq("user_id", req.user.id)
+    .single();
+  if (cropErr || !crop) return res.status(404).json({ error: "Crop not found" });
+
+  // Log the observation
+  const { data: obs, error: obsErr } = await req.db.from("observation_logs").insert({
+    user_id:          req.user.id,
+    crop_id:          req.params.id,
+    observed_at:      new Date().toISOString().split("T")[0],
+    observation_type,
+    symptom_code:     symptom_code || null,
+    severity:         severity     || null,
+    notes:            notes        || null,
+  }).select().single();
+
+  if (obsErr) return res.status(500).json({ error: obsErr.message });
+
+  // ── Engine response based on observation type ─────────────────────────────
+  const updates = {};
+  const engineActions = [];
+
+  if (symptom_code === "flowering_confirmed" || confirmed_stage === "flowering") {
+    updates.stage             = "flowering";
+    updates.stage_confidence  = "confirmed";
+    updates.stage_check_snoozed_until = null;
+    engineActions.push("stage_updated");
+  }
+
+  if (symptom_code === "fruit_set_confirmed" || confirmed_stage === "fruiting") {
+    updates.stage             = "fruiting";
+    updates.stage_confidence  = "confirmed";
+    updates.stage_check_snoozed_until = null;
+    engineActions.push("stage_updated");
+  }
+
+  if (symptom_code === "seedling_emerged" || confirmed_stage === "seedling") {
+    updates.stage             = "seedling";
+    updates.stage_confidence  = "confirmed";
+    updates.stage_check_snoozed_until = null;
+    engineActions.push("stage_updated");
+  }
+
+  if (symptom_code === "vegetative_confirmed" || confirmed_stage === "vegetative") {
+    updates.stage             = "vegetative";
+    updates.stage_confidence  = "confirmed";
+    updates.stage_check_snoozed_until = null;
+    engineActions.push("stage_updated");
+  }
+
+  if (symptom_code === "harvest_started") {
+    updates.status = "harvesting";
+    engineActions.push("harvest_started");
+    processBadgeEvent(req.user.id, "harvest_logged").catch(console.error);
+  }
+
+  if (symptom_code === "transplant_done") {
+    updates.status            = "transplanted";
+    updates.transplant_date   = new Date().toISOString().split("T")[0];
+    engineActions.push("transplant_done");
+  }
+
+  if (symptom_code === "plant_struggling") {
+    updates.missed_task_note  = "Plant reported as struggling — check growing conditions";
+    engineActions.push("struggling_flagged");
+  }
+
+  if (symptom_code === "looks_healthy") {
+    updates.missed_task_note  = null; // clear any struggle flag
+    engineActions.push("health_confirmed");
+  }
+
+  // Apply crop updates if any
+  if (Object.keys(updates).length > 0) {
+    updates.updated_at = new Date().toISOString();
+    await req.db.from("crop_instances")
+      .update(updates)
+      .eq("id", req.params.id)
+      .eq("user_id", req.user.id);
+  }
+
+  // Re-run rule engine — stage/status changes affect task generation
+  await runRuleEngine(req.user.id);
+
+  res.json({
+    observation: obs,
+    crop_updated: Object.keys(updates).length > 0,
+    engine_actions: engineActions,
+  });
+});
+
+// GET /crops/:id/observations — list observations for a crop
+app.get("/crops/:id/observations", requireAuth, async (req, res) => {
+  const { data, error } = await req.db.from("observation_logs")
+    .select("*")
+    .eq("crop_id", req.params.id)
+    .eq("user_id", req.user.id)
+    .order("observed_at", { ascending: false })
+    .limit(20);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
 // =============================================================================
 // CRON — called by Vercel Cron at 06:00 UTC daily
 // Protected by CRON_SECRET header.
