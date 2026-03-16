@@ -1554,8 +1554,7 @@ const ADMIN_EMAIL = "mark@wynyardadvisory.co.uk";
 
 async function requireAdmin(req, res, next) {
   if (!req.user) return res.status(401).json({ error: "Unauthorised" });
-  const { data: profile } = await req.db.from("profiles").select("email").eq("id", req.user.id).single();
-  if (!profile || profile.email !== ADMIN_EMAIL) return res.status(403).json({ error: "Forbidden" });
+  if (req.user.email !== ADMIN_EMAIL) return res.status(403).json({ error: "Forbidden" });
   next();
 }
 
