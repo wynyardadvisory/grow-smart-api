@@ -7,6 +7,8 @@
     { "src": "/(.*)", "dest": "api.js" }
   ],
   "crons": [
-    { "path": "/cron/daily", "schedule": "0 6 * * *" }
+    { "path": "/cron/daily", "schedule": "0 6 * * *" },
+    { "path": "/cron/nudge-unactivated", "schedule": "0 8 * * *" },
+    { "path": "/cron/feedback-sequence", "schedule": "0 9 * * *" }
   ]
 }
