@@ -877,31 +877,37 @@ class RuleEngine {
   // ── Materializer — idempotent upsert ────────────────────────────────────────
 
   async _materialize(candidates) {
+    console.log(`[RuleEngine] Materializing ${candidates.length} candidates`);
+    let inserted = 0, errors = 0;
     for (const c of candidates) {
       try {
         // Strip internal fields
         const { _description, _status, ...task } = c;
 
-        // Upsert by source_key — update if exists, insert if not
-        const { error } = await this.supabase
+        console.log(`[RuleEngine] Upserting: rule=${task.rule_id} type=${task.engine_type} status=${task.status} due=${task.due_date} key=${task.source_key?.slice(0,40)}`);
+
+        const { data, error } = await this.supabase
           .from("tasks")
           .upsert(task, {
-            onConflict:        "source_key",
-            ignoreDuplicates:  false,
-          });
+            onConflict:       "source_key",
+            ignoreDuplicates: false,
+          })
+          .select("id, engine_type, status")
+          .single();
 
         if (error) {
-          // Fall back to plain insert if upsert fails (e.g. no source_key)
-          if (error.code === "23505") {
-            // Duplicate — skip
-          } else {
-            console.error("[RuleEngine] Persist error:", error.message);
-          }
+          console.error(`[RuleEngine] Upsert error (${task.rule_id}):`, error.message, error.details);
+          errors++;
+        } else {
+          console.log(`[RuleEngine] Upserted OK: id=${data?.id} engine_type=${data?.engine_type}`);
+          inserted++;
         }
       } catch (err) {
         console.error("[RuleEngine] Persist error:", err.message);
+        errors++;
       }
     }
+    console.log(`[RuleEngine] Materialize complete: ${inserted} inserted, ${errors} errors`);
   }
 
   // ── Expiry ────────────────────────────────────────────────────────────────
