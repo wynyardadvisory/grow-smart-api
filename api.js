@@ -1974,18 +1974,13 @@ app.get("/dashboard", requireAuth, async (req, res) => {
           const upcoming56 = new Date(Date.now() + 56 * 86400000).toISOString().split("T")[0];
           return vf <= today && t.due_date > weekEnd && t.due_date <= upcoming56;
         });
-        // One per crop NAME + task_type combination — keep earliest due date
-        // This deduplicates across multiple instances of the same crop (e.g. 2x Brussels Sprouts)
+        // One per crop NAME — keep only the earliest due date task
+        // When completed, the next task for that crop appears
         const seen = new Map();
         for (const t of candidates) {
-          const cropName = t.crop?.name || "general";
-          const key = `${cropName}:${t.task_type}`;
-          const existing = seen.get(key);
-          if (!existing) { seen.set(key, t); continue; }
-          const betterDate    = t.due_date < existing.due_date;
-          const sameDate      = t.due_date === existing.due_date;
-          const betterUrgency = (URGENCY_RANK[t.urgency] || 0) > (URGENCY_RANK[existing.urgency] || 0);
-          if (betterDate || (sameDate && betterUrgency)) seen.set(key, t);
+          const cropName = t.crop?.name || t.rule_id || "general";
+          const existing = seen.get(cropName);
+          if (!existing || t.due_date < existing.due_date) seen.set(cropName, t);
         }
         return [...seen.values()].sort((a, b) => a.due_date.localeCompare(b.due_date));
       })(),
