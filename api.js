@@ -1985,10 +1985,27 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     profile_photo:    profile?.photo_url || null,
     plan:             profile?.plan || "free",
     tasks_completed_this_week: tasksCompletedThisWeek || 0,
-    tasks: {
-      tasks:     tasks, // full list including overdue
-      today:     tasks.filter(t => t.due_date <= today),
-      this_week: tasks.filter(t => t.due_date > today && t.due_date <= weekEnd),
+    tasks: (() => {
+      const URGENCY_RANK = { high: 3, medium: 2, low: 1 };
+      const incomplete = tasks.filter(t => !t.completed_at && t.status !== "expired");
+      const dedupByCrop = (items) => {
+        const seen = new Map();
+        for (const t of [...items].sort((a,b) => {
+          const uDiff = (URGENCY_RANK[b.urgency]||0) - (URGENCY_RANK[a.urgency]||0);
+          return uDiff !== 0 ? uDiff : a.due_date.localeCompare(b.due_date);
+        })) {
+          const key = t.crop?.name || t.rule_id || t.id;
+          if (!seen.has(key)) seen.set(key, t);
+        }
+        return [...seen.values()].sort((a,b) => {
+          const uDiff = (URGENCY_RANK[b.urgency]||0) - (URGENCY_RANK[a.urgency]||0);
+          return uDiff !== 0 ? uDiff : a.due_date.localeCompare(b.due_date);
+        });
+      };
+      return {
+      tasks:     tasks,
+      today:     dedupByCrop(incomplete.filter(t => t.due_date <= today)),
+      this_week: dedupByCrop(incomplete.filter(t => t.due_date > today && t.due_date <= weekEnd)),
       coming_up: (() => {
         const URGENCY_RANK = { high: 3, medium: 2, low: 1 };
         const candidates = tasks.filter(t => {
@@ -2008,7 +2025,8 @@ app.get("/dashboard", requireAuth, async (req, res) => {
         return [...seen.values()].sort((a, b) => a.due_date.localeCompare(b.due_date));
       })(),
       alerts: tasks.filter(t => !t.completed_at && t.record_type === 'alert' && t.status !== 'expired'),
-    },
+      };
+    })(),
     crop_count:       crops.length,
     crops_with_flags: crops.filter(c => c.missed_task_note).map(c => ({ id: c.id, name: c.name, missed_task_note: c.missed_task_note })),
     harvest_forecast: harvestForecast,
