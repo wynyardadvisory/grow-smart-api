@@ -277,20 +277,17 @@ async function enrichCrop(cropInstanceId, submittedName, submittedVariety) {
     console.error("[Enrich] Failed to create pending record:", pendingErr.message);
     return;
   }
-  const companionKeywords = ["lavender","marigold","nasturtium","phacelia","borage","calendula","chamomile","alyssum","cosmos","sunflower","cornflower"];
-  const isCompanionPlant = companionKeywords.some(c => submittedName.toLowerCase().includes(c));
 
   try {
     const prompt = `You are a horticultural expert for UK home growers and allotment holders.
-A user has added a ${isCompanionPlant ? "companion/beneficial plant" : "crop"} to their garden with the following details:
-- ${isCompanionPlant ? "Plant" : "Crop"} name: "${submittedName}"
+A user has added a crop to their garden with the following details:
+- Crop name: "${submittedName}"
 - Variety: "${submittedVariety || "not specified"}"
 
 Your task:
-1. Determine if this is a real, growable plant in the UK. ${isCompanionPlant ? "Companion plants, flowers, and beneficial plants are all valid." : "Only vegetables, fruit, and herbs are valid."} Reject nonsense or unrecognisable names.
-2. If real, correct any spelling errors.
+1. Determine if this is a real, growable crop in the UK (vegetables, fruit, herbs). If it is nonsense, misspelled beyond recognition, or not a real crop, reject it.
+2. If real, correct any spelling errors in both the crop name and variety name.
 3. Return comprehensive UK growing data.
-
 
 Respond ONLY with a JSON object — no markdown, no explanation. Use this exact structure:
 {
@@ -573,7 +570,6 @@ app.post("/crops", requireAuth,
       establishment_method, quantity, notes,
       start_date_confidence, source, status,
       is_other_crop, is_other_variety,
-      is_companion,
       barcode,
     } = req.body;
 
@@ -602,7 +598,7 @@ app.post("/crops", requireAuth,
       notes:                notes || null,
       photo_url:            null,
       start_date_confidence:start_date_confidence || "exact",
-      source:               is_companion ? "companion" : (source || "manual"),
+      source:               source || "manual",
     }).select().single();
 
     if (error) return res.status(500).json({ error: error.message });
@@ -625,7 +621,8 @@ app.post("/crops", requireAuth,
 
     // Clear planting suggestions for this area — bed is no longer empty
     if (data.area_id) await clearSuggestions(data.area_id, req.db);
-
+    processBadgeEvent(req.user.id, "crop_added").catch(console.error);
+    if (data.sown_date) processBadgeEvent(req.user.id, "sow_logged").catch(console.error);
     res.status(201).json({ ...data, enriching: needsEnrichment });
   }
 );
@@ -654,53 +651,6 @@ app.put("/crops/:id", requireAuth, async (req, res) => {
   res.json(data);
 });
 
-// POST /crops/:id/confirm-stage — lifecycle confirmation from Quick Crop Check
-app.post("/crops/:id/confirm-stage", requireAuth, async (req, res) => {
-  const { stage, confirmed } = req.body;
-  if (!stage) return res.status(400).json({ error: "stage required" });
-  const validStages = ["seed","seedling","vegetative","flowering","fruiting","harvesting","finished"];
-  if (!validStages.includes(stage)) return res.status(400).json({ error: "invalid stage" });
-
-  if (confirmed) {
-    // User confirmed — update the stage
-    const { data, error } = await req.db.from("crop_instances")
-      .update({
-        stage,
-        stage_confidence:          "confirmed",
-        stage_check_snoozed_until: null, // clear any snooze
-        updated_at:                new Date().toISOString(),
-      })
-      .eq("id", req.params.id)
-      .eq("user_id", req.user.id)
-      .select().single();
-    if (error) return res.status(500).json({ error: error.message });
-    await runRuleEngine(req.user.id);
-    // Return full crop so frontend can patch local state immediately
-    res.json({ confirmed: true, stage, crop: data });
-  } else {
-    // User said "not yet" — snooze for 7 days AND add 7 to stage_delay_days
-    const snoozeUntil = new Date(Date.now() + 7 * 86400000).toISOString();
-    const { data: current } = await req.db.from("crop_instances")
-      .select("stage_delay_days")
-      .eq("id", req.params.id)
-      .eq("user_id", req.user.id)
-      .single();
-    const currentDelay = current?.stage_delay_days || 0;
-    const { data, error } = await req.db.from("crop_instances")
-      .update({
-        stage_check_snoozed_until: snoozeUntil,
-        stage_delay_days:          currentDelay + 7,
-        updated_at:                new Date().toISOString(),
-      })
-      .eq("id", req.params.id)
-      .eq("user_id", req.user.id)
-      .select().single();
-    if (error) return res.status(500).json({ error: error.message });
-    // Return full crop so frontend can patch local state immediately
-    res.json({ confirmed: false, snoozed_until: snoozeUntil, stage_delay_days: currentDelay + 7, crop: data });
-  }
-});
-
 app.get("/crops/:id/enrichment", requireAuth, async (req, res) => {
   const { data, error } = await req.db.from("pending_crops")
     .select("status, rejection_reason, result_crop_def_id, result_variety_id")
@@ -727,35 +677,27 @@ app.get("/tasks", requireAuth, async (req, res) => {
   const { view = "all", completed } = req.query;
   const today   = todayISO();
   const weekEnd = weekEndISO();
-  const upcoming14 = new Date(Date.now() + 14 * 86400000).toISOString().split("T")[0];
 
   let query = req.db.from("tasks")
     .select("*, crop:crop_instance_id(name, variety), area:area_id(name)")
     .eq("user_id", req.user.id)
-    .not("status", "eq", "expired")
     .order("urgency",  { ascending: false })
     .order("due_date", { ascending: true });
 
   if (completed === "false") query = query.is("completed_at", null);
   if (completed === "true")  query = query.not("completed_at", "is", null);
-  if (view === "today") query = query.lte("due_date", today);
+  if (view === "today") query = query.eq("due_date", today);
   if (view === "week")  query = query.lte("due_date", weekEnd);
 
   const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
 
-  const incomplete = (data || []).filter(t => !t.completed_at);
-
   res.json({
     tasks: data,
     grouped: {
-      today:     incomplete.filter(t => t.due_date <= today),
-      this_week: incomplete.filter(t => t.due_date > today && t.due_date <= weekEnd),
-      coming_up: incomplete.filter(t => {
-        const vf = t.visible_from || t.due_date;
-        return vf <= today && t.due_date > weekEnd && t.due_date <= upcoming14;
-      }),
-      alerts: incomplete.filter(t => t.record_type === "alert"),
+      today:     data.filter(t => t.due_date === today),
+      this_week: data.filter(t => t.due_date > today && t.due_date <= weekEnd),
+      coming_up: data.filter(t => t.due_date > weekEnd),
     },
   });
 });
@@ -770,6 +712,7 @@ app.post("/tasks/:id/complete", requireAuth, async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
 
   // Auto-update crop status + dates when lifecycle tasks are completed
+  processBadgeEvent(req.user.id, "task_completed").catch(console.error);
   if (data.crop_instance_id) {
     const meta = data.meta ? (typeof data.meta === "string" ? JSON.parse(data.meta) : data.meta) : {};
     const transition = meta.status_transition;
@@ -1034,18 +977,18 @@ app.post("/areas/:id/suggestions/generate", requireAuth, async (req, res) => {
   if (!area || area.locations?.user_id !== req.user.id)
     return res.status(403).json({ error: "Not authorised" });
 
-  // Get current crops in this area
-  const { data: areaCrops } = await db.from("crop_instances")
-    .select("name, variety, status")
-    .eq("area_id", req.params.id).eq("active", true)
+  // Check area is actually empty
+  const { data: activeCrops } = await db.from("crop_instances")
+    .select("id").eq("area_id", req.params.id).eq("active", true)
     .not("status", "eq", "harvested");
-  const hasExistingCrops = (areaCrops?.length || 0) > 0;
-  const currentAreaCropsStr = hasExistingCrops
-    ? areaCrops.map(c => `${c.name}${c.variety ? ` (${c.variety})` : ""}`).join(", ")
-    : null;
+  if (activeCrops?.length > 0)
+    return res.status(400).json({ error: "Area is not empty" });
 
-  // Always regenerate — upsert replaces existing
-  // (suggestions are invalidated when crops change via clearSuggestions)
+  // Check suggestions don't already exist
+  const { data: existing } = await db.from("planting_suggestions")
+    .select("id").eq("area_id", req.params.id).single();
+  if (existing)
+    return res.status(400).json({ error: "Suggestions already exist", existing });
 
   // Get crop history for this area
   const { data: history } = await db.from("crop_instances")
@@ -1070,79 +1013,49 @@ app.post("/areas/:id/suggestions/generate", requireAuth, async (req, res) => {
     : "nothing currently";
 
   try {
-    const prompt = hasExistingCrops
-      ? `You are a UK horticultural expert advising a home grower or allotment holder.
-Area details:
-- Type: ${areaType}
-- Location postcode: ${postcode}
-- Currently growing in this bed: ${currentAreaCropsStr}
-- Also growing elsewhere: ${currentStr}
-- Current month: ${month}
-This bed already has crops. Return exactly 3 suggestions to improve this bed — companion plants, interplanting ideas, and beneficial plants.
-For each suggestion explain clearly WHY it benefits the existing crops.
-Respond ONLY with a JSON array of exactly 3 items — no markdown, no explanation:
-[
-  {
-    "type": "companion",
-    "crop": "Plant name",
-    "variety": "Specific variety if relevant, or null",
-    "reason": "One clear sentence explaining exactly how this benefits the crops already in this bed",
-    "sow_note": "When and how to add this in one sentence",
-    "companion_note": "Which specific crop it helps most and how"
-  },
-  {
-    "type": "interplant",
-    "crop": "Crop name",
-    "variety": "Specific variety name",
-    "reason": "One sentence why this works well alongside the existing crops",
-    "sow_note": "When and how to sow in one sentence",
-    "companion_note": "How it fits with what is already growing"
-  },
-  {
-    "type": "beneficial",
-    "crop": "Plant name e.g. Lavender, Phacelia, Borage, Nasturtium, Marigold",
-    "variety": "Specific variety if relevant, or null",
-    "reason": "One sentence on the specific benefit — pest deterrent, pollinator attractor, or soil improver",
-    "sow_note": "When and how to plant in one sentence",
-    "companion_note": "Which pest it deters or which beneficial insect it attracts"
-  }
-]`
-      : `You are a UK horticultural expert advising a home grower or allotment holder.
+    const prompt = `You are a UK horticultural expert advising a home grower or allotment holder.
+
 Area details:
 - Type: ${areaType}
 - Location postcode: ${postcode}
 - Current month: ${month}
 - Previously grown here: ${historyStr}
 - Currently growing elsewhere in their garden: ${currentStr}
-Return exactly 3 suggestions: 2 crop suggestions and 1 companion or beneficial plant.
-Consider crop rotation, seasonality, and what the grower already grows. Suggest specific named varieties.
+
+Return exactly 3 suggestions: 2 crop suggestions and 1 bed preparation or companion suggestion.
+Consider:
+1. Seasonality — what can realistically be sown or planted in ${month} in the UK
+2. Crop rotation — avoid repeating the same crop family as what was previously grown
+3. What the grower already likes (infer from what they grow elsewhere) — suggest complementary crops, avoid duplicates
+4. Suggest a specific named variety for each crop, not just the species name
+
 Respond ONLY with a JSON array of exactly 3 items — no markdown, no explanation:
 [
   {
     "type": "crop",
     "crop": "Crop name",
-    "variety": "Specific variety name",
-    "reason": "One sentence why this is ideal right now for this grower",
-    "sow_note": "When and how to sow in one sentence",
-    "companion_note": "Companion benefit or null"
+    "variety": "Specific variety name e.g. Cobra, Black Beauty, Gardener's Delight",
+    "reason": "One sentence why this crop and variety is ideal right now for this grower",
+    "sow_note": "When and how to sow this variety in one sentence",
+    "companion_note": "Companion benefit with their existing crops or null"
   },
   {
     "type": "crop",
     "crop": "Crop name",
     "variety": "Specific variety name",
-    "reason": "One sentence why this is ideal right now",
+    "reason": "One sentence why this crop and variety is ideal right now",
     "sow_note": "When and how to sow in one sentence",
     "companion_note": "Companion benefit or null"
   },
   {
-    "type": "beneficial",
-    "crop": "Plant name e.g. Marigold, Nasturtium, Phacelia, Borage, Lavender",
-    "variety": "Specific variety or null",
-    "reason": "One sentence on why this benefits this bed",
-    "sow_note": "When and how to plant in one sentence",
-    "companion_note": "Specific pest it deters or pollinator it attracts"
+    "type": "prep",
+    "title": "e.g. Add well-rotted manure, Sow green manure (Phacelia), Plant pot marigolds as companions",
+    "reason": "One sentence why this prep or companion planting benefits this bed right now",
+    "timing_note": "Brief note on when or how to do this"
   }
-]`;
+]
+
+The prep suggestion can be: soil enrichment (compost, manure, green manure), a companion plant (marigolds, nasturtiums, borage), or seasonal ground prep. Pick the most relevant given rotation history and season.`;
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -1570,7 +1483,7 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
 
 // GET /admin/feedback — admin only
 app.get("/admin/feedback", requireAuth, requireAdmin, async (req, res) => {
-  const { data, error } = await supabaseService
+  const { data, error } = await req.db
     .from("feedback")
     .select("*, profiles(name, email)")
     .order("created_at", { ascending: false });
@@ -1586,7 +1499,8 @@ const ADMIN_EMAIL = "mark@wynyardadvisory.co.uk";
 
 async function requireAdmin(req, res, next) {
   if (!req.user) return res.status(401).json({ error: "Unauthorised" });
-  if (req.user.email !== ADMIN_EMAIL) return res.status(403).json({ error: "Forbidden" });
+  const { data: profile } = await req.db.from("profiles").select("email").eq("id", req.user.id).single();
+  if (!profile || profile.email !== ADMIN_EMAIL) return res.status(403).json({ error: "Forbidden" });
   next();
 }
 
@@ -1635,7 +1549,7 @@ app.get("/admin/users", requireAuth, requireAdmin, async (req, res) => {
   const users = authUsers?.users || [];
 
   // Get profiles for name lookup
-  const { data: profiles } = await supabaseService.from("profiles").select("id, name");
+  const { data: profiles } = await req.db.from("profiles").select("id, name");
   const profileMap = {};
   (profiles || []).forEach(p => { profileMap[p.id] = p.name; });
 
@@ -2043,16 +1957,10 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     profile_photo:    profile?.photo_url || null,
     plan:             profile?.plan || "free",
     tasks: {
-      tasks:     tasks,
-      today:     tasks.filter(t => !t.completed_at && t.due_date <= today && t.status !== "expired"),
-      this_week: tasks.filter(t => !t.completed_at && t.due_date > today && t.due_date <= weekEnd && t.status !== "expired"),
-      coming_up: tasks.filter(t => {
-        if (t.completed_at || t.status === "expired") return false;
-        const vf = t.visible_from || t.due_date;
-        const upcoming14 = new Date(Date.now() + 14 * 86400000).toISOString().split("T")[0];
-        return vf <= today && t.due_date > weekEnd && t.due_date <= upcoming14;
-      }),
-      alerts: tasks.filter(t => !t.completed_at && t.record_type === "alert" && t.status !== "expired"),
+      tasks:     tasks, // full list including overdue
+      today:     tasks.filter(t => t.due_date <= today),
+      this_week: tasks.filter(t => t.due_date > today && t.due_date <= weekEnd),
+      coming_up: tasks.filter(t => t.due_date > weekEnd),
     },
     crop_count:       crops.length,
     crops_with_flags: crops.filter(c => c.missed_task_note).map(c => ({ id: c.id, name: c.name, missed_task_note: c.missed_task_note })),
@@ -2356,126 +2264,421 @@ app.post("/admin/reset-tasks", requireAuth, requireAdmin, async (req, res) => {
 
 
 // =============================================================================
-// EMAIL AUTOMATION
+// SHARE GARDEN — data endpoint for Share My Garden card
+// =============================================================================
+app.get("/share/garden-data", requireAuth, async (req, res) => {
+  const { mode = "recent" } = req.query;
+  const now        = new Date();
+  const today      = now.toISOString().split("T")[0];
+  const dayOfMonth = now.getDate();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split("T")[0];
+  const monthEnd   = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().split("T")[0];
+  const prevMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1).toISOString().split("T")[0];
+  const prevMonthEnd   = new Date(now.getFullYear(), now.getMonth(), 0).toISOString().split("T")[0];
+  const threeDaysAgo   = new Date(Date.now() - 3 * 86400000).toISOString().split("T")[0];
+  const fourteenDaysAgo = new Date(Date.now() - 14 * 86400000).toISOString().split("T")[0];
+  const isEarlyMonth   = dayOfMonth <= 5;
+
+  let completedQuery, upcomingQuery;
+
+  if (mode === "recent") {
+    const { data: recent } = await req.db.from("tasks")
+      .select("action, task_type, crop:crop_instance_id(name)")
+      .eq("user_id", req.user.id)
+      .gte("completed_at", threeDaysAgo)
+      .not("completed_at", "is", null)
+      .order("completed_at", { ascending: false })
+      .limit(8);
+    let completed = recent || [];
+    if (completed.length === 0) {
+      const { data: fallback } = await req.db.from("tasks")
+        .select("action, task_type, crop:crop_instance_id(name)")
+        .eq("user_id", req.user.id)
+        .gte("completed_at", fourteenDaysAgo)
+        .not("completed_at", "is", null)
+        .order("completed_at", { ascending: false })
+        .limit(8);
+      completed = fallback || [];
+    }
+    const { data: upcoming } = await req.db.from("tasks")
+      .select("action, task_type, due_date, crop:crop_instance_id(name)")
+      .eq("user_id", req.user.id)
+      .is("completed_at", null)
+      .gt("due_date", today)
+      .order("due_date", { ascending: true })
+      .limit(2);
+    completedQuery = completed;
+    upcomingQuery  = upcoming || [];
+  } else {
+    const completedFrom = isEarlyMonth ? prevMonthStart : monthStart;
+    const completedTo   = isEarlyMonth ? prevMonthEnd   : today;
+    const { data: completed } = await req.db.from("tasks")
+      .select("action, task_type, crop:crop_instance_id(name), completed_at")
+      .eq("user_id", req.user.id)
+      .gte("completed_at", completedFrom)
+      .lte("completed_at", completedTo)
+      .not("completed_at", "is", null)
+      .order("completed_at", { ascending: false })
+      .limit(5);
+    const { data: upcoming } = await req.db.from("tasks")
+      .select("action, task_type, due_date, crop:crop_instance_id(name)")
+      .eq("user_id", req.user.id)
+      .is("completed_at", null)
+      .gt("due_date", today)
+      .lte("due_date", monthEnd)
+      .order("due_date", { ascending: true })
+      .limit(3);
+    completedQuery = completed || [];
+    upcomingQuery  = upcoming  || [];
+  }
+
+  const { data: profile } = await req.db.from("profiles")
+    .select("name, postcode").eq("id", req.user.id).single();
+  const { count: cropCount } = await req.db.from("crop_instances")
+    .select("*", { count: "exact", head: true })
+    .eq("user_id", req.user.id).eq("active", true);
+  const { count: harvestCount } = await req.db.from("harvest_log")
+    .select("*", { count: "exact", head: true })
+    .eq("user_id", req.user.id)
+    .gte("harvested_at", monthStart);
+
+  processBadgeEvent(req.user.id, "garden_shared").catch(console.error);
+
+  res.json({
+    mode,
+    is_early_month: isEarlyMonth,
+    profile: { name: profile?.name || null, postcode: profile?.postcode || null },
+    completed: completedQuery,
+    upcoming:  upcomingQuery,
+    stats: { crop_count: cropCount || 0, harvest_count: harvestCount || 0, completed_count: completedQuery.length },
+    month_name: now.toLocaleString("en-GB", { month: "long" }),
+    prev_month_name: new Date(now.getFullYear(), now.getMonth() - 1, 1).toLocaleString("en-GB", { month: "long" }),
+  });
+});
+
+// =============================================================================
+// BADGES & CHALLENGES ENGINE
 // =============================================================================
 
-const RESEND_API_KEY = process.env.RESEND_API_KEY;
-
-async function sendEmail(to, subject, html) {
-  const r = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${RESEND_API_KEY}` },
-    body: JSON.stringify({ from: "Mark at Vercro <hello@vercro.com>", to: [to], subject, html }),
-  });
-  if (!r.ok) throw new Error(`Resend error: ${await r.text()}`);
-  return r.json();
+function getCurrentSeason() {
+  const m = new Date().getMonth() + 1;
+  if (m >= 3 && m <= 5)  return "spring";
+  if (m >= 6 && m <= 8)  return "summer";
+  if (m >= 9 && m <= 11) return "autumn";
+  return "winter";
 }
 
-// Admin — invite all waitlist users — responds immediately, processes in background
-app.post("/admin/invite-waitlist", requireAuth, requireAdmin, async (req, res) => {
-  const { data: waitlist } = await supabaseService
-    .from("waitlist").select("email, name, invite_sent_at").eq("status", "waitlist");
-  if (!waitlist?.length) return res.json({ sent: 0, queued: 0 });
-  const pending = waitlist.filter(w => !w.invite_sent_at);
-  // Respond immediately so Vercel doesn't timeout
-  res.json({ ok: true, queued: pending.length });
-  // Process in background
-  let sent = 0;
-  for (const w of pending) {
-    const name = w.name ? w.name.split(" ")[0] : "there";
-    try {
-      await sendEmail(w.email, "Great news — your Vercro spot is ready 🌱", `
-        <div style="font-family:Georgia,serif;max-width:560px;margin:0 auto;padding:40px 24px;color:#1a1a1a">
-          <div style="font-size:32px;margin-bottom:16px">🌱</div>
-          <h1 style="font-size:24px;font-weight:700;margin-bottom:8px;color:#2F5D50">Great news, ${name}!</h1>
-          <p style="font-size:15px;color:#6E6E6E;line-height:1.6;margin-bottom:20px">
-            You applied for early access to Vercro a little while ago and we put you on our reserve list. We're now opening up access to everyone — and that includes you.
-          </p>
-          <p style="font-size:15px;color:#6E6E6E;line-height:1.6;margin-bottom:28px">
-            Your account is ready and waiting. It takes less than 2 minutes to set up your first crop.
-          </p>
-          <div style="background:#f0f7f4;border-radius:14px;padding:28px;text-align:center;margin-bottom:28px">
-            <p style="font-size:15px;color:#1a1a1a;font-weight:700;margin-bottom:20px">Get started at:</p>
-            <a href="https://app.vercro.com" style="display:inline-block;background:#2F5D50;color:#fff;text-decoration:none;padding:18px 40px;border-radius:12px;font-weight:700;font-size:17px">Open Vercro →</a>
-          </div>
-          <p style="font-size:14px;color:#6E6E6E;line-height:1.6">If you have any questions, just reply to this email. We read everything.</p>
-          <hr style="border:none;border-top:1px solid #e8e8e8;margin:32px 0"/>
-          <p style="font-size:12px;color:#999">Vercro · hello@vercro.com · <a href="https://vercro.com" style="color:#2F5D50">vercro.com</a></p>
-        </div>`
-      );
-      await supabaseService.from("waitlist").update({
-        status: "accepted", invite_sent_at: new Date().toISOString(), accepted_at: new Date().toISOString()
-      }).eq("email", w.email);
-      sent++;
-      console.log(`[Invite] Sent to ${w.email} (${sent}/${pending.length})`);
-    } catch(e) { console.error(`[Invite] Failed ${w.email}:`, e.message); }
+function getMonthKey() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function getTodayISO() {
+  return new Date().toISOString().split("T")[0];
+}
+
+async function ensureCounters(userId) {
+  const { data } = await supabaseService.from("user_activity_counters").select("user_id").eq("user_id", userId).single();
+  if (!data) {
+    await supabaseService.from("user_activity_counters").insert({
+      user_id: userId,
+      current_month_key:  getMonthKey(),
+      current_season_key: getCurrentSeason(),
+    });
   }
-  console.log(`[Invite] Done: ${sent}/${pending.length} sent`);
+}
+
+async function checkAndResetCounters(userId) {
+  const { data: counters } = await supabaseService.from("user_activity_counters").select("*").eq("user_id", userId).single();
+  if (!counters) return;
+  const updates = {};
+  const monthKey  = getMonthKey();
+  const seasonKey = getCurrentSeason();
+  if (counters.current_month_key !== monthKey) {
+    updates.tasks_completed_this_month          = 0;
+    updates.sowing_logged_this_month            = 0;
+    updates.harvest_logged_this_month           = 0;
+    updates.photos_uploaded_this_month          = 0;
+    updates.tasks_completed_distinct_days_month = 0;
+    updates.active_dates_this_month             = [];
+    updates.current_month_key                   = monthKey;
+  }
+  if (counters.current_season_key !== seasonKey) {
+    updates.tasks_completed_this_season  = 0;
+    updates.sowing_logged_this_season    = 0;
+    updates.current_season_key           = seasonKey;
+  }
+  if (Object.keys(updates).length > 0) {
+    await supabaseService.from("user_activity_counters").update(updates).eq("user_id", userId);
+  }
+}
+
+async function updateStreak(userId, counters) {
+  const today = getTodayISO();
+  const last  = counters.last_qualifying_activity_date;
+  if (last === today) return {};
+  const yesterday = new Date(Date.now() - 86400000).toISOString().split("T")[0];
+  const newStreak = last === yesterday ? (counters.current_streak_days || 0) + 1 : 1;
+  const longest   = Math.max(counters.longest_streak_days || 0, newStreak);
+  return { current_streak_days: newStreak, longest_streak_days: longest, last_qualifying_activity_date: today };
+}
+
+async function evaluateBadges(userId, eventType, counters) {
+  const unlocks = [];
+  const relevantThresholds = {
+    task_completed:   ["tasks_completed_total","tasks_completed_this_month","tasks_completed_this_season","current_streak_days"],
+    crop_added:       ["crops_added_total"],
+    area_created:     ["growing_areas_created_total"],
+    sow_logged:       ["sowing_logged_total","sowing_logged_this_month","sowing_logged_this_season","current_streak_days"],
+    harvest_logged:   ["harvest_logged_total","harvest_logged_this_month","current_streak_days"],
+    photo_uploaded:   ["photos_uploaded_total","photos_uploaded_this_month"],
+    garden_shared:    ["share_count_total"],
+  }[eventType] || [];
+
+  const { data: badges } = await supabaseService.from("badge_definitions").select("*").in("threshold_type", relevantThresholds).eq("is_active", true);
+  if (!badges?.length) return unlocks;
+
+  const monthKey  = getMonthKey();
+  const seasonKey = getCurrentSeason();
+
+  for (const badge of badges) {
+    const { data: existing } = await supabaseService.from("user_badge_progress").select("is_completed, current_progress").eq("user_id", userId).eq("badge_id", badge.id).eq("month_key", badge.time_scope === "monthly" ? monthKey : "").maybeSingle();
+    if (existing?.is_completed) continue;
+    const currentValue = counters[badge.threshold_type] || 0;
+    const progress     = Math.min(currentValue, badge.threshold_value);
+    const completed    = currentValue >= badge.threshold_value;
+    await supabaseService.from("user_badge_progress").upsert({
+      user_id: userId, badge_id: badge.id, current_progress: progress, is_completed: completed,
+      completed_at: completed ? new Date().toISOString() : null,
+      month_key: badge.time_scope === "monthly" ? monthKey : "",
+      season_key: badge.time_scope === "seasonal" ? seasonKey : "",
+      last_progress_event_at: new Date().toISOString(),
+    }, { onConflict: "user_id,badge_id,month_key" });
+    if (completed && !existing?.is_completed) {
+      await supabaseService.from("badge_unlock_events").insert({
+        user_id: userId, badge_id: badge.id,
+        month_key: badge.time_scope === "monthly" ? monthKey : null,
+        season_key: badge.time_scope === "seasonal" ? seasonKey : null,
+      });
+      let nextBadge = null;
+      if (badge.next_badge_id) {
+        const { data: nb } = await supabaseService.from("badge_definitions").select("title").eq("id", badge.next_badge_id).single();
+        nextBadge = nb?.title || null;
+      }
+      unlocks.push({ badge_id: badge.id, title: badge.title, description: badge.description, celebration_copy: badge.celebration_copy, icon_key: badge.icon_key, type: badge.type, next_badge_title: nextBadge });
+    }
+  }
+  return unlocks;
+}
+
+async function processBadgeEvent(userId, eventType, extraCounterUpdates = {}) {
+  try {
+    await ensureCounters(userId);
+    await checkAndResetCounters(userId);
+    const { data: counters } = await supabaseService.from("user_activity_counters").select("*").eq("user_id", userId).single();
+    if (!counters) return [];
+    const today    = getTodayISO();
+    const updates  = { updated_at: new Date().toISOString(), ...extraCounterUpdates };
+    if (eventType === "task_completed") {
+      updates.tasks_completed_total         = (counters.tasks_completed_total        || 0) + 1;
+      updates.tasks_completed_this_month    = (counters.tasks_completed_this_month   || 0) + 1;
+      updates.tasks_completed_this_season   = (counters.tasks_completed_this_season  || 0) + 1;
+      const activeDates = counters.active_dates_this_month || [];
+      if (!activeDates.includes(today)) {
+        updates.active_dates_this_month             = [...activeDates, today];
+        updates.tasks_completed_distinct_days_month = (counters.tasks_completed_distinct_days_month || 0) + 1;
+      }
+    } else if (eventType === "crop_added") {
+      updates.crops_added_total = (counters.crops_added_total || 0) + 1;
+    } else if (eventType === "area_created") {
+      updates.growing_areas_created_total = (counters.growing_areas_created_total || 0) + 1;
+    } else if (eventType === "sow_logged") {
+      updates.sowing_logged_total        = (counters.sowing_logged_total       || 0) + 1;
+      updates.sowing_logged_this_month   = (counters.sowing_logged_this_month  || 0) + 1;
+      updates.sowing_logged_this_season  = (counters.sowing_logged_this_season || 0) + 1;
+    } else if (eventType === "harvest_logged") {
+      updates.harvest_logged_total       = (counters.harvest_logged_total      || 0) + 1;
+      updates.harvest_logged_this_month  = (counters.harvest_logged_this_month || 0) + 1;
+    } else if (eventType === "photo_uploaded") {
+      updates.photos_uploaded_total      = (counters.photos_uploaded_total     || 0) + 1;
+      updates.photos_uploaded_this_month = (counters.photos_uploaded_this_month|| 0) + 1;
+    } else if (eventType === "garden_shared") {
+      updates.share_count_total = (counters.share_count_total || 0) + 1;
+    }
+    const qualifyingEvents = ["task_completed","sow_logged","harvest_logged","crop_added","photo_uploaded","garden_shared"];
+    if (qualifyingEvents.includes(eventType)) {
+      const streakUpdates = await updateStreak(userId, { ...counters, ...updates });
+      Object.assign(updates, streakUpdates);
+    }
+    await supabaseService.from("user_activity_counters").update(updates).eq("user_id", userId);
+    const freshCounters = { ...counters, ...updates };
+    return await evaluateBadges(userId, eventType, freshCounters);
+  } catch (err) {
+    console.error("[BadgeEngine]", err.message);
+    return [];
+  }
+}
+
+// GET /badges
+app.get("/badges", requireAuth, async (req, res) => {
+  try {
+    const userId    = req.user.id;
+    const monthKey  = getMonthKey();
+    const seasonKey = getCurrentSeason();
+    await ensureCounters(userId);
+    await checkAndResetCounters(userId);
+    const [{ data: allBadges }, { data: progress }, { data: counters }, { data: recentUnlocks }] = await Promise.all([
+      supabaseService.from("badge_definitions").select("*").eq("is_active", true).order("sort_order"),
+      supabaseService.from("user_badge_progress").select("*").eq("user_id", userId),
+      supabaseService.from("user_activity_counters").select("*").eq("user_id", userId).single(),
+      supabaseService.from("badge_unlock_events").select("*, badge:badge_id(*)").eq("user_id", userId).order("unlocked_at", { ascending: false }).limit(10),
+    ]);
+    const progressMap = {};
+    (progress || []).forEach(p => { progressMap[p.badge_id + (p.month_key || "")] = p; });
+    const enriched = (allBadges || []).map(badge => {
+      const key = badge.id + (badge.time_scope === "monthly" ? monthKey : "");
+      const p   = progressMap[key];
+      const currentValue = counters ? (counters[badge.threshold_type] || 0) : 0;
+      return { ...badge, current_progress: p?.current_progress ?? Math.min(currentValue, badge.threshold_value), is_completed: p?.is_completed ?? false, completed_at: p?.completed_at ?? null };
+    });
+    const monthlyChallenge = {
+      title: `${new Date().toLocaleString("en-GB", { month: "long" })} Grower`,
+      description: `Complete 12 garden tasks in ${new Date().toLocaleString("en-GB", { month: "long" })}`,
+      icon_key: "🌿", type: "monthly", threshold: 12,
+      progress: counters?.tasks_completed_this_month || 0,
+      is_completed: (counters?.tasks_completed_this_month || 0) >= 12,
+    };
+    res.json({ badges: enriched, counters: counters || {}, recent_unlocks: recentUnlocks || [], monthly_challenge: monthlyChallenge, season: seasonKey, month_key: monthKey });
+  } catch (e) {
+    console.error("[Badges]", e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// Cron — nudge accepted but not onboarded users
-app.post("/cron/nudge-unactivated", async (req, res) => {
-  if (req.headers["x-cron-secret"] !== process.env.CRON_SECRET) return res.status(401).json({ error: "Unauthorised" });
-  try {
-    const { data: accepted } = await supabaseService.from("waitlist")
-      .select("email, name, nudge_count, last_nudge_at").eq("status", "accepted");
-    if (!accepted?.length) return res.json({ sent: 0 });
-    const { data: { users: authUsers } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
-    const { data: profiles } = await supabaseService.from("profiles").select("id");
-    const profileIds = new Set((profiles || []).map(p => p.id));
-    const onboardedEmails = new Set((authUsers || []).filter(u => profileIds.has(u.id)).map(u => u.email));
-    const now = new Date(); let sent = 0;
-    const subjects = ["Your Vercro garden is waiting 🌱","Don't miss the growing season — Vercro is ready for you","Your crops won't plant themselves 🥕","Still time to get your garden on track","Last reminder — your Vercro access is ready"];
-    const intros = ["You signed up for the Vercro beta — your account is ready and waiting.","A quick reminder that your Vercro garden planner is set up and ready to go.","The growing season won't wait — and neither will Vercro. Your account is all set.","You're missing out on personalised daily tasks, weather alerts and harvest forecasts for your garden.","This is our final reminder — your Vercro beta access is ready whenever you are."];
-    for (const w of accepted) {
-      if (onboardedEmails.has(w.email)) continue;
-      if (w.last_nudge_at && (now - new Date(w.last_nudge_at)) / 3600000 < 23) continue;
-      if ((w.nudge_count || 0) >= 5) continue;
-      const n = (w.nudge_count || 0);
-      const name = w.name ? w.name.split(" ")[0] : "there";
-      try {
-        await sendEmail(w.email, subjects[n], `<div style="font-family:Georgia,serif;max-width:560px;margin:0 auto;padding:40px 24px;color:#1a1a1a"><div style="font-size:32px;margin-bottom:16px">🌱</div><h1 style="font-size:22px;font-weight:700;margin-bottom:12px;color:#2F5D50">Hi ${name},</h1><p style="font-size:15px;color:#6E6E6E;line-height:1.6;margin-bottom:24px">${intros[n]}</p><div style="background:#f0f7f4;border-radius:14px;padding:28px;text-align:center;margin-bottom:28px"><p style="font-size:15px;color:#1a1a1a;font-weight:700;margin-bottom:20px">Get started at:</p><a href="https://app.vercro.com" style="display:inline-block;background:#2F5D50;color:#fff;text-decoration:none;padding:16px 36px;border-radius:12px;font-weight:700;font-size:16px">Open Vercro →</a></div><hr style="border:none;border-top:1px solid #e8e8e8;margin:32px 0"/><p style="font-size:12px;color:#999">Vercro · hello@vercro.com</p></div>`);
-        await supabaseService.from("waitlist").update({ nudge_count: n+1, last_nudge_at: now.toISOString() }).eq("email", w.email);
-        sent++;
-      } catch(e) { console.error(`[Nudge] Failed ${w.email}:`, e.message); }
-    }
-    res.json({ sent });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+// GET /badges/pending-unlocks
+app.get("/badges/pending-unlocks", requireAuth, async (req, res) => {
+  const { data, error } = await supabaseService.from("badge_unlock_events").select("*, badge:badge_id(*)").eq("user_id", req.user.id).eq("shown_to_user", false).order("unlocked_at", { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
 });
 
-// Cron — feedback email sequence post-onboarding
-app.post("/cron/feedback-sequence", async (req, res) => {
-  if (req.headers["x-cron-secret"] !== process.env.CRON_SECRET) return res.status(401).json({ error: "Unauthorised" });
-  try {
-    const { data: { users: authUsers } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
-    const { data: profiles } = await supabaseService.from("profiles").select("id, name, feedback_emails_sent, last_feedback_email_at, created_at");
-    const profileMap = {}; (profiles || []).forEach(p => { profileMap[p.id] = p; });
-    const now = new Date(); let sent = 0;
-    const sequences = [
-      { subject: "How are you finding Vercro so far? 🌱", question: "What's working well? And what would you change or improve?", intro: "You've had a couple of days with Vercro now — we'd love to know how it's going." },
-      { subject: "A week in — what do you think? 🥕", question: "Is it helping with your garden? What's missing or frustrating you?", intro: "You've had a week with Vercro — enough time to form a real opinion." },
-      { subject: "One last question from the Vercro team 🌾", question: "If you could only change ONE thing about Vercro, what would it be?", intro: "You've been using Vercro for a few weeks now — thank you for being one of our early testers." },
-    ];
-    for (const user of authUsers) {
-      const profile = profileMap[user.id];
-      if (!profile) continue;
-      const sent_count = profile.feedback_emails_sent || 0;
-      if (sent_count >= 3) continue;
-      const hoursSince = (now - new Date(profile.created_at)) / 3600000;
-      const thresholds = [48, 168, 504];
-      if (hoursSince < thresholds[sent_count]) continue;
-      if (profile.last_feedback_email_at && (now - new Date(profile.last_feedback_email_at)) / 3600000 < 46) continue;
-      const seq = sequences[sent_count];
-      const name = profile.name ? profile.name.split(" ")[0] : "there";
-      try {
-        await sendEmail(user.email, seq.subject, `<div style="font-family:Georgia,serif;max-width:560px;margin:0 auto;padding:40px 24px;color:#1a1a1a"><div style="font-size:32px;margin-bottom:16px">🌱</div><h1 style="font-size:22px;font-weight:700;margin-bottom:12px;color:#2F5D50">Hi ${name},</h1><p style="font-size:15px;color:#6E6E6E;line-height:1.6;margin-bottom:20px">${seq.intro}</p><p style="font-size:16px;font-weight:700;color:#1a1a1a;font-style:italic;margin-bottom:20px;padding:16px;background:#f0f7f4;border-radius:12px;border-left:3px solid #2F5D50">"${seq.question}"</p><div style="text-align:center"><a href="mailto:hello@vercro.com?subject=Vercro feedback" style="display:inline-block;background:#2F5D50;color:#fff;text-decoration:none;padding:14px 32px;border-radius:12px;font-weight:700;font-size:15px">Reply with your thoughts →</a></div><p style="font-size:13px;color:#999;margin-top:24px;text-align:center">Or just reply directly to this email — we read everything.</p><hr style="border:none;border-top:1px solid #e8e8e8;margin:32px 0"/><p style="font-size:12px;color:#999">Vercro · hello@vercro.com</p></div>`);
-        await supabaseService.from("profiles").update({ feedback_emails_sent: sent_count+1, last_feedback_email_at: now.toISOString() }).eq("id", user.id);
-        sent++;
-      } catch(e) { console.error(`[Feedback] Failed ${user.email}:`, e.message); }
-    }
-    res.json({ sent });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+// POST /badges/mark-shown
+app.post("/badges/mark-shown", requireAuth, async (req, res) => {
+  const { ids } = req.body;
+  if (!ids?.length) return res.json({ ok: true });
+  await supabaseService.from("badge_unlock_events").update({ shown_to_user: true }).in("id", ids).eq("user_id", req.user.id);
+  res.json({ ok: true });
 });
+
+// =============================================================================
+// ADMIN — One-time badge backfill for all existing users
+// =============================================================================
+app.post("/admin/backfill-badges", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const now         = new Date();
+    const monthKey    = now.toISOString().slice(0, 7);
+    const m           = now.getMonth() + 1;
+    const currentSeason = m>=3&&m<=5?"spring":m>=6&&m<=8?"summer":m>=9&&m<=11?"autumn":"winter";
+    const monthStart  = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split("T")[0];
+    const seasonStart = m>=3&&m<=5?`${now.getFullYear()}-03-01`:m>=6&&m<=8?`${now.getFullYear()}-06-01`:m>=9&&m<=11?`${now.getFullYear()}-09-01`:m===12?`${now.getFullYear()}-12-01`:`${now.getFullYear()-1}-12-01`;
+    const today       = now.toISOString().split("T")[0];
+    const yesterday   = new Date(Date.now()-86400000).toISOString().split("T")[0];
+
+    const { data: { users } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
+    if (!users?.length) return res.json({ ok: true, processed: 0 });
+
+    const [{ data: allTasks }, { data: allCrops }, { data: allLocations }, { data: allAreas }, { data: allHarvests }, { data: allPhotos }, { data: allBadges }] = await Promise.all([
+      supabaseService.from("tasks").select("user_id, task_type, completed_at").not("completed_at", "is", null),
+      supabaseService.from("crop_instances").select("user_id, active").eq("active", true),
+      supabaseService.from("locations").select("id, user_id"),
+      supabaseService.from("growing_areas").select("id, location_id"),
+      supabaseService.from("harvest_log").select("user_id, harvested_at"),
+      supabaseService.from("crop_photos").select("user_id"),
+      supabaseService.from("badge_definitions").select("*").eq("is_active", true),
+    ]);
+
+    const locUserMap = {};
+    (allLocations || []).forEach(l => { locUserMap[l.id] = l.user_id; });
+
+    const counterUpserts = [], badgeUpserts = [], unlockInserts = [], results = [];
+
+    for (const user of users) {
+      const uid = user.id;
+      const userTasks    = (allTasks    || []).filter(t => t.user_id === uid);
+      const userCrops    = (allCrops    || []).filter(c => c.user_id === uid);
+      const userHarvests = (allHarvests || []).filter(h => h.user_id === uid);
+      const userPhotos   = (allPhotos   || []).filter(p => p.user_id === uid);
+      const userLocIds   = (allLocations|| []).filter(l => l.user_id === uid).map(l => l.id);
+      const userAreas    = (allAreas    || []).filter(a => userLocIds.includes(a.location_id));
+
+      const tasksTotal  = userTasks.length;
+      const tasksMonth  = userTasks.filter(t => t.completed_at >= monthStart).length;
+      const tasksSeason = userTasks.filter(t => t.completed_at >= seasonStart).length;
+      const sowTotal    = userTasks.filter(t => t.task_type === "sow").length;
+      const sowMonth    = userTasks.filter(t => t.task_type === "sow" && t.completed_at >= monthStart).length;
+      const sowSeason   = userTasks.filter(t => t.task_type === "sow" && t.completed_at >= seasonStart).length;
+      const harvestTotal = userHarvests.length;
+      const harvestMonth = userHarvests.filter(h => h.harvested_at >= monthStart).length;
+
+      const distinctDays = [...new Set(userTasks.map(t => t.completed_at.split("T")[0]))].sort().reverse();
+      let streak = 0, longest = 0, cur = 0;
+      for (let i = 0; i < distinctDays.length; i++) {
+        if (i === 0) { cur = 1; continue; }
+        const diff = (new Date(distinctDays[i-1]) - new Date(distinctDays[i])) / 86400000;
+        if (diff === 1) cur++;
+        else { longest = Math.max(longest, cur); cur = 1; }
+      }
+      longest = Math.max(longest, cur);
+      if (distinctDays[0] === today || distinctDays[0] === yesterday) streak = cur;
+      const activeDatesMonth = distinctDays.filter(d => d >= monthStart);
+
+      const counters = {
+        user_id: uid, tasks_completed_total: tasksTotal, tasks_completed_this_month: tasksMonth,
+        tasks_completed_this_season: tasksSeason, tasks_completed_distinct_days_month: activeDatesMonth.length,
+        crops_added_total: userCrops.length, growing_areas_created_total: userAreas.length,
+        sowing_logged_total: sowTotal, sowing_logged_this_month: sowMonth, sowing_logged_this_season: sowSeason,
+        harvest_logged_total: harvestTotal, harvest_logged_this_month: harvestMonth,
+        photos_uploaded_total: userPhotos.length, share_count_total: 0,
+        current_streak_days: streak, longest_streak_days: longest,
+        last_qualifying_activity_date: distinctDays[0] || null,
+        active_dates_this_month: activeDatesMonth,
+        current_month_key: monthKey, current_season_key: currentSeason, updated_at: now.toISOString(),
+      };
+      counterUpserts.push(counters);
+
+      for (const badge of (allBadges || [])) {
+        const val       = counters[badge.threshold_type] || 0;
+        const completed = val >= badge.threshold_value;
+        const progress  = Math.min(val, badge.threshold_value);
+        if (progress === 0 && !completed) continue;
+        badgeUpserts.push({
+          user_id: uid, badge_id: badge.id, current_progress: progress, is_completed: completed,
+          completed_at: completed ? now.toISOString() : null,
+          month_key: badge.time_scope === "monthly" ? monthKey : "",
+          season_key: badge.time_scope === "seasonal" ? currentSeason : "",
+          last_progress_event_at: now.toISOString(),
+        });
+        if (completed) {
+          unlockInserts.push({ user_id: uid, badge_id: badge.id, month_key: badge.time_scope === "monthly" ? monthKey : null, season_key: badge.time_scope === "seasonal" ? currentSeason : null, shown_to_user: true });
+        }
+      }
+      results.push({ user_id: uid, email: user.email, tasks: tasksTotal, crops: userCrops.length, harvests: harvestTotal });
+    }
+
+    await supabaseService.from("user_activity_counters").upsert(counterUpserts, { onConflict: "user_id" });
+    if (badgeUpserts.length) {
+      await supabaseService.from("user_badge_progress").upsert(badgeUpserts, { onConflict: "user_id,badge_id,month_key" });
+    }
+    for (const unlock of unlockInserts) {
+      await supabaseService.from("badge_unlock_events").upsert(unlock, { onConflict: "user_id,badge_id" }).then(() => {}).catch(() => {});
+    }
+    res.json({ ok: true, processed: users.length, results });
+  } catch (e) {
+    console.error("[Backfill]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 
 // =============================================================================
 // CRON — called by Vercel Cron at 06:00 UTC daily
