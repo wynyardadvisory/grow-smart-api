@@ -654,6 +654,53 @@ app.put("/crops/:id", requireAuth, async (req, res) => {
   res.json(data);
 });
 
+// POST /crops/:id/confirm-stage — lifecycle confirmation from Quick Crop Check
+app.post("/crops/:id/confirm-stage", requireAuth, async (req, res) => {
+  const { stage, confirmed } = req.body;
+  if (!stage) return res.status(400).json({ error: "stage required" });
+  const validStages = ["seed","seedling","vegetative","flowering","fruiting","harvesting","finished"];
+  if (!validStages.includes(stage)) return res.status(400).json({ error: "invalid stage" });
+
+  if (confirmed) {
+    // User confirmed — update the stage
+    const { data, error } = await req.db.from("crop_instances")
+      .update({
+        stage,
+        stage_confidence:          "confirmed",
+        stage_check_snoozed_until: null, // clear any snooze
+        updated_at:                new Date().toISOString(),
+      })
+      .eq("id", req.params.id)
+      .eq("user_id", req.user.id)
+      .select().single();
+    if (error) return res.status(500).json({ error: error.message });
+    await runRuleEngine(req.user.id);
+    // Return full crop so frontend can patch local state immediately
+    res.json({ confirmed: true, stage, crop: data });
+  } else {
+    // User said "not yet" — snooze for 7 days AND add 7 to stage_delay_days
+    const snoozeUntil = new Date(Date.now() + 7 * 86400000).toISOString();
+    const { data: current } = await req.db.from("crop_instances")
+      .select("stage_delay_days")
+      .eq("id", req.params.id)
+      .eq("user_id", req.user.id)
+      .single();
+    const currentDelay = current?.stage_delay_days || 0;
+    const { data, error } = await req.db.from("crop_instances")
+      .update({
+        stage_check_snoozed_until: snoozeUntil,
+        stage_delay_days:          currentDelay + 7,
+        updated_at:                new Date().toISOString(),
+      })
+      .eq("id", req.params.id)
+      .eq("user_id", req.user.id)
+      .select().single();
+    if (error) return res.status(500).json({ error: error.message });
+    // Return full crop so frontend can patch local state immediately
+    res.json({ confirmed: false, snoozed_until: snoozeUntil, stage_delay_days: currentDelay + 7, crop: data });
+  }
+});
+
 app.get("/crops/:id/enrichment", requireAuth, async (req, res) => {
   const { data, error } = await req.db.from("pending_crops")
     .select("status, rejection_reason, result_crop_def_id, result_variety_id")
