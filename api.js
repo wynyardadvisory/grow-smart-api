@@ -993,11 +993,11 @@ app.post("/areas/:id/suggestions/generate", requireAuth, async (req, res) => {
   if (activeCrops?.length > 0)
     return res.status(400).json({ error: "Area is not empty" });
 
-  // Check suggestions don't already exist
+  // Check suggestions don't already exist — if they do, return them instead of erroring
   const { data: existing } = await db.from("planting_suggestions")
-    .select("id").eq("area_id", req.params.id).single();
+    .select("*").eq("area_id", req.params.id).single();
   if (existing)
-    return res.status(400).json({ error: "Suggestions already exist", existing });
+    return res.json({ suggestions: existing.suggestions, generated_at: existing.generated_at });
 
   // Get crop history for this area
   const { data: history } = await db.from("crop_instances")
