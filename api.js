@@ -727,27 +727,35 @@ app.get("/tasks", requireAuth, async (req, res) => {
   const { view = "all", completed } = req.query;
   const today   = todayISO();
   const weekEnd = weekEndISO();
+  const upcoming14 = new Date(Date.now() + 14 * 86400000).toISOString().split("T")[0];
 
   let query = req.db.from("tasks")
     .select("*, crop:crop_instance_id(name, variety), area:area_id(name)")
     .eq("user_id", req.user.id)
+    .not("status", "eq", "expired")
     .order("urgency",  { ascending: false })
     .order("due_date", { ascending: true });
 
   if (completed === "false") query = query.is("completed_at", null);
   if (completed === "true")  query = query.not("completed_at", "is", null);
-  if (view === "today") query = query.eq("due_date", today);
+  if (view === "today") query = query.lte("due_date", today);
   if (view === "week")  query = query.lte("due_date", weekEnd);
 
   const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
 
+  const incomplete = (data || []).filter(t => !t.completed_at);
+
   res.json({
     tasks: data,
     grouped: {
-      today:     data.filter(t => t.due_date === today),
-      this_week: data.filter(t => t.due_date > today && t.due_date <= weekEnd),
-      coming_up: data.filter(t => t.due_date > weekEnd),
+      today:     incomplete.filter(t => t.due_date <= today),
+      this_week: incomplete.filter(t => t.due_date > today && t.due_date <= weekEnd),
+      coming_up: incomplete.filter(t => {
+        const vf = t.visible_from || t.due_date;
+        return vf <= today && t.due_date > weekEnd && t.due_date <= upcoming14;
+      }),
+      alerts: incomplete.filter(t => t.record_type === "alert"),
     },
   });
 });
@@ -2035,10 +2043,16 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     profile_photo:    profile?.photo_url || null,
     plan:             profile?.plan || "free",
     tasks: {
-      tasks:     tasks, // full list including overdue
-      today:     tasks.filter(t => t.due_date <= today),
-      this_week: tasks.filter(t => t.due_date > today && t.due_date <= weekEnd),
-      coming_up: tasks.filter(t => t.due_date > weekEnd),
+      tasks:     tasks,
+      today:     tasks.filter(t => !t.completed_at && t.due_date <= today && t.status !== "expired"),
+      this_week: tasks.filter(t => !t.completed_at && t.due_date > today && t.due_date <= weekEnd && t.status !== "expired"),
+      coming_up: tasks.filter(t => {
+        if (t.completed_at || t.status === "expired") return false;
+        const vf = t.visible_from || t.due_date;
+        const upcoming14 = new Date(Date.now() + 14 * 86400000).toISOString().split("T")[0];
+        return vf <= today && t.due_date > weekEnd && t.due_date <= upcoming14;
+      }),
+      alerts: tasks.filter(t => !t.completed_at && t.record_type === "alert" && t.status !== "expired"),
     },
     crop_count:       crops.length,
     crops_with_flags: crops.filter(c => c.missed_task_note).map(c => ({ id: c.id, name: c.name, missed_task_note: c.missed_task_note })),

@@ -1,21 +1,79 @@
 "use strict";
 
 /**
- * GROW SMART — Rule Engine
+ * GROW SMART — Rule Engine v2
  * ─────────────────────────────────────────────────────────────
- * Evaluates crop rules against a user's active crop instances
- * and generates tasks where conditions are met.
+ * Hybrid scheduling + alerting engine.
  *
- * Usage:
- *   const engine = new RuleEngine(supabaseClient);
- *   const tasks  = await engine.runForUser(userId);
+ * Architecture:
+ *   1. Crop Context Builder   — normalised per-crop context object
+ *   2. Scheduled Rule Engine  — deterministic future task candidates
+ *   3. Dynamic Risk Engine    — short-horizon weather + pest/disease alerts
+ *   4. Task Materializer      — idempotent upsert via source_key
+ *   5. Expiry Handler         — cleans up stale tasks/alerts
  *
- * Called on:
- *   - User adds or updates a crop (via API)
- *   - Daily Vercel Cron job at 06:00 UTC
+ * Key design principles:
+ *   - Engine runs are idempotent — safe to run multiple times per day
+ *   - source_key uniqueness enforced at DB level — no duplicate tasks
+ *   - Scheduled rules think in DATE WINDOWS not boolean conditions
+ *   - Weather/pest rules are SHORT HORIZON ONLY (1–3 days)
+ *   - Coming Up Soon populated by visible_from field, not due_date
  */
 
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const LOOKAHEAD_DAYS = {
+  sow:        21,
+  transplant: 14,
+  feed:       14,
+  harvest:    10,
+  prune:      30,
+  seasonal:   30,
+  default:    14,
+};
+
+const LEAD_TIME_DAYS = {
+  sow:        7,
+  transplant: 3,
+  feed:       2,
+  harvest:    5,
+  prune:      5,
+  protect:    1,
+  default:    2,
+};
+
+const STAGE_ORDER = [
+  "seed", "seedling", "vegetative", "flowering",
+  "fruiting", "harvesting", "finished"
+];
+
+const STAGE_DTM_PERCENT = {
+  seed:        0,
+  seedling:    0.08,
+  vegetative:  0.25,
+  flowering:   0.55,
+  fruiting:    0.70,
+  harvesting:  0.90,
+  finished:    1.10,
+};
+
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
 // ── Date helpers ──────────────────────────────────────────────────────────────
+
+function todayISO() {
+  return new Date().toISOString().split("T")[0];
+}
+
+function addDays(dateStr, n) {
+  const d = new Date(dateStr);
+  d.setDate(d.getDate() + n);
+  return d.toISOString().split("T")[0];
+}
+
+function daysBetween(a, b) {
+  return Math.round((new Date(b) - new Date(a)) / 86400000);
+}
 
 function daysSince(dateStr) {
   if (!dateStr) return null;
@@ -26,697 +84,867 @@ function currentMonth() {
   return new Date().getMonth() + 1;
 }
 
-function todayISO() {
-  return new Date().toISOString().split("T")[0];
+function monthToDate(month, year = new Date().getFullYear(), day = 1) {
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
 }
 
-// ── Effective value resolver ──────────────────────────────────────────────────
-// Prefer variety overrides over crop_def defaults.
-// Variety_id is always optional — never block task generation when it is NULL.
+function withinLookahead(dateStr, lookaheadDays) {
+  if (!dateStr) return false;
+  const today = todayISO();
+  const limit = addDays(today, lookaheadDays);
+  return dateStr >= today && dateStr <= limit;
+}
 
-function resolveEffectiveValues(crop) {
-  const v = crop.variety;
-  const d = crop.crop_def;
+function isOverdue(dateStr) {
+  return dateStr < todayISO();
+}
+
+// ── Source key builder ────────────────────────────────────────────────────────
+// Deterministic unique key for idempotent upserts
+
+function sourceKey(parts) {
+  return Object.entries(parts)
+    .map(([k, v]) => `${k}:${v}`)
+    .join("|");
+}
+
+// ── Crop Context Builder ──────────────────────────────────────────────────────
+
+function buildCropContext(crop, weather, envMods, userFeeds) {
+  const def = crop.crop_def || {};
+  const variety = crop.variety || {};
+
+  // Resolve effective values — variety overrides crop def
+  const dtm_min = variety.days_to_maturity_min ?? def.days_to_maturity_min ?? null;
+  const dtm_max = variety.days_to_maturity_max ?? def.days_to_maturity_max ?? null;
+  const dtm     = dtm_min || 80; // fallback for stage estimation
+
+  const sowStart       = variety.sow_window_start       ?? def.sow_window_start       ?? null;
+  const sowEnd         = variety.sow_window_end         ?? def.sow_window_end         ?? null;
+  const txStart        = variety.transplant_window_start ?? def.transplant_window_start ?? null;
+  const txEnd          = variety.transplant_window_end   ?? def.transplant_window_end   ?? null;
+  const harvestStart   = def.harvest_month_start ?? null;
+  const harvestEnd     = def.harvest_month_end   ?? null;
+  const feedInterval   = variety.feed_interval_days_override ?? def.feed_interval_days ?? null;
+  const feedType       = def.feed_type ?? null;
+  const frostSensitive = variety.frost_sensitive_override ?? def.frost_sensitive ?? true;
+  const isPerennial    = def.is_perennial ?? false;
+  const sowMethod      = def.sow_method ?? "either";
+  const cropGroup      = def.category ?? null;
+
+  // Date anchors
+  const sowDate         = crop.sown_date         || crop.transplanted_date || null;
+  const transplantDate  = crop.transplanted_date  || crop.transplant_date  || null;
+  const plantedOutDate  = crop.planted_out_date   || null;
+  const lastFedAt       = crop.last_fed_at        || null;
+
+  // Stage
+  const daysSown = daysSince(sowDate);
+  const pctGrown = daysSown !== null && dtm > 0 ? daysSown / dtm : null;
+
+  let inferredStage = crop.stage || "seed";
+  const vegEstablishments = ["runner","tuber","crown","cane"];
+  if (!vegEstablishments.includes(def.default_establishment) && sowDate) {
+    // Infer from DTM percentage
+    if      (pctGrown === null)    inferredStage = "seed";
+    else if (pctGrown < 0.08)     inferredStage = "seed";
+    else if (pctGrown < 0.25)     inferredStage = "seedling";
+    else if (pctGrown < 0.55)     inferredStage = "vegetative";
+    else if (pctGrown < 0.70)     inferredStage = "flowering";
+    else if (pctGrown < 0.90)     inferredStage = "fruiting";
+    else if (pctGrown < 1.10)     inferredStage = "harvesting";
+    else                           inferredStage = "finished";
+  }
+
+  // Stage boundary dates — when does each stage start?
+  const stageBoundaries = {};
+  if (sowDate && dtm) {
+    for (const [stage, pct] of Object.entries(STAGE_DTM_PERCENT)) {
+      stageBoundaries[stage] = addDays(sowDate, Math.round(dtm * pct));
+    }
+  }
+
+  // Estimated harvest date
+  const estimatedHarvestDate = sowDate && dtm_min
+    ? addDays(sowDate, dtm_min)
+    : (harvestStart ? monthToDate(harvestStart) : null);
+
+  // Feed next due
+  let feedNextDue = null;
+  if (feedInterval) {
+    const anchor = lastFedAt || transplantDate || sowDate;
+    if (anchor) feedNextDue = addDays(anchor, feedInterval);
+  }
+
+  // Environment
+  const areaType = crop.area?.type || null;
+  const isProtected = envMods?.frost_protection?.protected || false;
+
+  // Weather summary
+  const frostRisk     = weather?.frost_risk === true;
+  const frostRisk7day = weather?.frost_risk_7day ?? null;
+  const tempC         = weather?.temp_c ?? null;
+  const rainMm        = weather?.rain_mm ?? null;
+
+  // Feed matching
+  const matchedFeed = feedType ? matchFeed(feedType, userFeeds) : null;
+
   return {
-    dtm_min:         v?.days_to_maturity_min          ?? d?.days_to_maturity_min          ?? null,
-    dtm_max:         v?.days_to_maturity_max          ?? d?.days_to_maturity_max          ?? null,
-    frost_sensitive: v?.frost_sensitive_override      ?? d?.frost_sensitive               ?? true,
-    feed_interval:   v?.feed_interval_days_override   ?? d?.feed_interval_days            ?? null,
-    pest_start:      v?.pest_window_start_override    ?? d?.pest_window_start             ?? null,
-    pest_end:        v?.pest_window_end_override      ?? d?.pest_window_end               ?? null,
-    is_perennial:    d?.is_perennial                  ?? false,
+    // Identity
+    cropId:     crop.id,
+    userId:     crop.user_id,
+    areaId:     crop.area_id,
+    cropName:   crop.name,
+    variety:    crop.variety_name || variety.name || null,
+    cropGroup,
+    cropStatus: crop.status || "growing",
+
+    // Definition
+    def, variety, dtm, dtm_min, dtm_max,
+    sowMethod, feedType, feedInterval,
+    frostSensitive, isPerennial, isProtected,
+
+    // Windows
+    sowStart, sowEnd, txStart, txEnd,
+    harvestStart, harvestEnd,
+
+    // Date anchors
+    sowDate, transplantDate, plantedOutDate, lastFedAt,
+    feedNextDue, estimatedHarvestDate,
+
+    // Stage
+    stage: inferredStage, stageBoundaries,
+    daysSown, pctGrown,
+
+    // Weather
+    frostRisk, frostRisk7day, tempC, rainMm,
+    areaType,
+
+    // Feed
+    matchedFeed,
+
+    // Potato type
+    potatoType: variety.potato_type || null,
   };
 }
 
-// ── Timing status ─────────────────────────────────────────────────────────────
-// Returns 'early', 'peak', or 'late' based on position within a month window
-// adjusted by frost risk and temperature.
+// ── Feed matcher ──────────────────────────────────────────────────────────────
 
-function timingStatus(windowStart, windowEnd, weather) {
-  const m = currentMonth();
-  if (!windowStart || !windowEnd) return "peak"; // no window = assume peak
-
-  const windowLen  = windowEnd - windowStart;
-  const posInWindow = m - windowStart; // 0 = first month, windowLen = last month
-
-  // Weather adjustments — frost risk pushes timing later
-  const min7      = weather?.frost_risk_7day ?? null;
-  const frostAdj  = (min7 !== null && min7 <= 2) ? 1 : 0; // add 1 to position if frost risk
-
-  const adjusted = posInWindow + frostAdj;
-
-  if (windowLen <= 1) return adjusted === 0 ? "peak" : "late";
-  if (adjusted === 0)                         return "early";
-  if (adjusted >= windowLen)                  return "late";
-  return "peak";
+function matchFeed(cropFeedType, userFeeds) {
+  if (!cropFeedType || !userFeeds?.length) return null;
+  const keywords = cropFeedType.toLowerCase();
+  const scored = userFeeds.map(feed => {
+    let score = 0;
+    const ft = (feed.feed_type || "").toLowerCase();
+    if (ft.includes("high_potash")       && keywords.includes("potash"))    score += 10;
+    if (ft.includes("high_nitrogen")     && keywords.includes("nitrogen"))  score += 10;
+    if (ft.includes("balanced")          && keywords.includes("balanced"))  score += 10;
+    if (ft.includes("specialist_tomato") && keywords.includes("potash"))    score += 15;
+    if (ft.includes("seaweed"))                                              score += 2;
+    if (ft.includes("organic_general"))                                      score += 3;
+    if (keywords.includes("potash")  && ft.includes("potash"))              score += 5;
+    if (keywords.includes("general") && ft.includes("balanced"))            score += 5;
+    return { feed, score };
+  }).filter(s => s.score > 0).sort((a, b) => b.score - a.score);
+  return scored[0]?.feed || null;
 }
 
-
-// Scales stage thresholds to the crop's days_to_maturity.
-// Falls back to generic thresholds when DTM is unknown.
-
-function inferStage(crop, effective) {
-  const days = daysSince(crop.sown_date);
-  if (days === null) return crop.stage;
-  const dtm = effective.dtm_min || 80;
-  if (days <= 7)           return "seed";
-  if (days <= dtm * 0.25)  return "seedling";
-  if (days <= dtm * 0.55)  return "vegetative";
-  if (days <= dtm * 0.75)  return "flowering";
-  if (days <= dtm * 0.95)  return "fruiting";
-  if (days <= dtm * 1.5)   return "harvesting";
-  return "finished";
+function formatFeedAction(cropName, matchedFeed, feedType, prefix) {
+  if (matchedFeed) {
+    const label = [matchedFeed.brand, matchedFeed.product_name].filter(Boolean).join(" ");
+    const dosage = matchedFeed.form === "liquid" && matchedFeed.dilution_ml_per_litre
+      ? ` at ${matchedFeed.dilution_ml_per_litre}ml per litre of water`
+      : matchedFeed.form === "granular" ? " — follow pack instructions" : "";
+    return `${prefix} ${cropName} with ${label}${dosage}`;
+  }
+  return `${prefix} ${cropName} — apply ${feedType || "a balanced feed"}. Add your feed to the feeds section for personalised reminders`;
 }
 
-// ── Condition evaluators ──────────────────────────────────────────────────────
+// ── Candidate builder ─────────────────────────────────────────────────────────
 
-const CONDITIONS = {
+function candidate(ctx, opts) {
+  const {
+    ruleId, taskType, title, description,
+    scheduledFor, urgency = "medium",
+    engineType = "scheduled", recordType = "task",
+    expiryDays = 14, leadTimeDays = null,
+    meta = {}, riskPayload = null,
+  } = opts;
 
-  days_since_sow(crop, params) {
-    const days = daysSince(crop.sown_date);
-    return days !== null && days >= params.days;
-  },
+  const lead    = leadTimeDays ?? LEAD_TIME_DAYS[taskType] ?? LEAD_TIME_DAYS.default;
+  const visFrom = scheduledFor ? addDays(scheduledFor, -lead) : todayISO();
+  const expiry  = scheduledFor ? addDays(scheduledFor, expiryDays) : addDays(todayISO(), expiryDays);
 
-  days_since_feed(crop, params, _ctx, effective) {
-    const interval = params.days || effective.feed_interval;
-    if (!interval) return false;
-    if (!crop.last_fed_at) return (daysSince(crop.sown_date) || 0) >= 7;
-    return daysSince(crop.last_fed_at) >= interval;
-  },
+  // Status: upcoming if scheduled in future, due if today or past
+  const today   = todayISO();
+  const status  = scheduledFor && scheduledFor > today ? "upcoming" : "due";
 
-  days_since_transplant(crop, params) {
-    const days = daysSince(crop.transplanted_date);
-    return days !== null && days >= params.days;
-  },
+  const key = sourceKey({
+    u: ctx.userId,
+    c: ctx.cropId,
+    r: ruleId,
+    d: scheduledFor || today,
+  });
 
-  month_window(_crop, params) {
+  return {
+    user_id:          ctx.userId,
+    crop_instance_id: ctx.cropId,
+    area_id:          ctx.areaId,
+    action:           title,        // keep 'action' for API compatibility
+    task_type:        taskType,
+    urgency,
+    due_date:         scheduledFor || today,
+    scheduled_for:    scheduledFor || today,
+    visible_from:     visFrom < today ? today : visFrom,
+    expires_at:       new Date(expiry + "T23:59:59Z").toISOString(),
+    status,
+    engine_type:      engineType,
+    record_type:      recordType,
+    source:           "rule_engine",
+    rule_id:          ruleId,
+    source_key:       key,
+    date_confidence:  scheduledFor ? "exact" : "approximate",
+    meta:             JSON.stringify(meta),
+    risk_payload:     riskPayload ? JSON.stringify(riskPayload) : null,
+    // description stored in meta for now (tasks table has no body field yet)
+    _description:     description, // stripped before DB insert
+    _status:          status,
+  };
+}
+
+// ── SCHEDULED RULE ENGINE ─────────────────────────────────────────────────────
+
+class ScheduledRuleEngine {
+
+  evaluate(ctx, rules) {
+    const candidates = [];
+    const status = ctx.cropStatus;
+
+    // Finished crops — nothing to do
+    if (ctx.stage === "finished") return candidates;
+
+    // ── PERENNIALS ───────────────────────────────────────────────────────────
+    if (ctx.isPerennial) {
+      candidates.push(...this._evalPerennial(ctx));
+      return candidates;
+    }
+
+    // ── PLANNED ─────────────────────────────────────────────────────────────
+    if (status === "planned") {
+      candidates.push(...this._evalPlanned(ctx));
+      return candidates;
+    }
+
+    // ── SOWN INDOORS ────────────────────────────────────────────────────────
+    if (status === "sown_indoors") {
+      candidates.push(...this._evalIndoor(ctx));
+      return candidates;
+    }
+
+    // ── GROWING / TRANSPLANTED / SOWN OUTDOORS ───────────────────────────────
+    candidates.push(...this._evalGrowing(ctx, rules));
+
+    return candidates;
+  }
+
+  // ── Perennial evaluation ─────────────────────────────────────────────────
+
+  _evalPerennial(ctx) {
+    const results = [];
+    const today = todayISO();
     const m = currentMonth();
-    return m >= params.start && m <= params.end;
-  },
+    const year = new Date().getFullYear();
 
-  stage_reached(crop, params) {
-    const ORDER = ["seed","seedling","vegetative","flowering","fruiting","harvesting","finished"];
-    return ORDER.indexOf(crop.stage) >= ORDER.indexOf(params.stage);
-  },
+    // Harvest window — recurring every 14 days
+    const hs = ctx.harvestStart, he = ctx.harvestEnd;
+    if (hs && he && m >= hs && m <= he) {
+      // Next harvest check = today (it's within window)
+      results.push(candidate(ctx, {
+        ruleId:       "perennial_harvest",
+        taskType:     "harvest",
+        title:        `${ctx.cropName} should be ready to harvest — check for ripeness and pick regularly to encourage more fruit`,
+        description:  `You're in the harvest window for ${ctx.cropName}. Regular picking encourages further fruiting.`,
+        scheduledFor: today,
+        urgency:      "medium",
+        expiryDays:   14,
+        leadTimeDays: 0,
+      }));
+    } else if (hs && m < hs) {
+      // Upcoming harvest — show in Coming Up Soon
+      const harvestDate = monthToDate(hs, year, 1);
+      if (withinLookahead(harvestDate, LOOKAHEAD_DAYS.harvest)) {
+        results.push(candidate(ctx, {
+          ruleId:       "perennial_harvest_upcoming",
+          taskType:     "harvest",
+          title:        `${ctx.cropName} harvest season starts ${MONTHS[hs-1]} — prepare to pick regularly`,
+          description:  `Your ${ctx.cropName} harvest window opens in ${MONTHS[hs-1]}. Prepare to pick regularly once ripe.`,
+          scheduledFor: harvestDate,
+          urgency:      "low",
+          leadTimeDays: 7,
+          expiryDays:   7,
+        }));
+      }
+    }
 
-  days_to_harvest(crop, params, _ctx, effective) {
-    if (!crop.sown_date || !effective.dtm_min) return false;
-    const daysLeft = effective.dtm_min - (daysSince(crop.sown_date) || 0);
-    return daysLeft >= 0 && daysLeft <= params.days;
-  },
+    // Spring feed — schedule for March 15 if in lookahead
+    if (ctx.feedType) {
+      const springFeedDate = `${new Date().getFullYear()}-03-15`;
+      if (withinLookahead(springFeedDate, LOOKAHEAD_DAYS.seasonal) || (m >= 3 && m <= 4)) {
+        const due = m >= 3 && m <= 4 ? today : springFeedDate;
+        results.push(candidate(ctx, {
+          ruleId:       "perennial_spring_feed",
+          taskType:     "feed",
+          title:        formatFeedAction(ctx.cropName, ctx.matchedFeed, ctx.feedType, "Feed"),
+          description:  `Spring feeding supports new growth on ${ctx.cropName}.`,
+          scheduledFor: due,
+          urgency:      "low",
+          expiryDays:   21,
+          leadTimeDays: 7,
+        }));
+      }
 
-  weather_frost(_crop, _params, ctx, effective) {
-    // Skip if crop is growing in a frost-protected environment
-    if (ctx.envMods?.frost_protection?.protected) return false;
-    // Skip if crop is not frost sensitive
-    if (!effective.frost_sensitive) return false;
-    return ctx.weather?.frost_risk === true;
-  },
+      // Summer feed — June/July
+      const summerFeedDate = `${new Date().getFullYear()}-06-15`;
+      if (withinLookahead(summerFeedDate, LOOKAHEAD_DAYS.seasonal) || (m >= 6 && m <= 7)) {
+        const due = m >= 6 && m <= 7 ? today : summerFeedDate;
+        results.push(candidate(ctx, {
+          ruleId:       "perennial_summer_feed",
+          taskType:     "feed",
+          title:        formatFeedAction(ctx.cropName, ctx.matchedFeed, ctx.feedType, "Feed"),
+          description:  `Summer feeding supports fruiting on ${ctx.cropName}.`,
+          scheduledFor: due,
+          urgency:      "low",
+          expiryDays:   21,
+          leadTimeDays: 7,
+        }));
+      }
+    }
 
-  weather_temp_below(_crop, params, ctx) {
-    return ctx.weather?.temp_c !== undefined && ctx.weather.temp_c < params.temp_c;
-  },
-};
+    return results;
+  }
 
-// ── Rule Engine ───────────────────────────────────────────────────────────────
+  // ── Planned crop evaluation ──────────────────────────────────────────────
+
+  _evalPlanned(ctx) {
+    const results = [];
+    let { sowStart, sowEnd, sowMethod, potatoType, frostSensitive } = ctx;
+
+    // Potato type offset
+    if (sowMethod === "tuber" && potatoType) {
+      if (potatoType === "first_early")  { sowStart = 3; sowEnd = 4; }
+      if (potatoType === "second_early") { sowStart = 3; sowEnd = 5; }
+      if (potatoType === "maincrop")     { sowStart = 4; sowEnd = 5; }
+    }
+
+    if (!sowStart || !sowEnd) return results;
+
+    // Calculate sow window start date
+    const year = new Date().getFullYear();
+    const sowWindowStart = monthToDate(sowStart, year, 1);
+    const sowWindowEnd   = monthToDate(sowEnd,   year, 28);
+    const today          = todayISO();
+    const m              = currentMonth();
+
+    // Is window open now or coming up within lookahead?
+    const windowOpenNow    = m >= sowStart && m <= sowEnd;
+    const windowUpcoming   = sowWindowStart > today && withinLookahead(sowWindowStart, LOOKAHEAD_DAYS.sow);
+
+    if (!windowOpenNow && !windowUpcoming) return results;
+
+    const scheduledFor = windowOpenNow ? today : sowWindowStart;
+
+    // Frost suppression for outdoor sowing
+    const isOutdoor = sowMethod === "outdoors" || sowMethod === "direct_sow" ||
+                      sowMethod === "either" || sowMethod === "tuber";
+    const hardFrost = frostSensitive && isOutdoor && ctx.frostRisk7day !== null && ctx.frostRisk7day <= 0;
+    const softFrost = frostSensitive && isOutdoor && ctx.frostRisk7day !== null && ctx.frostRisk7day > 0 && ctx.frostRisk7day <= 3;
+
+    // Hard block — don't even show task
+    if (hardFrost && windowOpenNow) return results;
+
+    let title, urgency, meta;
+    const windowStr = `${MONTHS[sowStart-1]}–${MONTHS[sowEnd-1]}`;
+
+    if (sowMethod === "indoors") {
+      title   = `Sow ${ctx.cropName} indoors now — starting indoors gives stronger plants and an earlier harvest. Sowing window: ${windowStr}`;
+      urgency = windowOpenNow ? "medium" : "low";
+      meta    = { status_transition: "sown_indoors", sow_method: "indoors", can_prefer_outdoors: true };
+    } else if (sowMethod === "tuber") {
+      title   = softFrost
+        ? `Almost time to plant out ${ctx.cropName} — frost risk still present, wait for a settled spell. Window: ${windowStr}`
+        : `Time to plant out ${ctx.cropName} — chit them now if not already started. Window: ${windowStr}`;
+      urgency = softFrost ? "low" : "medium";
+      meta    = { status_transition: "sown", sow_method: "tuber" };
+    } else if (sowMethod === "crown") {
+      title   = `Plant out ${ctx.cropName} crowns — do this while dormant for best establishment. Window: ${windowStr}`;
+      urgency = "medium";
+      meta    = { status_transition: "sown", sow_method: "crown" };
+    } else {
+      // Direct / either
+      title   = softFrost
+        ? `Almost time to direct sow ${ctx.cropName} outdoors — frost risk still marginal, wait for a settled spell. Window: ${windowStr}`
+        : `Time to direct sow ${ctx.cropName} outdoors. Window: ${windowStr}`;
+      urgency = softFrost ? "low" : "medium";
+      meta    = { status_transition: "sown", sow_method: "outdoors" };
+    }
+
+    results.push(candidate(ctx, {
+      ruleId:       "sow_prompt",
+      taskType:     "sow",
+      title,
+      scheduledFor,
+      urgency,
+      expiryDays:   daysBetween(scheduledFor, sowWindowEnd) + 3,
+      leadTimeDays: LEAD_TIME_DAYS.sow,
+      meta,
+    }));
+
+    return results;
+  }
+
+  // ── Indoor seedling evaluation ────────────────────────────────────────────
+
+  _evalIndoor(ctx) {
+    const results = [];
+    const { txStart, txEnd, frostSensitive, cropName } = ctx;
+    if (!txStart || !txEnd) return results;
+
+    const year        = new Date().getFullYear();
+    const txDate      = monthToDate(txStart, year, 1);
+    const txEndDate   = monthToDate(txEnd,   year, 28);
+    const today       = todayISO();
+    const m           = currentMonth();
+
+    const windowOpen     = m >= txStart && m <= txEnd;
+    const windowUpcoming = txDate > today && withinLookahead(txDate, LOOKAHEAD_DAYS.transplant);
+
+    if (!windowOpen && !windowUpcoming) return results;
+
+    const scheduledFor = windowOpen ? today : txDate;
+    const frostRisk    = ctx.frostRisk;
+
+    const title = frostRisk
+      ? `${cropName} is ready to transplant but frost is forecast — harden off and wait for a clear spell`
+      : `Time to transplant ${cropName} outdoors — harden off for a few days first if not already done`;
+
+    results.push(candidate(ctx, {
+      ruleId:       "transplant_prompt",
+      taskType:     "transplant",
+      title,
+      scheduledFor,
+      urgency:      frostRisk ? "low" : "medium",
+      expiryDays:   daysBetween(scheduledFor, txEndDate) + 3,
+      leadTimeDays: LEAD_TIME_DAYS.transplant,
+      meta:         { status_transition: "transplanted" },
+    }));
+
+    // Harden off — show 1 week before transplant window
+    const hardenDate = addDays(txDate, -7);
+    if (hardenDate >= today && withinLookahead(hardenDate, LOOKAHEAD_DAYS.transplant)) {
+      results.push(candidate(ctx, {
+        ruleId:       "harden_off",
+        taskType:     "check",
+        title:        `Start hardening off ${cropName} — put outside during the day, bring in at night for a week before transplanting`,
+        scheduledFor: hardenDate,
+        urgency:      "low",
+        expiryDays:   7,
+        leadTimeDays: 2,
+      }));
+    }
+
+    return results;
+  }
+
+  // ── Growing crop rule evaluation ─────────────────────────────────────────
+
+  _evalGrowing(ctx, rules) {
+    const results = [];
+    const today = todayISO();
+
+    // ── Feed scheduling ──────────────────────────────────────────────────────
+    if (ctx.feedNextDue && ctx.feedInterval) {
+      const feedDue = ctx.feedNextDue;
+      if (withinLookahead(feedDue, LOOKAHEAD_DAYS.feed) || isOverdue(feedDue)) {
+        const scheduledFor = isOverdue(feedDue) ? today : feedDue;
+        results.push(candidate(ctx, {
+          ruleId:       "feed_scheduled",
+          taskType:     "feed",
+          title:        formatFeedAction(ctx.cropName, ctx.matchedFeed, ctx.feedType, "Time to feed"),
+          description:  `Regular feeding is due for ${ctx.cropName}.`,
+          scheduledFor,
+          urgency:      isOverdue(feedDue) ? "high" : "medium",
+          expiryDays:   7,
+          leadTimeDays: LEAD_TIME_DAYS.feed,
+        }));
+      }
+    }
+
+    // ── Harvest scheduling ───────────────────────────────────────────────────
+    if (ctx.estimatedHarvestDate) {
+      // Show harvest task leading up to and during harvest
+      const harvestAlertDate = addDays(ctx.estimatedHarvestDate, -LEAD_TIME_DAYS.harvest);
+      const today = todayISO();
+      if (withinLookahead(harvestAlertDate, LOOKAHEAD_DAYS.harvest) ||
+          (ctx.estimatedHarvestDate >= addDays(today, -7) && ctx.estimatedHarvestDate <= addDays(today, 14))) {
+        const scheduledFor = harvestAlertDate < today ? today : harvestAlertDate;
+        results.push(candidate(ctx, {
+          ruleId:       "harvest_approaching",
+          taskType:     "harvest",
+          title:        `${ctx.cropName} should be ready to harvest around ${ctx.estimatedHarvestDate} — check for ripeness`,
+          description:  `Based on your sow date and variety, ${ctx.cropName} should be approaching harvest.`,
+          scheduledFor,
+          urgency:      "medium",
+          expiryDays:   21,
+          leadTimeDays: LEAD_TIME_DAYS.harvest,
+          meta:         { estimated_harvest_date: ctx.estimatedHarvestDate },
+        }));
+      }
+    }
+
+    // ── Stage-based tasks from crop_rules table ──────────────────────────────
+    for (const rule of rules) {
+      // Crop match
+      if (rule.crop_def_id && rule.crop_def_id !== ctx.def?.id) continue;
+      // Area type match
+      if (rule.area_type && rule.area_type !== ctx.areaType) continue;
+      // Stage match
+      if (rule.stage && rule.stage !== ctx.stage) continue;
+      // Skip finished
+      if (ctx.stage === "finished") continue;
+
+      const scheduledFor = this._resolveRuleDate(ctx, rule, today);
+      if (!scheduledFor) continue;
+
+      // Is it within lookahead or overdue?
+      const lookahead = LOOKAHEAD_DAYS[rule.task_type] || LOOKAHEAD_DAYS.default;
+      if (!withinLookahead(scheduledFor, lookahead) && !isOverdue(scheduledFor)) continue;
+
+      const due = isOverdue(scheduledFor) ? today : scheduledFor;
+
+      // Feed personalisation
+      let action = rule.action;
+      if (rule.task_type === "feed") {
+        action = formatFeedAction(ctx.cropName, ctx.matchedFeed, ctx.feedType, "Time to feed");
+      }
+
+      results.push(candidate(ctx, {
+        ruleId:       rule.rule_id,
+        taskType:     rule.task_type,
+        title:        action,
+        scheduledFor: due,
+        urgency:      rule.urgency || "medium",
+        expiryDays:   rule.cooldown_days || 7,
+        leadTimeDays: LEAD_TIME_DAYS[rule.task_type] || LEAD_TIME_DAYS.default,
+      }));
+    }
+
+    return results;
+  }
+
+  // Resolve what date a crop_rules rule should fire
+  _resolveRuleDate(ctx, rule, today) {
+    const { condition_type, condition_value: cv } = rule;
+
+    switch (condition_type) {
+      case "days_since_sow":
+        if (!ctx.sowDate || !cv?.days) return null;
+        return addDays(ctx.sowDate, cv.days);
+
+      case "days_since_transplant":
+        if (!ctx.transplantDate || !cv?.days) return null;
+        return addDays(ctx.transplantDate, cv.days);
+
+      case "days_since_feed":
+        if (!ctx.feedInterval) return null;
+        return ctx.feedNextDue || today;
+
+      case "days_to_harvest":
+        if (!ctx.estimatedHarvestDate || !cv?.days) return null;
+        return addDays(ctx.estimatedHarvestDate, -(cv.days));
+
+      case "stage_reached": {
+        if (!cv?.stage || !ctx.sowDate) return null;
+        const stagePct = STAGE_DTM_PERCENT[cv.stage];
+        if (stagePct === undefined) return null;
+        return addDays(ctx.sowDate, Math.round(ctx.dtm * stagePct));
+      }
+
+      case "month_window":
+        if (!cv?.start || !cv?.end) return null;
+        if (currentMonth() >= cv.start && currentMonth() <= cv.end) return today;
+        // Upcoming?
+        const windowDate = monthToDate(cv.start);
+        return windowDate > today ? windowDate : null;
+
+      default:
+        return null; // unknown condition types fall through to reactive only
+    }
+  }
+}
+
+// ── DYNAMIC RISK ENGINE ───────────────────────────────────────────────────────
+
+class DynamicRiskEngine {
+
+  evaluate(ctx, pestRules) {
+    const results = [];
+    const today   = todayISO();
+    const m       = currentMonth();
+
+    // ── Frost alert (1–3 day horizon) ────────────────────────────────────────
+    if (ctx.frostSensitive && !ctx.isProtected) {
+      const min7 = ctx.frostRisk7day;
+      if (min7 !== null && min7 <= 2) {
+        const urgency = min7 <= 0 ? "high" : "medium";
+        const title   = min7 <= 0
+          ? `Frost forecast tonight — protect ${ctx.cropName} with fleece or bring containers inside`
+          : `Frost risk this week — keep fleece handy for ${ctx.cropName}`;
+        results.push(candidate(ctx, {
+          ruleId:       "frost_alert",
+          taskType:     "protect",
+          title,
+          scheduledFor: today,
+          urgency,
+          engineType:   "risk",
+          recordType:   "alert",
+          expiryDays:   2,
+          leadTimeDays: 0,
+        }));
+      }
+    }
+
+    // ── Heat stress alert ─────────────────────────────────────────────────────
+    if (ctx.tempC !== null && ctx.tempC >= 28 && ctx.areaType !== "greenhouse") {
+      results.push(candidate(ctx, {
+        ruleId:       "heat_alert",
+        taskType:     "water",
+        title:        `High temperatures forecast — water ${ctx.cropName} early morning and check for wilting`,
+        scheduledFor: today,
+        urgency:      "medium",
+        engineType:   "risk",
+        recordType:   "alert",
+        expiryDays:   1,
+        leadTimeDays: 0,
+      }));
+    }
+
+    // ── Pest and disease risk rules ──────────────────────────────────────────
+    for (const rule of pestRules) {
+      if (!this._pestRuleApplies(ctx, rule, m)) continue;
+
+      const riskLevel = this._assessRiskLevel(ctx, rule);
+      if (!riskLevel) continue;
+
+      const template = rule[`urgency_${riskLevel}_template`];
+      if (!template) continue;
+
+      const title = template.replace(/\{crop\}/g, ctx.cropName);
+
+      results.push(candidate(ctx, {
+        ruleId:       `pest_${rule.pest_code}`,
+        taskType:     rule.default_task_type || "inspect_pests",
+        title,
+        scheduledFor: today,
+        urgency:      riskLevel,
+        engineType:   "risk",
+        recordType:   riskLevel === "high" ? "task" : "alert",
+        expiryDays:   rule.alert_cooldown_days || 2,
+        leadTimeDays: 0,
+        riskPayload:  {
+          pest_code:         rule.pest_code,
+          risk_kind:         rule.risk_kind,
+          risk_level:        riskLevel,
+          treatment_guidance: rule.treatment_guidance,
+        },
+      }));
+    }
+
+    return results;
+  }
+
+  _pestRuleApplies(ctx, rule, m) {
+    // Season check
+    if (rule.season_start_month && m < rule.season_start_month) return false;
+    if (rule.season_end_month   && m > rule.season_end_month)   return false;
+
+    // Crop group check
+    if (rule.applies_to_crop_groups?.length) {
+      if (!ctx.cropGroup || !rule.applies_to_crop_groups.includes(ctx.cropGroup)) return false;
+    }
+
+    // Specific crop def check
+    if (rule.applies_to_crop_def_ids?.length) {
+      if (!ctx.def?.id || !rule.applies_to_crop_def_ids.includes(ctx.def.id)) return false;
+    }
+
+    // Stage check
+    if (rule.stage_min) {
+      if (STAGE_ORDER.indexOf(ctx.stage) < STAGE_ORDER.indexOf(rule.stage_min)) return false;
+    }
+    if (rule.stage_max) {
+      if (STAGE_ORDER.indexOf(ctx.stage) > STAGE_ORDER.indexOf(rule.stage_max)) return false;
+    }
+
+    // Outdoor requirement
+    if (rule.requires_outdoor && ctx.areaType === "greenhouse") return false;
+    if (rule.requires_unprotected && ctx.isProtected) return false;
+
+    return true;
+  }
+
+  _assessRiskLevel(ctx, rule) {
+    const { tempC, rainMm, frostRisk7day } = ctx;
+
+    let score = 0;
+    const maxScore = 3;
+
+    // Temperature check
+    if (rule.temp_min_c !== null && tempC !== null && tempC >= rule.temp_min_c) score++;
+    if (rule.temp_max_c !== null && tempC !== null && tempC <= rule.temp_max_c) score++;
+
+    // Rain check
+    if (rule.rain_last_24h_min_mm !== null && rainMm !== null && rainMm >= rule.rain_last_24h_min_mm) score++;
+
+    // Season alone can give low risk
+    const m = currentMonth();
+    const inSeason = (!rule.season_start_month || m >= rule.season_start_month) &&
+                     (!rule.season_end_month   || m <= rule.season_end_month);
+    if (inSeason && score === 0) return "low"; // seasonal watch regardless
+
+    if (score === 0) return null;
+    if (score === 1) return "low";
+    if (score === 2) return "medium";
+    return "high";
+  }
+}
+
+// ── RULE ENGINE (main class) ──────────────────────────────────────────────────
 
 class RuleEngine {
   constructor(supabase = null, options = {}) {
-    this.supabase = supabase;
-    this.dryRun   = options.dryRun || false;
+    this.supabase  = supabase;
+    this.dryRun    = options.dryRun || false;
+    this.scheduled = new ScheduledRuleEngine();
+    this.risk      = new DynamicRiskEngine();
   }
 
-  // ── Main entry point ────────────────────────────────────────────────────────
-
   async runForUser(userId) {
-    // ── Cleanup: remove tasks for inactive/deleted crops ──────────────────────
     if (this.supabase) {
       await this._cleanupOrphanedTasks(userId);
+      await this._expireStaleItems(userId);
     }
 
-    const [crops, rules, weatherByLocation, recentLog, envModifiers, userFeeds] = await Promise.all([
+    const [crops, rules, weatherByLocation, envModifiers, userFeeds, pestRules] = await Promise.all([
       this._loadCrops(userId),
       this._loadRules(),
       this._loadWeatherByLocation(userId),
-      this._loadRuleLog(userId),
       this._loadEnvModifiers(),
       this._loadUserFeeds(userId),
+      this._loadPestRules(),
     ]);
 
-    const newTasks = [];
+    const allCandidates = [];
 
     for (const crop of crops) {
-      const effective  = resolveEffectiveValues(crop);
-      const cropStatus = crop.status || "growing";
-      const areaType   = crop.area?.type;
-      const locId      = crop.location_id || crop.area?.location_id;
-      const weather    = weatherByLocation[locId] || null;
-      const envMods    = envModifiers[areaType]   || {};
-      const context    = { weather, envMods };
-      const m          = currentMonth();
-      const sowMethod  = crop.crop_def?.sow_method || "either";
+      const locId   = crop.location_id || crop.area?.location_id;
+      const weather = weatherByLocation[locId] || null;
+      const areaType = crop.area?.type;
+      const envMods  = envModifiers[areaType] || {};
 
-      // ── PERENNIALS: fruit trees, bushes, established plants ─────────────────
-      // Skip the seed cycle entirely. Generate harvest alerts and feed reminders
-      // based on harvest window and feed schedule, not days since sowing.
-      if (effective.is_perennial) {
-        const harvestStart = crop.crop_def?.harvest_month_start;
-        const harvestEnd   = crop.crop_def?.harvest_month_end;
-        const feedSchedule = crop.crop_def?.feed_type;
+      // Build normalised context once per crop
+      const ctx = buildCropContext(crop, weather, envMods, userFeeds);
 
-        // Harvest alert — when in harvest window
-        if (harvestStart && harvestEnd && m >= harvestStart && m <= harvestEnd) {
-          const logKey  = `${crop.id}:perennial_harvest`;
-          const lastRun = recentLog.get(logKey);
-          if (!lastRun || (Date.now() - lastRun.getTime()) >= 14 * 86400000) {
-            const task = {
-              user_id:          crop.user_id,
-              crop_instance_id: crop.id,
-              area_id:          crop.area_id,
-              action:           `${crop.name} should be ready to harvest — check for ripeness and pick regularly to encourage more fruit`,
-              task_type:        "harvest",
-              urgency:          "medium",
-              due_date:         todayISO(),
-              source:           "rule_engine",
-              rule_id:          "perennial_harvest",
-              date_confidence:  "approximate",
-              meta:             JSON.stringify({}),
-            };
-            newTasks.push({ ...task, crop_name: crop.name, rule_id: "perennial_harvest" });
-            if (!this.dryRun && this.supabase) {
-              await this._persistTaskWithKey(task, crop, "perennial_harvest");
-            }
-          }
-        }
+      // Scheduled engine — future tasks
+      const scheduled = this.scheduled.evaluate(ctx, rules);
+      allCandidates.push(...scheduled);
 
-        // Spring feed reminder — March/April for most perennials
-        if (m >= 3 && m <= 4 && feedSchedule) {
-          const logKey  = `${crop.id}:perennial_spring_feed`;
-          const lastRun = recentLog.get(logKey);
-          if (!lastRun || (Date.now() - lastRun.getTime()) >= 21 * 86400000) {
-            const matchedFeed = this._matchFeed(feedSchedule, userFeeds);
-            let feedAction;
-            if (matchedFeed) {
-              const productLabel = [matchedFeed.brand, matchedFeed.product_name].filter(Boolean).join(" ");
-              const dosageNote = matchedFeed.form === "liquid" && matchedFeed.dilution_ml_per_litre
-                ? ` at ${matchedFeed.dilution_ml_per_litre}ml per litre of water`
-                : matchedFeed.form === "granular" ? " — follow pack instructions" : "";
-              feedAction = `Feed ${crop.name} now growth is starting — apply ${productLabel}${dosageNote} around the base and water in well`;
-            } else {
-              feedAction = `Feed ${crop.name} now growth is starting — apply ${feedSchedule} around the base and water in well. Add a suitable feed to your feeds section for personalised reminders`;
-            }
-            const task = {
-              user_id:          crop.user_id,
-              crop_instance_id: crop.id,
-              area_id:          crop.area_id,
-              action:           feedAction,
-              task_type:        "feed",
-              urgency:          "low",
-              due_date:         todayISO(),
-              timing_status:    "peak",
-              source:           "rule_engine",
-              rule_id:          "perennial_spring_feed",
-              date_confidence:  "approximate",
-              meta:             JSON.stringify({ matched_feed: matchedFeed?.id || null }),
-            };
-            newTasks.push({ ...task, crop_name: crop.name, rule_id: "perennial_spring_feed" });
-            if (!this.dryRun && this.supabase) {
-              await this._persistTaskWithKey(task, crop, "perennial_spring_feed");
-            }
-          }
-        }
-
-        // Summer feed reminder — June/July during fruiting
-        if (m >= 6 && m <= 7 && feedSchedule) {
-          const logKey  = `${crop.id}:perennial_summer_feed`;
-          const lastRun = recentLog.get(logKey);
-          if (!lastRun || (Date.now() - lastRun.getTime()) >= 21 * 86400000) {
-            const matchedFeed = this._matchFeed(feedSchedule, userFeeds);
-            let feedAction;
-            if (matchedFeed) {
-              const productLabel = [matchedFeed.brand, matchedFeed.product_name].filter(Boolean).join(" ");
-              const dosageNote = matchedFeed.form === "liquid" && matchedFeed.dilution_ml_per_litre
-                ? ` at ${matchedFeed.dilution_ml_per_litre}ml per litre of water`
-                : matchedFeed.form === "granular" ? " — follow pack instructions" : "";
-              feedAction = `Feed ${crop.name} to support fruiting — apply ${productLabel}${dosageNote} and keep well watered`;
-            } else {
-              feedAction = `Feed ${crop.name} to support fruiting — apply ${feedSchedule} and keep well watered. Add a suitable feed to your feeds section for personalised reminders`;
-            }
-            const task = {
-              user_id:          crop.user_id,
-              crop_instance_id: crop.id,
-              area_id:          crop.area_id,
-              action:           feedAction,
-              task_type:        "feed",
-              urgency:          "low",
-              due_date:         todayISO(),
-              timing_status:    "peak",
-              source:           "rule_engine",
-              rule_id:          "perennial_summer_feed",
-              date_confidence:  "approximate",
-              meta:             JSON.stringify({ matched_feed: matchedFeed?.id || null }),
-            };
-            newTasks.push({ ...task, crop_name: crop.name, rule_id: "perennial_summer_feed" });
-            if (!this.dryRun && this.supabase) {
-              await this._persistTaskWithKey(task, crop, "perennial_summer_feed");
-            }
-          }
-        }
-
-        continue; // perennials skip the rest of the rule engine
-      }
-
-      // ── PLANNED CROPS: generate sow prompt when in sow window ────────────────
-      if (cropStatus === "planned") {
-        // Prefer variety-level sow window if set (e.g. late maincrop vs early variety)
-        const sowStart       = crop.variety?.sow_window_start       ?? crop.crop_def?.sow_window_start;
-        const sowEnd         = crop.variety?.sow_window_end         ?? crop.crop_def?.sow_window_end;
-        const frostSensitive = effective.frost_sensitive;
-
-        // ── Potato variety-aware plant-out offset ────────────────────────────
-        // first_early: plant out Mar–Apr, second_early: Apr–May, maincrop: Apr–May (later)
-        const potatoType = crop.variety?.potato_type || null;
-        let effectiveSowStart = sowStart;
-        let effectiveSowEnd   = sowEnd;
-        if (sowMethod === "tuber" && potatoType) {
-          if (potatoType === "first_early")   { effectiveSowStart = 3; effectiveSowEnd = 4; }
-          if (potatoType === "second_early")  { effectiveSowStart = 3; effectiveSowEnd = 5; }
-          if (potatoType === "maincrop")      { effectiveSowStart = 4; effectiveSowEnd = 5; }
-        }
-
-        // ── User sow preference override ────────────────────────────────────
-        // sow_preference = 'outdoors' means user has opted out of indoors recommendation
-        const userPreference = crop.sow_preference || null;
-
-        // Determine effective sow method — user preference overrides recommendation
-        let effectiveSowMethod = sowMethod;
-        if (userPreference === "outdoors" && (sowMethod === "indoors" || sowMethod === "either")) {
-          effectiveSowMethod = "outdoors";
-          // Outdoor sow window starts later — use direct sow window if available
-          const outdoorStart = crop.crop_def?.sow_direct_start ?? sowStart;
-          const outdoorEnd   = crop.crop_def?.sow_direct_end   ?? sowEnd;
-          effectiveSowStart  = outdoorStart;
-          effectiveSowEnd    = outdoorEnd;
-        }
-
-        if (effectiveSowStart && effectiveSowEnd && m >= effectiveSowStart && m <= effectiveSowEnd) {
-
-          // ── Frost-aware suppression for outdoor sowing ──────────────────────
-          const min7        = weather?.frost_risk_7day ?? null;
-          const isOutdoor   = effectiveSowMethod === "outdoors" || effectiveSowMethod === "direct_sow" || effectiveSowMethod === "either";
-          const frostHigh   = frostSensitive && isOutdoor && min7 !== null && min7 <= 0;
-          const frostMedium = frostSensitive && isOutdoor && min7 !== null && min7 > 0 && min7 <= 3;
-
-          // Hard block: frost forecast and crop is frost-sensitive outdoor sow
-          if (frostHigh) continue;
-
-          const logKey  = `${crop.id}:sow_prompt`;
-          const lastRun = recentLog.get(logKey);
-          const cooldown = frostMedium ? 3 * 86400000 : 7 * 86400000;
-
-          if (!lastRun || (Date.now() - lastRun.getTime()) >= cooldown) {
-            let action, urgency, why, sowMeta;
-
-            // ── Month name helpers ───────────────────────────────────────────
-            const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-            const windowStr = effectiveSowStart && effectiveSowEnd
-              ? `${MONTHS[effectiveSowStart-1]}–${MONTHS[effectiveSowEnd-1]}`
-              : null;
-
-            if (effectiveSowMethod === "indoors") {
-              // Recommend indoors with clear reasoning
-              why    = "Starting indoors now gives stronger plants, an earlier harvest, and better protection from slugs and late frosts.";
-              action = `Sow ${crop.name} indoors now — ${why}${windowStr ? ` Sowing window: ${windowStr}.` : ""}`;
-              urgency = "medium";
-              sowMeta = { status_transition: "sown_indoors", sow_method: "indoors", can_prefer_outdoors: true };
-
-            } else if (effectiveSowMethod === "outdoors" || effectiveSowMethod === "direct_sow") {
-              if (userPreference === "outdoors") {
-                // User chose outdoors — respect it, note timing
-                if (frostMedium) {
-                  action  = `Almost time to direct sow ${crop.name} outdoors — frost risk still present, wait for a settled spell.${windowStr ? ` Sowing window: ${windowStr}.` : ""}`;
-                  urgency = "low";
-                } else {
-                  action  = `Time to direct sow ${crop.name} outdoors.${windowStr ? ` Sowing window: ${windowStr}.` : ""}`;
-                  urgency = "medium";
-                }
-              } else {
-                if (frostMedium) {
-                  action  = `Almost time to direct sow ${crop.name} outdoors — frost risk still marginal, wait for a settled spell.`;
-                  urgency = "low";
-                } else {
-                  action  = `Time to direct sow ${crop.name} outdoors.${windowStr ? ` Sowing window: ${windowStr}.` : ""}`;
-                  urgency = "medium";
-                }
-              }
-              sowMeta = { status_transition: "sown", sow_method: "outdoors" };
-
-            } else if (effectiveSowMethod === "tuber") {
-              // Potato plant-out
-              const typeLabel = potatoType === "first_early" ? "first early"
-                              : potatoType === "second_early" ? "second early"
-                              : potatoType === "maincrop" ? "maincrop"
-                              : null;
-              const typeNote  = typeLabel ? ` (${typeLabel})` : "";
-              action  = `Plant out ${crop.name}${typeNote} tubers now — chitting should be complete. Earth up as shoots emerge.${windowStr ? ` Plant-out window: ${windowStr}.` : ""}`;
-              urgency = "medium";
-              sowMeta = { status_transition: "planted_out", sow_method: "tuber" };
-
-            } else {
-              // "either" — recommend indoors by default unless user has opted out
-              why    = "Starting indoors gives stronger plants and an earlier harvest.";
-              action = `Sow ${crop.name} indoors now for best results — ${why}${windowStr ? ` Sowing window: ${windowStr}.` : ""}`;
-              urgency = "medium";
-              sowMeta = { status_transition: "sown_indoors", sow_method: "indoors", can_prefer_outdoors: true };
-            }
-
-            // ── Succession sowing note ───────────────────────────────────────
-            // Encourage adding a second instance for crops with a long sow window
-            const windowLength = (effectiveSowEnd - effectiveSowStart);
-            const successionNote = windowLength >= 2
-              ? ` Sowing window runs ${windowStr} — add another ${crop.name} to your garden in a few weeks for a succession harvest.`
-              : "";
-            if (successionNote && !action.includes("Sowing window")) {
-              action = action.trimEnd() + successionNote;
-            }
-
-            const task = {
-              user_id:          crop.user_id,
-              crop_instance_id: crop.id,
-              area_id:          crop.area_id,
-              action,
-              task_type:        "sow",
-              urgency,
-              due_date:         todayISO(),
-              due_window_start: effectiveSowStart ? `${new Date().getFullYear()}-${String(effectiveSowStart).padStart(2,"0")}-01` : null,
-              due_window_end:   effectiveSowEnd   ? `${new Date().getFullYear()}-${String(effectiveSowEnd).padStart(2,"0")}-28`   : null,
-              source:           "rule_engine",
-              rule_id:          "sow_prompt",
-              date_confidence:  "exact",
-              timing_status:    timingStatus(effectiveSowStart, effectiveSowEnd, weather),
-              meta:             JSON.stringify({ ...(sowMeta || { status_transition: "sown", sow_method: effectiveSowMethod }), why: why || null }),
-            };
-            newTasks.push({ ...task, crop_name: crop.name, rule_id: "sow_prompt" });
-            if (!this.dryRun && this.supabase) {
-              await this._persistTaskWithKey(task, crop, "sow_prompt");
-            }
-          }
-        }
-        continue;
-      }
-
-      // ── SOWN INDOORS: generate transplant task when frost risk low + window right
-      if (cropStatus === "sown_indoors") {
-        const txStart = crop.crop_def?.transplant_window_start;
-        const txEnd   = crop.crop_def?.transplant_window_end;
-        const isTuber = crop.crop_def?.sow_method === "tuber"; // potatoes, etc.
-
-        // ── Chitting tip for tubers (Jan–Feb, while still indoors) ──
-        if (isTuber && m >= 1 && m <= 2) {
-          const chitKey  = `${crop.id}:chitting_tip`;
-          const lastChit = recentLog.get(chitKey);
-          if (!lastChit || (Date.now() - lastChit.getTime()) >= 14 * 86400000) {
-            const task = {
-              user_id:          crop.user_id,
-              crop_instance_id: crop.id,
-              area_id:          crop.area_id,
-              action:           `${crop.name} chitting tip — stand seed potatoes rose-end up in egg boxes in a cool, light frost-free spot. Short stubby chits (2cm) are ideal before planting out`,
-              task_type:        "info",
-              urgency:          "low",
-              due_date:         todayISO(),
-              source:           "rule_engine",
-              rule_id:          "chitting_tip",
-              date_confidence:  "approximate",
-              meta:             JSON.stringify({ tip: true }),
-            };
-            newTasks.push({ ...task, crop_name: crop.name, rule_id: "chitting_tip" });
-            if (!this.dryRun && this.supabase) {
-              await this._persistTaskWithKey(task, crop, "chitting_tip");
-            }
-          }
-        }
-
-        // ── Plant out task (transplant window, frost-aware) ──
-        if (txStart && txEnd && m >= txStart && m <= txEnd) {
-          const frostRisk  = weather?.frost_risk === true;
-          const logKey     = `${crop.id}:transplant_prompt`;
-          const lastRun    = recentLog.get(logKey);
-          const cooldown   = frostRisk ? 3 * 86400000 : 7 * 86400000;
-          if (!lastRun || (Date.now() - lastRun.getTime()) >= cooldown) {
-            let action;
-            if (isTuber) {
-              action = frostRisk
-                ? `${crop.name} are ready to plant out but frost is forecast — hold off a few more days to protect emerging shoots`
-                : `Time to plant out your ${crop.name} — chits look good, frosts should now be clear. Plant 10–15cm deep, 30cm apart`;
-            } else {
-              action = frostRisk
-                ? `${crop.name} is ready to transplant but frost is forecast — hold off a few more days`
-                : `Time to transplant ${crop.name} outdoors — frosts should now be clear`;
-            }
-            const task = {
-              user_id:          crop.user_id,
-              crop_instance_id: crop.id,
-              area_id:          crop.area_id,
-              action,
-              task_type:        "transplant",
-              urgency:          frostRisk ? "low" : "medium",
-              due_date:         todayISO(),
-              due_window_start: txStart ? `${new Date().getFullYear()}-${String(txStart).padStart(2,"0")}-01` : null,
-              due_window_end:   txEnd   ? `${new Date().getFullYear()}-${String(txEnd).padStart(2,"0")}-28`   : null,
-              timing_status:    timingStatus(txStart, txEnd, weather),
-              source:           "rule_engine",
-              rule_id:          "transplant_prompt",
-              date_confidence:  "exact",
-              meta:             JSON.stringify({ status_transition: "transplanted" }),
-            };
-            newTasks.push({ ...task, crop_name: crop.name, rule_id: "transplant_prompt" });
-            if (!this.dryRun && this.supabase) {
-              await this._persistTaskWithKey(task, crop, "transplant_prompt");
-            }
-          }
-        }
-        continue; // sown_indoors crops only get transplant prompts for now
-      }
-
-      // ── GROWING CROPS: run normal rules ──────────────────────────────────────
-      // Only infer stage from sow date for seed-grown crops.
-      // Perennial/vegetative establishments (runner, tuber, crown, cane) keep
-      // whatever stage is stored in the database — inferring from sow_date
-      // would incorrectly reset them to 'seed'.
-      const vegEstablishments = ["runner", "tuber", "crown", "cane"];
-      const useStoredStage = vegEstablishments.includes(crop.crop_def?.default_establishment);
-      if (!useStoredStage) {
-        crop.stage = inferStage(crop, effective);
-      }
-
-      for (const rule of rules) {
-        // 1. Crop match — NULL means applies to all crops
-        if (rule.crop_def_id && rule.crop_def_id !== crop.crop_def_id) continue;
-
-        // 2. Area type match — NULL means applies to all area types
-        if (rule.area_type && rule.area_type !== areaType) continue;
-
-        // 3. Stage match — NULL means applies to all stages
-        if (rule.stage && rule.stage !== crop.stage) continue;
-
-        // 4. Skip finished crops
-        if (crop.stage === "finished") continue;
-
-        // 5. Cooldown — use per-rule cooldown_days
-        const logKey    = `${crop.id}:${rule.rule_id}`;
-        const lastRun   = recentLog.get(logKey);
-        const cooldown  = (rule.cooldown_days || 3) * 86400000;
-        if (lastRun && (Date.now() - lastRun.getTime()) < cooldown) continue;
-
-        // 6. Evaluate condition
-        const evaluator = CONDITIONS[rule.condition_type];
-        if (!evaluator) {
-          console.warn(`[RuleEngine] Unknown condition: ${rule.condition_type}`);
-          continue;
-        }
-
-        if (!evaluator(crop, rule.condition_value, context, effective)) continue;
-
-        // 7. Build and persist task
-        const confidence = (crop.start_date_confidence === "unknown" ||
-                            crop.stage_confidence       === "inferred")
-                           ? "estimated" : "exact";
-
-        // For feed tasks — personalise action with user's matched feed
-        let action = rule.action;
-        if (rule.task_type === "feed") {
-          const cropFeedType = crop.crop_def?.feed_type;
-          const matchedFeed  = this._matchFeed(cropFeedType, userFeeds);
-          if (matchedFeed) {
-            const productLabel = [matchedFeed.brand, matchedFeed.product_name].filter(Boolean).join(" ");
-            let dosageNote = "";
-            if (matchedFeed.form === "liquid" && matchedFeed.dilution_ml_per_litre) {
-              dosageNote = ` — ${matchedFeed.dilution_ml_per_litre}ml per litre of water`;
-            } else if (matchedFeed.form === "granular" || matchedFeed.form === "powder") {
-              dosageNote = matchedFeed.notes ? ` — follow pack instructions` : "";
-            }
-            action = `Time to feed your ${crop.name} with ${productLabel}${dosageNote}`;
-          }
-        }
-
-        const task = {
-          user_id:          crop.user_id,
-          crop_instance_id: crop.id,
-          area_id:          crop.area_id,
-          action,
-          task_type:        rule.task_type,
-          urgency:          rule.urgency,
-          due_date:         todayISO(),
-          timing_status:    "peak", // general rules fire when conditions are met = peak
-          source:           "rule_engine",
-          rule_id:          rule.rule_id,
-          date_confidence:  confidence,
-        };
-
-        newTasks.push({ ...task, crop_name: crop.name, rule_id: rule.rule_id });
-
-        if (!this.dryRun && this.supabase) {
-          await this._persistTask(task, crop, rule);
-        }
+      // Risk engine — short-horizon alerts (only for growing/sown crops)
+      const skipRisk = crop.status === "planned" || ctx.stage === "finished";
+      if (!skipRisk) {
+        const alerts = this.risk.evaluate(ctx, pestRules);
+        allCandidates.push(...alerts);
       }
     }
 
-    return newTasks;
+    // Upsert all candidates
+    if (!this.dryRun && this.supabase) {
+      await this._materialize(allCandidates);
+    }
+
+    return allCandidates;
   }
 
-  // ── Persist task + log entry ────────────────────────────────────────────────
+  // ── Materializer — idempotent upsert ────────────────────────────────────────
 
-  async _persistTask(task, crop, rule) {
+  async _materialize(candidates) {
+    for (const c of candidates) {
+      try {
+        // Strip internal fields
+        const { _description, _status, ...task } = c;
+
+        // Upsert by source_key — update if exists, insert if not
+        const { error } = await this.supabase
+          .from("tasks")
+          .upsert(task, {
+            onConflict:        "source_key",
+            ignoreDuplicates:  false,
+          });
+
+        if (error) {
+          // Fall back to plain insert if upsert fails (e.g. no source_key)
+          if (error.code === "23505") {
+            // Duplicate — skip
+          } else {
+            console.error("[RuleEngine] Persist error:", error.message);
+          }
+        }
+      } catch (err) {
+        console.error("[RuleEngine] Persist error:", err.message);
+      }
+    }
+  }
+
+  // ── Expiry ────────────────────────────────────────────────────────────────
+
+  async _expireStaleItems(userId) {
     try {
-      const { data: inserted, error } = await this.supabase
+      await this.supabase
         .from("tasks")
-        .insert(task)
-        .select("id")
-        .single();
-      if (error) throw error;
-      await this.supabase.from("rule_log").insert({
-        crop_instance_id: crop.id,
-        rule_id:          rule.rule_id,
-        task_id:          inserted.id,
-      });
+        .update({ status: "expired" })
+        .eq("user_id", userId)
+        .in("status", ["upcoming","due"])
+        .is("completed_at", null)
+        .lt("expires_at", new Date().toISOString());
     } catch (err) {
-      console.error("[RuleEngine] Persist error:", err.message);
+      console.error("[RuleEngine] Expiry error:", err.message);
     }
   }
 
-  async _persistTaskWithKey(task, crop, ruleKey) {
-    try {
-      // Dedup check — don't insert if any task with same rule_id exists for this crop
-      const { data: existingTasks } = await this.supabase
-        .from("tasks")
-        .select("id")
-        .eq("crop_instance_id", crop.id)
-        .eq("rule_id", ruleKey)
-        .limit(1);
-      const existing = existingTasks?.[0] || null;
-      if (existing) {
-        console.log(`[RuleEngine] Skipping duplicate task ${ruleKey} for ${crop.name}`);
-        return;
-      }
-
-      const { data: inserted, error } = await this.supabase
-        .from("tasks")
-        .insert(task)
-        .select("id")
-        .single();
-      if (error) throw error;
-      await this.supabase.from("rule_log").insert({
-        crop_instance_id: crop.id,
-        rule_id:          ruleKey,
-        task_id:          inserted.id,
-      });
-    } catch (err) {
-      console.error("[RuleEngine] Persist error:", err.message);
-    }
-  }
-
-  // ── Feed matching ────────────────────────────────────────────────────────────
-  // Match a crop's feed_type to the best user feed available.
-  // Returns the best matching feed or null if none found.
-
-  _matchFeed(cropFeedType, userFeeds) {
-    if (!cropFeedType || !userFeeds?.length) return null;
-
-    // Normalise crop feed type to a keyword list for fuzzy matching
-    const cropKeywords = cropFeedType.toLowerCase();
-
-    // Score each feed — higher = better match
-    const scored = userFeeds.map(feed => {
-      let score = 0;
-      const feedType = (feed.feed_type || "").toLowerCase();
-      const suitableTypes = feed.suitable_crop_types || [];
-
-      // Exact feed_type match is best
-      if (feedType.includes("high_potash") && cropKeywords.includes("potash")) score += 10;
-      if (feedType.includes("high_nitrogen") && cropKeywords.includes("nitrogen")) score += 10;
-      if (feedType.includes("balanced") && cropKeywords.includes("balanced")) score += 10;
-      if (feedType.includes("specialist_tomato") && cropKeywords.includes("potash")) score += 15;
-      if (feedType.includes("seaweed")) score += 2; // seaweed is generally beneficial
-      if (feedType.includes("organic_general")) score += 3;
-
-      // Partial keyword overlaps
-      if (cropKeywords.includes("potash") && feedType.includes("potash")) score += 5;
-      if (cropKeywords.includes("general") && feedType.includes("balanced")) score += 5;
-
-      return { feed, score };
-    }).filter(s => s.score > 0);
-
-    if (!scored.length) return null;
-    scored.sort((a, b) => b.score - a.score);
-    return scored[0].feed;
-  }
-
-  // ── Cleanup ─────────────────────────────────────────────────────────────────
+  // ── Cleanup orphaned tasks ────────────────────────────────────────────────
 
   async _cleanupOrphanedTasks(userId) {
     try {
-      // Get all active crop instance IDs for this user
-      const { data: activeCrops, error: cropError } = await this.supabase
-        .from("crop_instances")
-        .select("id")
-        .eq("user_id", userId)
-        .eq("active", true);
-
-      // Safety — if the crop query failed or returned nothing, don't delete anything
-      if (cropError || !activeCrops) {
-        console.log("[RuleEngine] Skipping cleanup — could not load crops");
-        return;
-      }
-
+      const { data: activeCrops, error } = await this.supabase
+        .from("crop_instances").select("id")
+        .eq("user_id", userId).eq("active", true);
+      if (error || !activeCrops) return;
       const activeIds = activeCrops.map(c => c.id);
-
-      // If user has no crops at all, skip cleanup entirely
-      if (activeIds.length === 0) {
-        console.log("[RuleEngine] Skipping cleanup — no active crops found");
-        return;
-      }
-
-      // Find incomplete tasks whose crop_instance_id is not in the active list
-      // Never delete completed tasks — they're needed for metrics history
-      const { data: orphanTasks } = await this.supabase
-        .from("tasks")
-        .select("id, crop_instance_id")
-        .eq("user_id", userId)
-        .is("completed_at", null)
-        .not("crop_instance_id", "in", `(${activeIds.join(",")})`)
-
-      if (orphanTasks?.length) {
-        const orphanIds = orphanTasks.map(t => t.id);
-        await this.supabase.from("rule_log").delete().in("task_id", orphanIds);
-        await this.supabase.from("tasks").delete().in("id", orphanIds);
-        console.log(`[RuleEngine] Cleaned up ${orphanIds.length} orphaned tasks`);
+      if (!activeIds.length) return;
+      const { data: orphans } = await this.supabase
+        .from("tasks").select("id")
+        .eq("user_id", userId).is("completed_at", null)
+        .not("crop_instance_id", "in", `(${activeIds.join(",")})`);
+      if (orphans?.length) {
+        const ids = orphans.map(t => t.id);
+        await this.supabase.from("rule_log").delete().in("task_id", ids);
+        await this.supabase.from("tasks").delete().in("id", ids);
       }
     } catch (err) {
       console.error("[RuleEngine] Cleanup error:", err.message);
     }
   }
 
-  // ── Data loaders ────────────────────────────────────────────────────────────
+  // ── Data loaders ──────────────────────────────────────────────────────────
 
   async _loadCrops(userId) {
     if (!this.supabase) return [];
@@ -726,12 +954,13 @@ class RuleEngine {
         *,
         area:area_id ( type, location_id ),
         crop_def:crop_def_id (
-          is_perennial, frost_sensitive, sow_method,
+          id, is_perennial, frost_sensitive, sow_method, category,
           days_to_maturity_min, days_to_maturity_max,
           feed_interval_days, pest_window_start, pest_window_end,
           sow_window_start, sow_window_end,
           transplant_window_start, transplant_window_end,
-          harvest_month_start, harvest_month_end, feed_type
+          harvest_month_start, harvest_month_end, feed_type,
+          default_establishment
         ),
         variety:variety_id (
           days_to_maturity_min, days_to_maturity_max,
@@ -751,21 +980,24 @@ class RuleEngine {
   async _loadRules() {
     if (!this.supabase) return [];
     const { data, error } = await this.supabase
-      .from("crop_rules")
-      .select("*")
+      .from("crop_rules").select("*")
       .eq("active", true)
       .order("priority_score", { ascending: false });
     if (error) throw error;
     return data || [];
   }
 
+  async _loadPestRules() {
+    if (!this.supabase) return [];
+    const { data } = await this.supabase
+      .from("pest_risk_rules").select("*").eq("is_active", true);
+    return data || [];
+  }
+
   async _loadWeatherByLocation(userId) {
     if (!this.supabase) return {};
     const { data: locations } = await this.supabase
-      .from("locations")
-      .select("id, postcode")
-      .eq("user_id", userId);
-
+      .from("locations").select("id, postcode").eq("user_id", userId);
     const result = {};
     for (const loc of locations || []) {
       if (!loc.postcode) continue;
@@ -782,9 +1014,7 @@ class RuleEngine {
 
   async _loadEnvModifiers() {
     if (!this.supabase) return {};
-    const { data } = await this.supabase
-      .from("environment_modifiers")
-      .select("*");
+    const { data } = await this.supabase.from("environment_modifiers").select("*");
     return (data || []).reduce((acc, m) => {
       acc[m.area_type] = acc[m.area_type] || {};
       acc[m.area_type][m.modifier_type] = m.value;
@@ -797,37 +1027,9 @@ class RuleEngine {
     const { data } = await this.supabase
       .from("user_feeds")
       .select("id, brand, product_name, form, feed_type, npk, dilution_ml_per_litre, frequency_days, suitable_crop_types, application_method, notes, enriched")
-      .eq("user_id", userId)
-      .eq("active", true)
-      .eq("enriched", true);
+      .eq("user_id", userId).eq("active", true).eq("enriched", true);
     return data || [];
-  }
-
-  async _loadRuleLog(userId) {
-    if (!this.supabase) return new Map();
-    const cropIds = await this._getUserCropIds(userId);
-    if (!cropIds.length) return new Map();
-    const { data } = await this.supabase
-      .from("rule_log")
-      .select("crop_instance_id, rule_id, triggered_at")
-      .in("crop_instance_id", cropIds);
-    const log = new Map();
-    for (const row of data || []) {
-      const key = `${row.crop_instance_id}:${row.rule_id}`;
-      const ts  = new Date(row.triggered_at);
-      if (!log.has(key) || ts > log.get(key)) log.set(key, ts);
-    }
-    return log;
-  }
-
-  async _getUserCropIds(userId) {
-    const { data } = await this.supabase
-      .from("crop_instances")
-      .select("id")
-      .eq("user_id", userId)
-      .eq("active", true);
-    return (data || []).map(c => c.id);
   }
 }
 
-module.exports = { RuleEngine, resolveEffectiveValues, inferStage, daysSince };
+module.exports = { RuleEngine, buildCropContext, resolveEffectiveValues: buildCropContext, inferStage: () => {}, daysSince };
