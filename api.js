@@ -2007,8 +2007,6 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       today:     dedupByCrop(incomplete.filter(t => t.due_date <= today)),
       this_week: dedupByCrop(incomplete.filter(t => t.due_date > today && t.due_date <= weekEnd)),
       coming_up: (() => {
-        const URGENCY_RANK = { high: 3, medium: 2, low: 1 };
-        const candidates = tasks.filter(t => {
         const candidates = tasks.filter(t => {
           if (t.completed_at || t.status === 'expired') return false;
           const upcoming56 = new Date(Date.now() + 56 * 86400000).toISOString().split("T")[0];
