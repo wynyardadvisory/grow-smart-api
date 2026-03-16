@@ -277,17 +277,20 @@ async function enrichCrop(cropInstanceId, submittedName, submittedVariety) {
     console.error("[Enrich] Failed to create pending record:", pendingErr.message);
     return;
   }
+  const companionKeywords = ["lavender","marigold","nasturtium","phacelia","borage","calendula","chamomile","alyssum","cosmos","sunflower","cornflower"];
+  const isCompanionPlant = companionKeywords.some(c => submittedName.toLowerCase().includes(c));
 
   try {
     const prompt = `You are a horticultural expert for UK home growers and allotment holders.
-A user has added a crop to their garden with the following details:
-- Crop name: "${submittedName}"
+A user has added a ${isCompanionPlant ? "companion/beneficial plant" : "crop"} to their garden with the following details:
+- ${isCompanionPlant ? "Plant" : "Crop"} name: "${submittedName}"
 - Variety: "${submittedVariety || "not specified"}"
 
 Your task:
-1. Determine if this is a real, growable crop in the UK (vegetables, fruit, herbs). If it is nonsense, misspelled beyond recognition, or not a real crop, reject it.
-2. If real, correct any spelling errors in both the crop name and variety name.
+1. Determine if this is a real, growable plant in the UK. ${isCompanionPlant ? "Companion plants, flowers, and beneficial plants are all valid." : "Only vegetables, fruit, and herbs are valid."} Reject nonsense or unrecognisable names.
+2. If real, correct any spelling errors.
 3. Return comprehensive UK growing data.
+
 
 Respond ONLY with a JSON object — no markdown, no explanation. Use this exact structure:
 {
@@ -570,6 +573,7 @@ app.post("/crops", requireAuth,
       establishment_method, quantity, notes,
       start_date_confidence, source, status,
       is_other_crop, is_other_variety,
+      is_companion,
       barcode,
     } = req.body;
 
@@ -598,7 +602,7 @@ app.post("/crops", requireAuth,
       notes:                notes || null,
       photo_url:            null,
       start_date_confidence:start_date_confidence || "exact",
-      source:               source || "manual",
+      source:               is_companion ? "companion" : (source || "manual"),
     }).select().single();
 
     if (error) return res.status(500).json({ error: error.message });
