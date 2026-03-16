@@ -1974,14 +1974,16 @@ app.get("/dashboard", requireAuth, async (req, res) => {
           const upcoming56 = new Date(Date.now() + 56 * 86400000).toISOString().split("T")[0];
           return vf <= today && t.due_date > weekEnd && t.due_date <= upcoming56;
         });
-        // One per crop — keep earliest due date, break ties by highest urgency
+        // One per crop NAME + task_type combination — keep earliest due date
+        // This deduplicates across multiple instances of the same crop (e.g. 2x Brussels Sprouts)
         const seen = new Map();
         for (const t of candidates) {
-          const key = t.crop_instance_id || t.rule_id || t.id;
+          const cropName = t.crop?.name || "general";
+          const key = `${cropName}:${t.task_type}`;
           const existing = seen.get(key);
           if (!existing) { seen.set(key, t); continue; }
-          const betterDate = t.due_date < existing.due_date;
-          const sameDate   = t.due_date === existing.due_date;
+          const betterDate    = t.due_date < existing.due_date;
+          const sameDate      = t.due_date === existing.due_date;
           const betterUrgency = (URGENCY_RANK[t.urgency] || 0) > (URGENCY_RANK[existing.urgency] || 0);
           if (betterDate || (sameDate && betterUrgency)) seen.set(key, t);
         }
