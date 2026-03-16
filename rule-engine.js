@@ -271,6 +271,7 @@ function candidate(ctx, opts) {
     engineType = "scheduled", recordType = "task",
     expiryDays = 14, leadTimeDays = null,
     meta = {}, riskPayload = null,
+    dedupeByName = false, // if true, all instances of same crop share one task
   } = opts;
 
   const lead    = leadTimeDays ?? LEAD_TIME_DAYS[taskType] ?? LEAD_TIME_DAYS.default;
@@ -281,9 +282,14 @@ function candidate(ctx, opts) {
   const today   = todayISO();
   const status  = scheduledFor && scheduledFor > today ? "upcoming" : "due";
 
+  // For perennial care tasks, dedupe by crop name so multiple instances share one task
+  const cropKey = dedupeByName
+    ? ctx.cropName.toLowerCase().replace(/\s+/g, "_")
+    : ctx.cropId;
+
   const key = sourceKey({
     u: ctx.userId,
-    c: ctx.cropId,
+    c: cropKey,
     r: ruleId,
     d: scheduledFor || today,
   });
@@ -363,6 +369,7 @@ class ScheduledRuleEngine {
       // Next harvest check = today (it's within window)
       results.push(candidate(ctx, {
         ruleId:       "perennial_harvest",
+        dedupeByName: true,
         taskType:     "harvest",
         title:        `${ctx.cropName} should be ready to harvest — check for ripeness and pick regularly to encourage more fruit`,
         description:  `You're in the harvest window for ${ctx.cropName}. Regular picking encourages further fruiting.`,
@@ -377,6 +384,7 @@ class ScheduledRuleEngine {
       if (withinLookahead(harvestDate, LOOKAHEAD_DAYS.harvest)) {
         results.push(candidate(ctx, {
           ruleId:       "perennial_harvest_upcoming",
+        dedupeByName: true,
           taskType:     "harvest",
           title:        `${ctx.cropName} harvest season starts ${MONTHS[hs-1]} — prepare to pick regularly`,
           description:  `Your ${ctx.cropName} harvest window opens in ${MONTHS[hs-1]}. Prepare to pick regularly once ripe.`,
@@ -395,6 +403,7 @@ class ScheduledRuleEngine {
         const due = m >= 3 && m <= 4 ? today : springFeedDate;
         results.push(candidate(ctx, {
           ruleId:       "perennial_spring_feed",
+        dedupeByName: true,
           taskType:     "feed",
           title:        formatFeedAction(ctx.cropName, ctx.matchedFeed, ctx.feedType, "Feed"),
           description:  `Spring feeding supports new growth on ${ctx.cropName}.`,
@@ -411,6 +420,7 @@ class ScheduledRuleEngine {
         const due = m >= 6 && m <= 7 ? today : summerFeedDate;
         results.push(candidate(ctx, {
           ruleId:       "perennial_summer_feed",
+        dedupeByName: true,
           taskType:     "feed",
           title:        formatFeedAction(ctx.cropName, ctx.matchedFeed, ctx.feedType, "Feed"),
           description:  `Summer feeding supports fruiting on ${ctx.cropName}.`,
@@ -482,6 +492,7 @@ class ScheduledRuleEngine {
     if (fw && m >= fw.start && m <= fw.end) {
       results.push(candidate(ctx, {
         ruleId:       "perennial_flowering_check",
+        dedupeByName: true,
         taskType:     "check",
         title:        `Are your ${ctx.cropName} flowering yet? Check for open blossoms and ensure pollinators can access them`,
         scheduledFor: today,
@@ -496,6 +507,7 @@ class ScheduledRuleEngine {
     if (fsw && m >= fsw.start && m <= fsw.end) {
       results.push(candidate(ctx, {
         ruleId:       "perennial_fruit_set_check",
+        dedupeByName: true,
         taskType:     "check",
         title:        `Check your ${ctx.cropName} — has fruit started to set after flowering? Look for small fruit forming`,
         scheduledFor: today,
@@ -512,6 +524,7 @@ class ScheduledRuleEngine {
       if (withinLookahead(flowerDate, LOOKAHEAD_DAYS.seasonal)) {
         results.push(candidate(ctx, {
           ruleId:       "perennial_flowering_upcoming",
+        dedupeByName: true,
           taskType:     "check",
           title:        `${ctx.cropName} should start flowering in ${MONTHS[fw.start-1]} — watch for blossom and protect from late frosts`,
           scheduledFor: flowerDate,
@@ -536,6 +549,7 @@ class ScheduledRuleEngine {
     if (name.includes("strawberry") && m >= 7 && m <= 8) {
       results.push(candidate(ctx, {
         ruleId:       "strawberry_runners",
+        dedupeByName: true,
         taskType:     "prune",
         title:        `Check ${ctx.cropName} for runners — pin down the strongest ones to propagate, remove the rest to keep the plant's energy in fruiting`,
         scheduledFor: today,
@@ -549,6 +563,7 @@ class ScheduledRuleEngine {
     if (name.includes("strawberry") && m === 8) {
       results.push(candidate(ctx, {
         ruleId:       "strawberry_renovate",
+        dedupeByName: true,
         taskType:     "prune",
         title:        `Renovate ${ctx.cropName} after harvesting — cut back old foliage to 10cm, clear debris and feed to encourage new growth`,
         scheduledFor: today,
@@ -562,6 +577,7 @@ class ScheduledRuleEngine {
     if (name.includes("raspberry") && m >= 8 && m <= 9) {
       results.push(candidate(ctx, {
         ruleId:       "raspberry_cane_prune",
+        dedupeByName: true,
         taskType:     "prune",
         title:        `Prune ${ctx.cropName} — cut out all canes that fruited this year to ground level, tie in the new green canes for next year`,
         scheduledFor: today,
@@ -575,6 +591,7 @@ class ScheduledRuleEngine {
     if ((name.includes("apple") || name.includes("pear")) && m >= 7 && m <= 8) {
       results.push(candidate(ctx, {
         ruleId:       "apple_pear_summer_prune",
+        dedupeByName: true,
         taskType:     "prune",
         title:        `Summer prune ${ctx.cropName} — cut back sideshoots to 3 leaves above the basal cluster to encourage fruiting spurs`,
         scheduledFor: today,
@@ -589,6 +606,7 @@ class ScheduledRuleEngine {
       const pruneDate = m === 12 ? monthToDate(12, year, 15) : today;
       results.push(candidate(ctx, {
         ruleId:       "apple_pear_winter_prune",
+        dedupeByName: true,
         taskType:     "prune",
         title:        `Winter prune ${ctx.cropName} while dormant — remove crossing, dead, or diseased branches, open up the centre for airflow`,
         scheduledFor: pruneDate,
@@ -602,6 +620,7 @@ class ScheduledRuleEngine {
     if ((name.includes("blueberry") || name.includes("currant") || name.includes("gooseberry")) && (m === 1 || m === 2)) {
       results.push(candidate(ctx, {
         ruleId:       "berry_winter_prune",
+        dedupeByName: true,
         taskType:     "prune",
         title:        `Prune ${ctx.cropName} while dormant — remove oldest darkest stems to ground level to encourage new productive growth`,
         scheduledFor: today,
@@ -616,6 +635,7 @@ class ScheduledRuleEngine {
     if (mulchCrops.some(k => name.includes(k)) && m >= 3 && m <= 4) {
       results.push(candidate(ctx, {
         ruleId:       "perennial_mulch",
+        dedupeByName: true,
         taskType:     "mulch",
         title:        `Mulch around ${ctx.cropName} now — apply 5-8cm of well-rotted compost or bark to retain moisture and suppress weeds`,
         scheduledFor: today,
@@ -629,6 +649,7 @@ class ScheduledRuleEngine {
     if (name.includes("rhubarb") && m >= 2 && m <= 3) {
       results.push(candidate(ctx, {
         ruleId:       "rhubarb_forcing_check",
+        dedupeByName: true,
         taskType:     "check",
         title:        `Check ${ctx.cropName} — are stems emerging? You can force early growth by covering crowns with a forcing pot or bucket now`,
         scheduledFor: today,
@@ -643,6 +664,7 @@ class ScheduledRuleEngine {
     if (name.includes("asparagus") && m >= 4 && m <= 6) {
       results.push(candidate(ctx, {
         ruleId:       "asparagus_cutting_check",
+        dedupeByName: true,
         taskType:     "harvest",
         title:        `Check ${ctx.cropName} — spears ready to cut when 15-20cm tall. Stop cutting after mid-June to let plants build strength for next year`,
         scheduledFor: today,
