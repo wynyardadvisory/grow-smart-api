@@ -1850,7 +1850,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       .order("urgency",  { ascending: false })
       .order("due_date", { ascending: true }),
     req.db.from("crop_instances")
-      .select("id, name, variety, variety_id, sown_date, area_id, missed_task_note, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, pest_window_start, pest_window_end, pest_notes)")
+      .select("id, name, variety, variety_id, sown_date, status, area_id, missed_task_note, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, pest_window_start, pest_window_end, pest_notes, is_perennial, default_establishment)")
       .eq("user_id", req.user.id).eq("active", true),
     req.db.from("profiles").select("name, plan, postcode, photo_url").eq("id", req.user.id).single(),
     req.db.from("harvest_log")
@@ -1878,16 +1878,30 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     }));
 
   // ── Missing data prompts ──────────────────────────────────────────────────
+  // Establishments that are planted direct — missing sow date only matters once planted out
+  const directEstablishments = ["tuber","crown","runner","cane","sets"];
   const missingData = crops
-    .filter(c => (!c.variety_id && !c.variety) || (!c.sown_date && c.status !== "planned" && !c.crop_def?.is_perennial))
-    .map(c => ({
-      id:      c.id,
-      name:    c.name,
-      missing: [
-        (!c.variety_id && !c.variety) && "variety not set",
-        (!c.sown_date && c.status !== "planned" && !c.crop_def?.is_perennial) && "sow date not recorded yet"
-      ].filter(Boolean),
-    }));
+    .filter(c => {
+      const isDirect = directEstablishments.includes(c.crop_def?.default_establishment);
+      const missingSow = !c.sown_date && c.status !== "planned" && !c.crop_def?.is_perennial;
+      // Don't flag missing sow date for direct-planted crops that haven't been planted yet
+      const skipSowPrompt = isDirect && (c.status === "planned" || c.status === "sown_indoors");
+      const missingVariety = !c.variety_id && !c.variety;
+      return missingVariety || (missingSow && !skipSowPrompt);
+    })
+    .map(c => {
+      const isDirect = directEstablishments.includes(c.crop_def?.default_establishment);
+      const skipSowPrompt = isDirect && (c.status === "planned" || c.status === "sown_indoors");
+      return {
+        id:      c.id,
+        name:    c.name,
+        missing: [
+          (!c.variety_id && !c.variety) && "variety not set",
+          (!c.sown_date && c.status !== "planned" && !c.crop_def?.is_perennial && !skipSowPrompt) && "sow date not recorded yet"
+        ].filter(Boolean),
+      };
+    })
+    .filter(c => c.missing.length > 0);
 
   // ── Pest risk — how many crops are in their peak pest window this month ───
   const cropsInPestWindow = crops.filter(c => {
