@@ -963,14 +963,14 @@ app.delete("/feeds/:id", requireAuth, async (req, res) => {
 // =============================================================================
 
 app.get("/areas/:id/suggestions", requireAuth, async (req, res) => {
-  // Verify ownership
-  const { data: area } = await req.db.from("growing_areas")
-    .select("id, name, type, location_id, locations(user_id)")
+  // Verify ownership via supabaseService to avoid RLS issues
+  const { data: area } = await supabaseService.from("growing_areas")
+    .select("id, location_id, locations(user_id)")
     .eq("id", req.params.id).single();
   if (!area || area.locations?.user_id !== req.user.id)
     return res.status(403).json({ error: "Not authorised" });
 
-  const { data } = await req.db.from("planting_suggestions")
+  const { data } = await supabaseService.from("planting_suggestions")
     .select("*").eq("area_id", req.params.id).single();
 
   res.json(data || null);
@@ -986,10 +986,11 @@ app.post("/areas/:id/suggestions/generate", requireAuth, async (req, res) => {
   if (!area || area.locations?.user_id !== req.user.id)
     return res.status(403).json({ error: "Not authorised" });
 
-  // Check area is actually empty
+  // Check area is actually empty — planned crops don't count
   const { data: activeCrops } = await db.from("crop_instances")
     .select("id").eq("area_id", req.params.id).eq("active", true)
-    .not("status", "eq", "harvested");
+    .not("status", "eq", "harvested")
+    .not("status", "eq", "planned");
   if (activeCrops?.length > 0)
     return res.status(400).json({ error: "Area is not empty" });
 
