@@ -2929,6 +2929,340 @@ app.post("/admin/backfill-badges", requireAuth, requireAdmin, async (req, res) =
 });
 
 
+
+// =============================================================================
+// EMAIL AUTOMATION
+// =============================================================================
+
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+
+async function sendEmail(to, subject, html) {
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${RESEND_API_KEY}`,
+    },
+    body: JSON.stringify({
+      from: "Mark at Vercro <hello@vercro.com>",
+      to: [to],
+      subject,
+      html,
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Resend error: ${err}`);
+  }
+  return res.json();
+}
+
+// ── Nudge email — accepted but not onboarded ──────────────────────────────────
+// Called by cron daily
+app.post("/cron/nudge-unactivated", async (req, res) => {
+  // Simple auth — Vercel cron secret
+  if (req.headers["x-cron-secret"] !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: "Unauthorised" });
+  }
+
+  try {
+    // Get accepted waitlist users who haven't completed onboarding
+    // "Not onboarded" = in waitlist table with status=accepted but no matching profile row
+    const { data: accepted } = await supabaseService
+      .from("waitlist")
+      .select("email, name, accepted_at, nudge_count, last_nudge_at")
+      .eq("status", "accepted");
+
+    if (!accepted?.length) return res.json({ sent: 0 });
+
+    // Get all emails that have completed onboarding (have a profile)
+    const { data: profiles } = await supabaseService
+      .from("profiles")
+      .select("id, email:id");
+
+    // Get auth users to match emails
+    const { data: { users: authUsers } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
+    const onboardedEmails = new Set(
+      (authUsers || [])
+        .filter(u => u.user_metadata?.onboarded || u.app_metadata?.onboarded)
+        .map(u => u.email)
+    );
+
+    // Also check profiles table — if they have a profile row they've onboarded
+    const profileUserIds = new Set((profiles || []).map(p => p.id));
+    const profileEmails = new Set(
+      (authUsers || [])
+        .filter(u => profileUserIds.has(u.id))
+        .map(u => u.email)
+    );
+
+    const allOnboarded = new Set([...onboardedEmails, ...profileEmails]);
+
+    let sent = 0;
+    const now = new Date();
+
+    for (const w of accepted) {
+      // Skip if already onboarded
+      if (allOnboarded.has(w.email)) continue;
+
+      // Skip if nudged in the last 24 hours
+      if (w.last_nudge_at) {
+        const hoursSince = (now - new Date(w.last_nudge_at)) / 3600000;
+        if (hoursSince < 23) continue;
+      }
+
+      // Max 5 nudges total
+      if ((w.nudge_count || 0) >= 5) continue;
+
+      const name = w.name ? w.name.split(" ")[0] : "there";
+      const nudgeNum = (w.nudge_count || 0) + 1;
+
+      const subjects = [
+        "Your Vercro garden is waiting 🌱",
+        "Don't miss the growing season — Vercro is ready for you",
+        "Your crops won't plant themselves 🥕",
+        "Still time to get your garden on track",
+        "Last reminder — your Vercro access is ready",
+      ];
+
+      const intros = [
+        `You signed up for the Vercro beta — your account is ready and waiting.`,
+        `A quick reminder that your Vercro garden planner is set up and ready to go.`,
+        `The growing season won't wait — and neither will Vercro. Your account is all set.`,
+        `You're missing out on personalised daily tasks, weather alerts and harvest forecasts for your garden.`,
+        `This is our final reminder — your Vercro beta access is ready whenever you are.`,
+      ];
+
+      try {
+        await sendEmail(
+          w.email,
+          subjects[nudgeNum - 1] || subjects[0],
+          `
+            <div style="font-family: Georgia, serif; max-width: 560px; margin: 0 auto; padding: 40px 24px; color: #1a1a1a;">
+              <div style="font-size: 32px; margin-bottom: 16px;">🌱</div>
+              <h1 style="font-size: 22px; font-weight: 700; margin-bottom: 12px; color: #2F5D50;">Hi ${name},</h1>
+              <p style="font-size: 15px; color: #6E6E6E; line-height: 1.6; margin-bottom: 24px;">
+                ${intros[nudgeNum - 1] || intros[0]}
+              </p>
+              <div style="background: #f0f7f4; border-radius: 14px; padding: 28px; text-align: center; margin-bottom: 28px;">
+                <p style="font-size: 15px; color: #1a1a1a; font-weight: 700; margin-bottom: 20px;">Get started at:</p>
+                <a href="https://app.vercro.com" style="display: inline-block; background: #2F5D50; color: #fff; text-decoration: none; padding: 16px 36px; border-radius: 12px; font-weight: 700; font-size: 16px;">
+                  Open Vercro →
+                </a>
+              </div>
+              <p style="font-size: 13px; color: #999; line-height: 1.6;">
+                Takes less than 2 minutes to set up. Add your first crop and Vercro will build a task schedule for it automatically.
+              </p>
+              <hr style="border: none; border-top: 1px solid #e8e8e8; margin: 32px 0;" />
+              <p style="font-size: 12px; color: #999;">Vercro · hello@vercro.com · <a href="https://vercro.com" style="color: #2F5D50;">vercro.com</a></p>
+            </div>
+          `
+        );
+
+        // Update nudge count and timestamp
+        await supabaseService.from("waitlist")
+          .update({
+            nudge_count:   nudgeNum,
+            last_nudge_at: now.toISOString(),
+          })
+          .eq("email", w.email);
+
+        sent++;
+      } catch (e) {
+        console.error(`[Nudge] Failed to email ${w.email}:`, e.message);
+      }
+    }
+
+    res.json({ sent, checked: accepted.length });
+  } catch (e) {
+    console.error("[Nudge cron]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Feedback email sequence — post-onboarding ─────────────────────────────────
+// Called by cron daily — checks for users who need a feedback email
+app.post("/cron/feedback-sequence", async (req, res) => {
+  if (req.headers["x-cron-secret"] !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: "Unauthorised" });
+  }
+
+  try {
+    // Get all auth users with profiles (onboarded)
+    const { data: { users: authUsers } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
+    const { data: profiles } = await supabaseService.from("profiles").select("id, name, feedback_emails_sent, last_feedback_email_at, created_at");
+
+    const profileMap = {};
+    (profiles || []).forEach(p => { profileMap[p.id] = p; });
+
+    const now = new Date();
+    let sent = 0;
+
+    for (const user of authUsers) {
+      const profile = profileMap[user.id];
+      if (!profile) continue; // not onboarded
+
+      const emailsSent  = profile.feedback_emails_sent || 0;
+      if (emailsSent >= 3) continue; // max 3 emails
+
+      const onboardedAt = new Date(profile.created_at);
+      const hoursSince  = (now - onboardedAt) / 3600000;
+
+      // Sequence: 48hr, 1 week (168hr), 3 weeks (504hr)
+      const thresholds = [48, 168, 504];
+      const threshold  = thresholds[emailsSent];
+      if (!threshold) continue;
+
+      if (hoursSince < threshold) continue;
+
+      // Check last feedback email was sent (avoid double sending)
+      if (profile.last_feedback_email_at) {
+        const hoursSinceLast = (now - new Date(profile.last_feedback_email_at)) / 3600000;
+        if (hoursSinceLast < 46) continue;
+      }
+
+      const name = profile.name ? profile.name.split(" ")[0] : "there";
+      const email = user.email;
+
+      const sequences = [
+        {
+          subject: "How are you finding Vercro so far? 🌱",
+          intro: `You've had a couple of days with Vercro now — we'd love to know how it's going.`,
+          question: "What's working well? And what would you change or improve?",
+          cta: "It takes 2 minutes and every response makes a real difference to what we build next.",
+        },
+        {
+          subject: "A week in — what do you think? 🥕",
+          intro: `You've had a week with Vercro — enough time to form a real opinion.`,
+          question: "Is it helping with your garden? What's missing or frustrating you?",
+          cta: "We're actively building new features and your feedback goes directly into our roadmap.",
+        },
+        {
+          subject: "One last question from the Vercro team 🌾",
+          intro: `You've been using Vercro for a few weeks now — thank you for being one of our early testers.`,
+          question: "If you could only change ONE thing about Vercro, what would it be?",
+          cta: "Your answer genuinely shapes what we focus on building next.",
+        },
+      ];
+
+      const seq = sequences[emailsSent];
+
+      try {
+        await sendEmail(
+          email,
+          seq.subject,
+          `
+            <div style="font-family: Georgia, serif; max-width: 560px; margin: 0 auto; padding: 40px 24px; color: #1a1a1a;">
+              <div style="font-size: 32px; margin-bottom: 16px;">🌱</div>
+              <h1 style="font-size: 22px; font-weight: 700; margin-bottom: 12px; color: #2F5D50;">Hi ${name},</h1>
+              <p style="font-size: 15px; color: #6E6E6E; line-height: 1.6; margin-bottom: 20px;">
+                ${seq.intro}
+              </p>
+              <p style="font-size: 16px; font-weight: 700; color: #1a1a1a; font-style: italic; margin-bottom: 20px; padding: 16px; background: #f0f7f4; border-radius: 12px; border-left: 3px solid #2F5D50;">
+                "${seq.question}"
+              </p>
+              <p style="font-size: 14px; color: #6E6E6E; line-height: 1.6; margin-bottom: 28px;">
+                ${seq.cta}
+              </p>
+              <div style="text-align: center;">
+                <a href="mailto:hello@vercro.com?subject=Vercro feedback" style="display: inline-block; background: #2F5D50; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 12px; font-weight: 700; font-size: 15px;">
+                  Reply with your thoughts →
+                </a>
+              </div>
+              <p style="font-size: 13px; color: #999; margin-top: 24px; text-align: center;">
+                Or just reply directly to this email — we read everything.
+              </p>
+              <hr style="border: none; border-top: 1px solid #e8e8e8; margin: 32px 0;" />
+              <p style="font-size: 12px; color: #999;">Vercro · hello@vercro.com · <a href="https://vercro.com" style="color: #2F5D50;">vercro.com</a></p>
+            </div>
+          `
+        );
+
+        await supabaseService.from("profiles")
+          .update({
+            feedback_emails_sent:   emailsSent + 1,
+            last_feedback_email_at: now.toISOString(),
+          })
+          .eq("id", user.id);
+
+        sent++;
+      } catch (e) {
+        console.error(`[Feedback] Failed to email ${email}:`, e.message);
+      }
+    }
+
+    res.json({ sent, checked: authUsers.length });
+  } catch (e) {
+    console.error("[Feedback cron]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Admin — bulk email waitlist users telling them they can join ───────────────
+app.post("/admin/invite-waitlist", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { data: waitlist } = await supabaseService
+      .from("waitlist")
+      .select("email, name, status, invite_sent_at")
+      .eq("status", "waitlist");
+
+    if (!waitlist?.length) return res.json({ sent: 0, message: "No waitlist users found" });
+
+    let sent = 0;
+    for (const w of waitlist) {
+      if (w.invite_sent_at) continue; // already invited
+
+      const name = w.name ? w.name.split(" ")[0] : "there";
+      try {
+        await sendEmail(
+          w.email,
+          "Great news — your Vercro spot is ready 🌱",
+          `
+            <div style="font-family: Georgia, serif; max-width: 560px; margin: 0 auto; padding: 40px 24px; color: #1a1a1a;">
+              <div style="font-size: 32px; margin-bottom: 16px;">🌱</div>
+              <h1 style="font-size: 24px; font-weight: 700; margin-bottom: 8px; color: #2F5D50;">Great news, ${name}!</h1>
+              <p style="font-size: 15px; color: #6E6E6E; line-height: 1.6; margin-bottom: 20px;">
+                You applied for early access to Vercro a little while ago and we put you on our reserve list. We're now opening up access to everyone — and that includes you.
+              </p>
+              <p style="font-size: 15px; color: #6E6E6E; line-height: 1.6; margin-bottom: 28px;">
+                Your account is ready and waiting. It takes less than 2 minutes to set up your first crop.
+              </p>
+              <div style="background: #f0f7f4; border-radius: 14px; padding: 28px; text-align: center; margin-bottom: 28px;">
+                <p style="font-size: 15px; color: #1a1a1a; font-weight: 700; margin-bottom: 20px;">Get started at:</p>
+                <a href="https://app.vercro.com" style="display: inline-block; background: #2F5D50; color: #fff; text-decoration: none; padding: 18px 40px; border-radius: 12px; font-weight: 700; font-size: 17px;">
+                  Open Vercro →
+                </a>
+              </div>
+              <p style="font-size: 14px; color: #6E6E6E; line-height: 1.6;">
+                If you have any questions or want to share feedback, just reply to this email. We read everything.
+              </p>
+              <hr style="border: none; border-top: 1px solid #e8e8e8; margin: 32px 0;" />
+              <p style="font-size: 12px; color: #999;">Vercro · hello@vercro.com · <a href="https://vercro.com" style="color: #2F5D50;">vercro.com</a></p>
+            </div>
+          `
+        );
+
+        await supabaseService.from("waitlist")
+          .update({
+            status:         "accepted",
+            invite_sent_at: new Date().toISOString(),
+            accepted_at:    new Date().toISOString(),
+          })
+          .eq("email", w.email);
+
+        sent++;
+      } catch (e) {
+        console.error(`[Invite] Failed to email ${w.email}:`, e.message);
+      }
+    }
+
+    res.json({ sent, total: waitlist.length });
+  } catch (e) {
+    console.error("[Invite waitlist]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // =============================================================================
 // CRON — called by Vercel Cron at 06:00 UTC daily
 // Protected by CRON_SECRET header.
