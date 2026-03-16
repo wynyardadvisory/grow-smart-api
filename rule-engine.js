@@ -787,8 +787,9 @@ class DynamicRiskEngine {
       if (STAGE_ORDER.indexOf(ctx.stage) > STAGE_ORDER.indexOf(rule.stage_max)) return false;
     }
 
-    // Outdoor requirement
+    // Outdoor requirement — skip for greenhouse and any indoor-sown crops
     if (rule.requires_outdoor && ctx.areaType === "greenhouse") return false;
+    if (rule.requires_outdoor && ctx.cropStatus === "sown_indoors") return false;
     if (rule.requires_unprotected && ctx.isProtected) return false;
 
     return true;
@@ -860,8 +861,11 @@ class RuleEngine {
       const scheduled = this.scheduled.evaluate(ctx, rules);
       allCandidates.push(...scheduled);
 
-      // Risk engine — short-horizon alerts (only for growing/sown crops)
-      const skipRisk = crop.status === "planned" || ctx.stage === "finished";
+      // Risk engine — short-horizon alerts
+      // Skip for planned, finished, or indoor crops (pests not relevant until outside)
+      const skipRisk = crop.status === "planned" ||
+                       crop.status === "sown_indoors" ||
+                       ctx.stage === "finished";
       if (!skipRisk) {
         const alerts = this.risk.evaluate(ctx, pestRules);
         allCandidates.push(...alerts);
