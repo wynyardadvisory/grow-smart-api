@@ -1966,12 +1966,27 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       tasks:     tasks, // full list including overdue
       today:     tasks.filter(t => t.due_date <= today),
       this_week: tasks.filter(t => t.due_date > today && t.due_date <= weekEnd),
-      coming_up: tasks.filter(t => {
-        if (t.completed_at || t.status === 'expired') return false;
-        const vf = t.visible_from || t.due_date;
-        const upcoming56 = new Date(Date.now() + 56 * 86400000).toISOString().split("T")[0];
-        return vf <= today && t.due_date > weekEnd && t.due_date <= upcoming56;
-      }),
+      coming_up: (() => {
+        const URGENCY_RANK = { high: 3, medium: 2, low: 1 };
+        const candidates = tasks.filter(t => {
+          if (t.completed_at || t.status === 'expired') return false;
+          const vf = t.visible_from || t.due_date;
+          const upcoming56 = new Date(Date.now() + 56 * 86400000).toISOString().split("T")[0];
+          return vf <= today && t.due_date > weekEnd && t.due_date <= upcoming56;
+        });
+        // One per crop — keep earliest due date, break ties by highest urgency
+        const seen = new Map();
+        for (const t of candidates) {
+          const key = t.crop_instance_id || t.rule_id || t.id;
+          const existing = seen.get(key);
+          if (!existing) { seen.set(key, t); continue; }
+          const betterDate = t.due_date < existing.due_date;
+          const sameDate   = t.due_date === existing.due_date;
+          const betterUrgency = (URGENCY_RANK[t.urgency] || 0) > (URGENCY_RANK[existing.urgency] || 0);
+          if (betterDate || (sameDate && betterUrgency)) seen.set(key, t);
+        }
+        return [...seen.values()].sort((a, b) => a.due_date.localeCompare(b.due_date));
+      })(),
       alerts: tasks.filter(t => !t.completed_at && t.record_type === 'alert' && t.status !== 'expired'),
     },
     crop_count:       crops.length,
