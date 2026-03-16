@@ -31,6 +31,7 @@ const { body, validationResult } = require("express-validator");
 require("dotenv").config();
 
 const { RuleEngine } = require("./rule-engine");
+const { runNotificationsForUser } = require("./notifications");
 
 // ── Supabase (service role — server only) ─────────────────────────────────────
 const supabaseService = createClient(
@@ -2865,6 +2866,138 @@ app.get("/crops/:id/observations", requireAuth, async (req, res) => {
     .limit(20);
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
+});
+
+
+// =============================================================================
+// PUSH NOTIFICATIONS
+// =============================================================================
+
+// GET /notifications/vapid-key — public key for subscription
+app.get("/notifications/vapid-key", (_req, res) => {
+  if (!process.env.VAPID_PUBLIC_KEY) return res.status(503).json({ error: "Push not configured" });
+  res.json({ publicKey: process.env.VAPID_PUBLIC_KEY });
+});
+
+// POST /notifications/register-token — save device push token
+app.post("/notifications/register-token", requireAuth, async (req, res) => {
+  const { subscription, platform = "web", device_label } = req.body;
+  if (!subscription) return res.status(400).json({ error: "subscription required" });
+
+  const endpoint = subscription.endpoint;
+  const { error } = await supabaseService.from("device_push_tokens").upsert({
+    user_id:      req.user.id,
+    platform,
+    push_token:   JSON.stringify(subscription),
+    endpoint,
+    device_label: device_label || null,
+    is_active:    true,
+    last_seen_at: new Date().toISOString(),
+    updated_at:   new Date().toISOString(),
+  }, { onConflict: "user_id,endpoint" });
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Ensure preferences row exists
+  await supabaseService.from("notification_preferences").upsert({
+    user_id:      req.user.id,
+    push_enabled: true,
+    updated_at:   new Date().toISOString(),
+  }, { onConflict: "user_id", ignoreDuplicates: true });
+
+  res.json({ ok: true });
+});
+
+// DELETE /notifications/token — unregister device
+app.delete("/notifications/token", requireAuth, async (req, res) => {
+  const { endpoint } = req.body;
+  if (!endpoint) return res.status(400).json({ error: "endpoint required" });
+  await supabaseService.from("device_push_tokens")
+    .update({ is_active: false })
+    .eq("user_id", req.user.id)
+    .eq("endpoint", endpoint);
+  res.json({ ok: true });
+});
+
+// GET /notifications/preferences — get user notification preferences
+app.get("/notifications/preferences", requireAuth, async (req, res) => {
+  const { data } = await supabaseService.from("notification_preferences")
+    .select("*").eq("user_id", req.user.id).single();
+  res.json(data || { push_enabled: false });
+});
+
+// PUT /notifications/preferences — update preferences
+app.put("/notifications/preferences", requireAuth, async (req, res) => {
+  const allowed = [
+    "push_enabled","due_today_enabled","coming_up_enabled","weather_alerts_enabled",
+    "pest_alerts_enabled","crop_checks_enabled","weekly_summary_enabled",
+    "daily_plan_enabled","milestones_enabled","morning_time_local","evening_time_local",
+    "do_not_disturb_start","do_not_disturb_end","critical_alerts_anytime","timezone"
+  ];
+  const updates = Object.fromEntries(Object.entries(req.body).filter(([k]) => allowed.includes(k)));
+  updates.updated_at = new Date().toISOString();
+
+  const { error } = await supabaseService.from("notification_preferences").upsert({
+    user_id: req.user.id,
+    ...updates,
+  }, { onConflict: "user_id" });
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
+});
+
+// POST /notifications/:id/opened — mark notification as opened
+app.post("/notifications/:id/opened", async (req, res) => {
+  await supabaseService.from("notification_events")
+    .update({ status: "opened", opened_at: new Date().toISOString() })
+    .eq("id", req.params.id);
+  res.json({ ok: true });
+});
+
+// POST /cron/push-morning — morning notifications (8:30am)
+app.post("/cron/push-morning", async (req, res) => {
+  if (req.headers["x-cron-secret"] !== process.env.CRON_SECRET) return res.status(401).json({ error: "Unauthorised" });
+  try {
+    const { data: profiles } = await supabaseService.from("profiles").select("id");
+    if (!profiles?.length) return res.json({ processed: 0 });
+    res.json({ ok: true, queued: profiles.length });
+    let sent = 0;
+    for (const p of profiles) {
+      try {
+        const result = await runNotificationsForUser(supabaseService, p.id, "morning");
+        if (result.sent > 0) sent++;
+      } catch(e) { console.error(`[PushMorning] ${p.id}:`, e.message); }
+    }
+    console.log(`[PushMorning] Sent to ${sent}/${profiles.length} users`);
+  } catch(e) {
+    console.error("[PushMorning]", e.message);
+  }
+});
+
+// POST /cron/push-evening — evening notifications (6pm)
+app.post("/cron/push-evening", async (req, res) => {
+  if (req.headers["x-cron-secret"] !== process.env.CRON_SECRET) return res.status(401).json({ error: "Unauthorised" });
+  try {
+    const { data: profiles } = await supabaseService.from("profiles").select("id");
+    if (!profiles?.length) return res.json({ processed: 0 });
+    res.json({ ok: true, queued: profiles.length });
+    let sent = 0;
+    for (const p of profiles) {
+      try {
+        const result = await runNotificationsForUser(supabaseService, p.id, "evening");
+        if (result.sent > 0) sent++;
+      } catch(e) { console.error(`[PushEvening] ${p.id}:`, e.message); }
+    }
+    console.log(`[PushEvening] Sent to ${sent}/${profiles.length} users`);
+  } catch(e) {
+    console.error("[PushEvening]", e.message);
+  }
+});
+
+// POST /notifications/test — send test push to current user (admin only)
+app.post("/notifications/test", requireAuth, requireAdmin, async (req, res) => {
+  const result = await runNotificationsForUser(supabaseService, req.user.id, "morning");
+  res.json(result);
 });
 
 // =============================================================================
