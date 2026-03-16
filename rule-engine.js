@@ -422,6 +422,237 @@ class ScheduledRuleEngine {
       }
     }
 
+    // ── Lifecycle check prompts — adds to QuickCropCheck via stage field ────────
+    // These generate a check task that the frontend surfaces as a crop check
+    const perennialLifecycle = this._perennialLifecycle(ctx, m, year, today);
+    results.push(...perennialLifecycle);
+
+    // ── Seasonal care tasks ───────────────────────────────────────────────────
+    const perennialCare = this._perennialSeasonalCare(ctx, m, year, today);
+    results.push(...perennialCare);
+
+    return results;
+  }
+
+  // ── Perennial lifecycle checks ───────────────────────────────────────────
+  // Generates stage-appropriate check prompts for perennial crops
+  // These surface in QuickCropCheck on the dashboard
+
+  _perennialLifecycle(ctx, m, year, today) {
+    const results = [];
+    const name = ctx.cropName.toLowerCase();
+
+    // Flowering check — prompt when crop should be flowering
+    // Different crops flower at different times
+    const floweringWindows = {
+      strawberry:   { start: 4, end: 5 },
+      apple:        { start: 4, end: 5 },
+      pear:         { start: 4, end: 5 },
+      blueberry:    { start: 4, end: 5 },
+      blackcurrant: { start: 4, end: 5 },
+      redcurrant:   { start: 4, end: 5 },
+      gooseberry:   { start: 4, end: 5 },
+      raspberry:    { start: 5, end: 6 },
+      blackberry:   { start: 6, end: 7 },
+      rhubarb:      { start: 3, end: 4 },
+      asparagus:    { start: 4, end: 5 },
+    };
+
+    // Fruit set check — when fruit should be forming
+    const fruitSetWindows = {
+      strawberry:   { start: 5, end: 6 },
+      apple:        { start: 6, end: 7 },
+      pear:         { start: 6, end: 7 },
+      blueberry:    { start: 6, end: 7 },
+      blackcurrant: { start: 6, end: 7 },
+      redcurrant:   { start: 6, end: 7 },
+      gooseberry:   { start: 6, end: 7 },
+      raspberry:    { start: 6, end: 8 },
+      blackberry:   { start: 7, end: 9 },
+    };
+
+    // Match crop to lifecycle windows
+    const cropKey = Object.keys(floweringWindows).find(k => name.includes(k));
+    if (!cropKey) return results;
+
+    const fw = floweringWindows[cropKey];
+    const fsw = fruitSetWindows[cropKey];
+
+    // Flowering check
+    if (fw && m >= fw.start && m <= fw.end) {
+      results.push(candidate(ctx, {
+        ruleId:       "perennial_flowering_check",
+        taskType:     "check",
+        title:        `Are your ${ctx.cropName} flowering yet? Check for open blossoms and ensure pollinators can access them`,
+        scheduledFor: today,
+        urgency:      "low",
+        expiryDays:   14,
+        leadTimeDays: 0,
+        meta:         { lifecycle_check: true, stage: "flowering" },
+      }));
+    }
+
+    // Fruit set check
+    if (fsw && m >= fsw.start && m <= fsw.end) {
+      results.push(candidate(ctx, {
+        ruleId:       "perennial_fruit_set_check",
+        taskType:     "check",
+        title:        `Check your ${ctx.cropName} — has fruit started to set after flowering? Look for small fruit forming`,
+        scheduledFor: today,
+        urgency:      "low",
+        expiryDays:   14,
+        leadTimeDays: 0,
+        meta:         { lifecycle_check: true, stage: "fruiting" },
+      }));
+    }
+
+    // Upcoming flowering — show in Coming Up Soon
+    if (fw && m < fw.start) {
+      const flowerDate = monthToDate(fw.start, year, 1);
+      if (withinLookahead(flowerDate, LOOKAHEAD_DAYS.seasonal)) {
+        results.push(candidate(ctx, {
+          ruleId:       "perennial_flowering_upcoming",
+          taskType:     "check",
+          title:        `${ctx.cropName} should start flowering in ${MONTHS[fw.start-1]} — watch for blossom and protect from late frosts`,
+          scheduledFor: flowerDate,
+          urgency:      "low",
+          expiryDays:   21,
+          leadTimeDays: 7,
+        }));
+      }
+    }
+
+    return results;
+  }
+
+  // ── Perennial seasonal care ──────────────────────────────────────────────
+  // Pruning, mulching, winter care tasks
+
+  _perennialSeasonalCare(ctx, m, year, today) {
+    const results = [];
+    const name = ctx.cropName.toLowerCase();
+
+    // Strawberry runners — July/August
+    if (name.includes("strawberry") && m >= 7 && m <= 8) {
+      results.push(candidate(ctx, {
+        ruleId:       "strawberry_runners",
+        taskType:     "prune",
+        title:        `Check ${ctx.cropName} for runners — pin down the strongest ones to propagate, remove the rest to keep the plant's energy in fruiting`,
+        scheduledFor: today,
+        urgency:      "low",
+        expiryDays:   21,
+        leadTimeDays: 0,
+      }));
+    }
+
+    // Strawberry renovation — August after harvest
+    if (name.includes("strawberry") && m === 8) {
+      results.push(candidate(ctx, {
+        ruleId:       "strawberry_renovate",
+        taskType:     "prune",
+        title:        `Renovate ${ctx.cropName} after harvesting — cut back old foliage to 10cm, clear debris and feed to encourage new growth`,
+        scheduledFor: today,
+        urgency:      "low",
+        expiryDays:   21,
+        leadTimeDays: 0,
+      }));
+    }
+
+    // Raspberry cane management — August/September (summer fruiting)
+    if (name.includes("raspberry") && m >= 8 && m <= 9) {
+      results.push(candidate(ctx, {
+        ruleId:       "raspberry_cane_prune",
+        taskType:     "prune",
+        title:        `Prune ${ctx.cropName} — cut out all canes that fruited this year to ground level, tie in the new green canes for next year`,
+        scheduledFor: today,
+        urgency:      "medium",
+        expiryDays:   28,
+        leadTimeDays: 0,
+      }));
+    }
+
+    // Apple/pear summer prune — July/August for trained forms
+    if ((name.includes("apple") || name.includes("pear")) && m >= 7 && m <= 8) {
+      results.push(candidate(ctx, {
+        ruleId:       "apple_pear_summer_prune",
+        taskType:     "prune",
+        title:        `Summer prune ${ctx.cropName} — cut back sideshoots to 3 leaves above the basal cluster to encourage fruiting spurs`,
+        scheduledFor: today,
+        urgency:      "low",
+        expiryDays:   28,
+        leadTimeDays: 0,
+      }));
+    }
+
+    // Apple/pear winter prune — December/January
+    if ((name.includes("apple") || name.includes("pear")) && (m === 12 || m === 1)) {
+      const pruneDate = m === 12 ? monthToDate(12, year, 15) : today;
+      results.push(candidate(ctx, {
+        ruleId:       "apple_pear_winter_prune",
+        taskType:     "prune",
+        title:        `Winter prune ${ctx.cropName} while dormant — remove crossing, dead, or diseased branches, open up the centre for airflow`,
+        scheduledFor: pruneDate,
+        urgency:      "low",
+        expiryDays:   42,
+        leadTimeDays: 7,
+      }));
+    }
+
+    // Blueberry/currant winter prune — January/February
+    if ((name.includes("blueberry") || name.includes("currant") || name.includes("gooseberry")) && (m === 1 || m === 2)) {
+      results.push(candidate(ctx, {
+        ruleId:       "berry_winter_prune",
+        taskType:     "prune",
+        title:        `Prune ${ctx.cropName} while dormant — remove oldest darkest stems to ground level to encourage new productive growth`,
+        scheduledFor: today,
+        urgency:      "low",
+        expiryDays:   42,
+        leadTimeDays: 0,
+      }));
+    }
+
+    // Mulching — March for most perennials
+    const mulchCrops = ["strawberry","raspberry","blueberry","blackcurrant","redcurrant","gooseberry","apple","pear","blackberry"];
+    if (mulchCrops.some(k => name.includes(k)) && m >= 3 && m <= 4) {
+      results.push(candidate(ctx, {
+        ruleId:       "perennial_mulch",
+        taskType:     "mulch",
+        title:        `Mulch around ${ctx.cropName} now — apply 5-8cm of well-rotted compost or bark to retain moisture and suppress weeds`,
+        scheduledFor: today,
+        urgency:      "low",
+        expiryDays:   28,
+        leadTimeDays: 0,
+      }));
+    }
+
+    // Rhubarb — forcing check February/March
+    if (name.includes("rhubarb") && m >= 2 && m <= 3) {
+      results.push(candidate(ctx, {
+        ruleId:       "rhubarb_forcing_check",
+        taskType:     "check",
+        title:        `Check ${ctx.cropName} — are stems emerging? You can force early growth by covering crowns with a forcing pot or bucket now`,
+        scheduledFor: today,
+        urgency:      "low",
+        expiryDays:   21,
+        leadTimeDays: 0,
+        meta:         { lifecycle_check: true, stage: "vegetative" },
+      }));
+    }
+
+    // Asparagus — cutting season check April/May/June
+    if (name.includes("asparagus") && m >= 4 && m <= 6) {
+      results.push(candidate(ctx, {
+        ruleId:       "asparagus_cutting_check",
+        taskType:     "harvest",
+        title:        `Check ${ctx.cropName} — spears ready to cut when 15-20cm tall. Stop cutting after mid-June to let plants build strength for next year`,
+        scheduledFor: today,
+        urgency:      "medium",
+        expiryDays:   14,
+        leadTimeDays: 0,
+        meta:         { lifecycle_check: true, stage: "harvesting" },
+      }));
+    }
+
     return results;
   }
 
