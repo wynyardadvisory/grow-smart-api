@@ -2009,10 +2009,10 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       coming_up: (() => {
         const URGENCY_RANK = { high: 3, medium: 2, low: 1 };
         const candidates = tasks.filter(t => {
+        const candidates = tasks.filter(t => {
           if (t.completed_at || t.status === 'expired') return false;
-          const vf = t.visible_from || t.due_date;
           const upcoming56 = new Date(Date.now() + 56 * 86400000).toISOString().split("T")[0];
-          return vf <= today && t.due_date > weekEnd && t.due_date <= upcoming56;
+          return t.due_date > weekEnd && t.due_date <= upcoming56;
         });
         // One per crop NAME — keep only the earliest due date task
         // When completed, the next task for that crop appears
