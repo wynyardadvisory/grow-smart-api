@@ -518,4 +518,299 @@ async function runWaitlistNudges(supabase) {
   return { sent, skipped };
 }
 
-module.exports = { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges };
+// ── Waitlist day 7 nudge ──────────────────────────────────────────────────────
+function templateWaitlistNudge2(name) {
+  const firstName = name ? name.split(" ")[0] : "there";
+  return {
+    subject: `The growing season is starting, ${firstName}`,
+    html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f8f2;font-family:Georgia,serif;">
+  <div style="max-width:560px;margin:40px auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 2px 16px rgba(47,93,80,0.08);">
+    <div style="background:#2F5D50;padding:32px 40px;text-align:center;">
+      <div style="font-size:32px;margin-bottom:8px;">🌱</div>
+      <div style="font-family:Georgia,serif;font-size:24px;font-weight:700;color:#ffffff;">Vercro</div>
+    </div>
+    <div style="padding:40px;">
+      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">The growing season is getting started</h1>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
+        Hey ${firstName} — March and April are the busiest months in the UK growing calendar. Sowing windows are opening, frost risk is still real, and getting organised now makes the rest of the season much easier.
+      </p>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 24px;">
+        Vercro tells you exactly what to do and when — based on your crops, your postcode and the actual weather. Your spot is still there.
+      </p>
+      <div style="background:#f4f8f2;border-radius:12px;padding:16px 20px;margin-bottom:28px;">
+        <p style="font-size:13px;color:#2F5D50;font-weight:700;margin:0 0 8px;">What you'll get on day one:</p>
+        <p style="font-size:13px;color:#4a4a4a;line-height:1.7;margin:0;">✓ A personalised daily task list<br>✓ Sowing and harvest windows for your crops<br>✓ Frost alerts based on your postcode<br>✓ AI crop identification if you're not sure what you have</p>
+      </div>
+      <div style="text-align:center;margin-bottom:16px;">
+        <a href="https://app.vercro.com" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">
+          Start growing →
+        </a>
+      </div>
+      <p style="font-size:13px;color:#888;text-align:center;margin:0;">Free · No card needed · 2 minutes to set up</p>
+    </div>
+    <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
+      <p style="font-size:12px;color:#888;margin:0;">Mark · Founder of Vercro · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
+    </div>
+  </div>
+</body>
+</html>`,
+  };
+}
+
+// ── Waitlist day 14 final nudge ───────────────────────────────────────────────
+function templateWaitlistNudge3(name) {
+  const firstName = name ? name.split(" ")[0] : "there";
+  return {
+    subject: "One last nudge from me 🌱",
+    html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f8f2;font-family:Georgia,serif;">
+  <div style="max-width:560px;margin:40px auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 2px 16px rgba(47,93,80,0.08);">
+    <div style="background:#2F5D50;padding:32px 40px;text-align:center;">
+      <div style="font-size:32px;margin-bottom:8px;">🌱</div>
+      <div style="font-family:Georgia,serif;font-size:24px;font-weight:700;color:#ffffff;">Vercro</div>
+    </div>
+    <div style="padding:40px;">
+      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">Hey ${firstName} — one last nudge from me</h1>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
+        I've sent you a couple of emails about Vercro and I don't want to keep pestering you — so this is the last one.
+      </p>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
+        If the timing isn't right or gardening isn't a priority right now, that's completely fine. Your access isn't going anywhere — you can sign up whenever you're ready.
+      </p>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 32px;">
+        But if you do want a growing season where you always know what to do next — Vercro is ready for you.
+      </p>
+      <div style="text-align:center;margin-bottom:16px;">
+        <a href="https://app.vercro.com" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">
+          Set up my garden →
+        </a>
+      </div>
+      <p style="font-size:13px;color:#888;text-align:center;margin:0;">Free · No card needed · Always open</p>
+    </div>
+    <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
+      <p style="font-size:12px;color:#888;margin:0;">Mark · Founder of Vercro · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
+    </div>
+  </div>
+</body>
+</html>`,
+  };
+}
+
+// ── Re-engagement day 14 ──────────────────────────────────────────────────────
+function templateReengageDay14(name) {
+  const firstName = name ? name.split(" ")[0] : "there";
+  return {
+    subject: "A couple of things we've added to Vercro 🌿",
+    html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f8f2;font-family:Georgia,serif;">
+  <div style="max-width:560px;margin:40px auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 2px 16px rgba(47,93,80,0.08);">
+    <div style="background:#2F5D50;padding:32px 40px;text-align:center;">
+      <div style="font-size:32px;margin-bottom:8px;">🌱</div>
+      <div style="font-family:Georgia,serif;font-size:24px;font-weight:700;color:#ffffff;">Vercro</div>
+    </div>
+    <div style="padding:40px;">
+      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">Hey ${firstName} — a couple of things worth knowing</h1>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 24px;">
+        It's been a couple of weeks since you joined. We've been building quickly based on what early users are telling us — here are a few things that might be useful if you haven't tried them yet.
+      </p>
+      <div style="display:flex;flex-direction:column;gap:0;">
+        <div style="border:1px solid #D4E8CE;border-radius:12px;padding:18px 20px;margin-bottom:12px;">
+          <p style="font-size:14px;font-weight:700;color:#2F5D50;margin:0 0 6px;">📈 Crop timelines</p>
+          <p style="font-size:13px;color:#4a4a4a;line-height:1.6;margin:0;">Tap any crop and hit Timeline to see exactly where it is in its lifecycle — sown, seedling, vegetative, flowering, harvest — with predicted dates for what's coming next.</p>
+        </div>
+        <div style="border:1px solid #D4E8CE;border-radius:12px;padding:18px 20px;margin-bottom:12px;">
+          <p style="font-size:14px;font-weight:700;color:#2F5D50;margin:0 0 6px;">🌿 Companion suggestions</p>
+          <p style="font-size:13px;color:#4a4a4a;line-height:1.6;margin:0;">On any bed in your Garden tab, tap the suggestions button — for empty beds it recommends what to plant, for beds with crops it suggests companion plants to improve yield and deter pests.</p>
+        </div>
+        <div style="border:1px solid #D4E8CE;border-radius:12px;padding:18px 20px;margin-bottom:24px;">
+          <p style="font-size:14px;font-weight:700;color:#2F5D50;margin:0 0 6px;">📤 Share your garden</p>
+          <p style="font-size:13px;color:#4a4a4a;line-height:1.6;margin:0;">Generate a shareable card showing your recent tasks, crop count and harvest stats — perfect for Instagram or WhatsApp. Find it on the dashboard.</p>
+        </div>
+      </div>
+      <div style="text-align:center;margin-bottom:16px;">
+        <a href="https://app.vercro.com" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">
+          Open my garden →
+        </a>
+      </div>
+      <p style="font-size:13px;color:#888;text-align:center;margin:8px 0 0;">As always — just hit reply if you have questions or feedback.</p>
+    </div>
+    <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
+      <p style="font-size:12px;color:#888;margin:0;">Mark · Founder of Vercro · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
+    </div>
+  </div>
+</body>
+</html>`,
+  };
+}
+
+// ── Re-engagement day 30 ──────────────────────────────────────────────────────
+function templateReengageDay30(name) {
+  const firstName = name ? name.split(" ")[0] : "there";
+  const month = new Date().toLocaleString("en-GB", { month: "long" });
+  return {
+    subject: `What's happening in UK gardens this ${month}`,
+    html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f8f2;font-family:Georgia,serif;">
+  <div style="max-width:560px;margin:40px auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 2px 16px rgba(47,93,80,0.08);">
+    <div style="background:#2F5D50;padding:32px 40px;text-align:center;">
+      <div style="font-size:32px;margin-bottom:8px;">🌱</div>
+      <div style="font-family:Georgia,serif;font-size:24px;font-weight:700;color:#ffffff;">Vercro</div>
+    </div>
+    <div style="padding:40px;">
+      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">Hey ${firstName} — ${month} in the garden</h1>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
+        It's been about a month since you joined Vercro. We've had a great first group of beta users helping us shape the app — and we'd love to have you more involved.
+      </p>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 24px;">
+        If you've drifted away, no worries at all — but if you'd like to give it another go, your garden is exactly as you left it. Your crops, your tasks, your growing plan — all still there.
+      </p>
+      <div style="background:#f4f8f2;border-radius:12px;padding:18px 20px;margin-bottom:28px;border-left:3px solid #2F5D50;">
+        <p style="font-size:14px;color:#2F5D50;font-weight:700;margin:0 0 6px;">What active Vercro growers are doing in ${month}:</p>
+        <p style="font-size:13px;color:#4a4a4a;line-height:1.7;margin:0;">Completing daily tasks · Tracking sowing dates · Getting frost alerts · Logging harvests · Confirming crop stages on their timelines</p>
+      </div>
+      <div style="text-align:center;margin-bottom:16px;">
+        <a href="https://app.vercro.com" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">
+          Back to my garden →
+        </a>
+      </div>
+      <p style="font-size:13px;color:#888;text-align:center;margin:8px 0 0;">Hit reply anytime — I read everything.</p>
+    </div>
+    <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
+      <p style="font-size:12px;color:#888;margin:0;">Mark · Founder of Vercro · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
+    </div>
+  </div>
+</body>
+</html>`,
+  };
+}
+
+// ── Waitlist day 7 + day 14 nudge runners ─────────────────────────────────────
+
+async function runWaitlistNudges2(supabase) {
+  // Day 7 nudge — invite sent 7+ days ago, nudge_count < 2, not signed up
+  const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
+  const { data: invited } = await supabase
+    .from("waitlist")
+    .select("id, email, name, invite_sent_at, nudge_count")
+    .eq("status", "accepted")
+    .not("invite_sent_at", "is", null)
+    .lte("invite_sent_at", sevenDaysAgo)
+    .lt("nudge_count", 2);
+
+  if (!invited?.length) return { sent: 0, skipped: 0 };
+
+  const { data: { users } } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+  const signedUpEmails = new Set((users || []).map(u => u.email?.toLowerCase()));
+
+  let sent = 0, skipped = 0;
+  for (const person of invited) {
+    if (signedUpEmails.has(person.email?.toLowerCase())) { skipped++; continue; }
+    // nudge_count 1 = already had day-3 nudge, now send day-7
+    if ((person.nudge_count || 0) !== 1) { skipped++; continue; }
+    const result = await sendEmail(person.email, templateWaitlistNudge2(person.name));
+    if (result.sent) {
+      await supabase.from("waitlist")
+        .update({ nudge_count: 2, last_nudge_at: new Date().toISOString() })
+        .eq("id", person.id);
+      sent++;
+    } else { skipped++; }
+  }
+
+  console.log(`[WaitlistNudges2] Sent: ${sent}, Skipped: ${skipped}`);
+  return { sent, skipped };
+}
+
+async function runWaitlistNudges3(supabase) {
+  // Day 14 final nudge — nudge_count is 2, not signed up
+  const fourteenDaysAgo = new Date(Date.now() - 14 * 86400000).toISOString();
+  const { data: invited } = await supabase
+    .from("waitlist")
+    .select("id, email, name, invite_sent_at, nudge_count")
+    .eq("status", "accepted")
+    .not("invite_sent_at", "is", null)
+    .lte("invite_sent_at", fourteenDaysAgo)
+    .lt("nudge_count", 3);
+
+  if (!invited?.length) return { sent: 0, skipped: 0 };
+
+  const { data: { users } } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+  const signedUpEmails = new Set((users || []).map(u => u.email?.toLowerCase()));
+
+  let sent = 0, skipped = 0;
+  for (const person of invited) {
+    if (signedUpEmails.has(person.email?.toLowerCase())) { skipped++; continue; }
+    if ((person.nudge_count || 0) !== 2) { skipped++; continue; }
+    const result = await sendEmail(person.email, templateWaitlistNudge3(person.name));
+    if (result.sent) {
+      await supabase.from("waitlist")
+        .update({ nudge_count: 3, last_nudge_at: new Date().toISOString() })
+        .eq("id", person.id);
+      sent++;
+    } else { skipped++; }
+  }
+
+  console.log(`[WaitlistNudges3] Sent: ${sent}, Skipped: ${skipped}`);
+  return { sent, skipped };
+}
+
+// ── Re-engagement runners ─────────────────────────────────────────────────────
+
+async function runReengagement(supabase) {
+  const { data: profiles } = await supabase.from("profiles").select("id, name").order("created_at");
+  const { data: { users } } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+  const userMap = {};
+  (users || []).forEach(u => { userMap[u.id] = u; });
+
+  const { data: alreadySent } = await supabase.from("email_log").select("user_id, email_type");
+  const sentMap = {};
+  (alreadySent || []).forEach(e => {
+    if (!sentMap[e.user_id]) sentMap[e.user_id] = new Set();
+    sentMap[e.user_id].add(e.email_type);
+  });
+
+  const now = Date.now();
+  let sent = 0;
+
+  for (const profile of (profiles || [])) {
+    const user = userMap[profile.id];
+    if (!user?.email) continue;
+    const daysSince = (now - new Date(user.created_at).getTime()) / 86400000;
+    const userSent  = sentMap[profile.id] || new Set();
+
+    // Day 14
+    if (daysSince >= 14 && daysSince < 15 && !userSent.has("reengage_day14")) {
+      const result = await sendEmail(user.email, templateReengageDay14(profile.name));
+      if (result.sent) {
+        await supabase.from("email_log").insert({ user_id: profile.id, email: user.email, email_type: "reengage_day14", sent_at: new Date().toISOString() });
+        sent++;
+      }
+    }
+
+    // Day 30
+    if (daysSince >= 30 && daysSince < 31 && !userSent.has("reengage_day30")) {
+      const result = await sendEmail(user.email, templateReengageDay30(profile.name));
+      if (result.sent) {
+        await supabase.from("email_log").insert({ user_id: profile.id, email: user.email, email_type: "reengage_day30", sent_at: new Date().toISOString() });
+        sent++;
+      }
+    }
+  }
+
+  console.log(`[Reengagement] Sent: ${sent}`);
+  return { sent };
+}
+
+module.exports = { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement };

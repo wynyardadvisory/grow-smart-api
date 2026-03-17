@@ -32,7 +32,7 @@ require("dotenv").config();
 
 const { RuleEngine } = require("./rule-engine");
 const { runNotificationsForUser } = require("./notifications");
-const { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges } = require("./emails");
+const { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement } = require("./emails");
 
 // ── Supabase (service role — server only) ─────────────────────────────────────
 const supabaseService = createClient(
@@ -2853,6 +2853,33 @@ app.post("/cron/waitlist-nudges", async (req, res) => {
     const result = await runWaitlistNudges(supabaseService);
     res.json({ ok: true, ...result });
   } catch(e) { console.error("[WaitlistNudges]", e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post("/cron/waitlist-nudges-2", async (req, res) => {
+  const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
+  if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  try {
+    const result = await runWaitlistNudges2(supabaseService);
+    res.json({ ok: true, ...result });
+  } catch(e) { console.error("[WaitlistNudges2]", e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post("/cron/waitlist-nudges-3", async (req, res) => {
+  const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
+  if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  try {
+    const result = await runWaitlistNudges3(supabaseService);
+    res.json({ ok: true, ...result });
+  } catch(e) { console.error("[WaitlistNudges3]", e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post("/cron/reengagement", async (req, res) => {
+  const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
+  if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  try {
+    const result = await runReengagement(supabaseService);
+    res.json({ ok: true, ...result });
+  } catch(e) { console.error("[Reengagement]", e.message); res.status(500).json({ error: e.message }); }
 });
 
 // =============================================================================
