@@ -107,10 +107,10 @@ function templateNudgeUnconfirmed(name) {
   };
 }
 
-function templateFeedbackDay3(name) {
+function templateFeedbackDay3Active(name, tasksCompleted) {
   const firstName = name ? name.split(" ")[0] : "there";
   return {
-    subject: "How's Vercro working for you so far?",
+    subject: `${tasksCompleted} tasks down, ${firstName} — you're off to a great start 🌱`,
     html: `
 <!DOCTYPE html>
 <html>
@@ -122,25 +122,16 @@ function templateFeedbackDay3(name) {
       <div style="font-family:Georgia,serif;font-size:24px;font-weight:700;color:#ffffff;">Vercro</div>
     </div>
     <div style="padding:40px;">
-      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">Hey ${firstName} — how's it going?</h1>
+      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">${tasksCompleted} tasks in 3 days — that's a great start, ${firstName}</h1>
       <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
-        You've been using Vercro for a few days now. I'd love to know what you think — what's working well, what's confusing, what's missing.
+        You're one of our most active early users and that means a lot — the people who tick off tasks regularly are the ones who get the best harvests at the end of the season.
       </p>
-      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 32px;">
-        Just hit reply and tell me — I read every response personally.
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 24px;">
+        Quick question — what made you sign up? Was it a specific problem you were trying to solve? I'm building Vercro to fix real gardening frustrations and hearing from engaged users like you directly shapes what we build next.
       </p>
-      <div style="background:#f4f8f2;border-radius:12px;padding:20px 24px;margin-bottom:32px;border-left:3px solid #2F5D50;">
-        <p style="font-size:14px;color:#2F5D50;font-weight:700;margin:0 0 4px;">A couple of things worth knowing:</p>
-        <ul style="font-size:14px;color:#4a4a4a;line-height:1.7;margin:8px 0 0;padding-left:20px;">
-          <li>You can add more crops from the Crops tab</li>
-          <li>Your daily tasks update every morning based on your garden</li>
-          <li>Tap any task to complete it and track your progress</li>
-        </ul>
-      </div>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 32px;">Just hit reply — I read everything personally.</p>
       <div style="text-align:center;margin-bottom:16px;">
-        <a href="${APP_URL}" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">
-          Open my garden →
-        </a>
+        <a href="${APP_URL}" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">Keep growing →</a>
       </div>
     </div>
     <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
@@ -152,10 +143,10 @@ function templateFeedbackDay3(name) {
   };
 }
 
-function templateFeedbackDay7(name) {
+function templateFeedbackDay3Quiet(name) {
   const firstName = name ? name.split(" ")[0] : "there";
   return {
-    subject: "A week in — what do you think of Vercro?",
+    subject: "Getting started with Vercro — anything I can help with?",
     html: `
 <!DOCTYPE html>
 <html>
@@ -167,21 +158,94 @@ function templateFeedbackDay7(name) {
       <div style="font-family:Georgia,serif;font-size:24px;font-weight:700;color:#ffffff;">Vercro</div>
     </div>
     <div style="padding:40px;">
-      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">One week with Vercro, ${firstName}</h1>
+      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">Hey ${firstName} — getting on OK with Vercro?</h1>
       <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
-        It's been a week since you joined. I hope the daily tasks and reminders have been useful — we're still in early beta and your feedback directly shapes what we build next.
+        You signed up a few days ago and I just wanted to check in. Sometimes the app takes a few minutes to click — especially once you've added your crops and seen your first daily task list.
+      </p>
+      <div style="background:#f4f8f2;border-radius:12px;padding:16px 20px;margin-bottom:24px;border-left:3px solid #2F5D50;">
+        <p style="font-size:13px;color:#2F5D50;font-weight:700;margin:0 0 8px;">If you haven't already, try this:</p>
+        <p style="font-size:13px;color:#4a4a4a;line-height:1.7;margin:0;">Go to the Crops tab → Add a crop you're growing → Come back to the dashboard. Your personalised task list will appear straight away.</p>
+      </div>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 32px;">If something isn't working or feels confusing, just hit reply — I'll help you get set up.</p>
+      <div style="text-align:center;margin-bottom:16px;">
+        <a href="${APP_URL}" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">Open my garden →</a>
+      </div>
+    </div>
+    <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
+      <p style="font-size:12px;color:#888;margin:0;">Mark · Founder of Vercro · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
+    </div>
+  </div>
+</body>
+</html>`,
+  };
+}
+
+function templateFeedbackDay7Active(name, tasksCompleted) {
+  const firstName = name ? name.split(" ")[0] : "there";
+  return {
+    subject: `A week in and ${tasksCompleted} tasks done — what do you think?`,
+    html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f8f2;font-family:Georgia,serif;">
+  <div style="max-width:560px;margin:40px auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 2px 16px rgba(47,93,80,0.08);">
+    <div style="background:#2F5D50;padding:32px 40px;text-align:center;">
+      <div style="font-size:32px;margin-bottom:8px;">🌱</div>
+      <div style="font-family:Georgia,serif;font-size:24px;font-weight:700;color:#ffffff;">Vercro</div>
+    </div>
+    <div style="padding:40px;">
+      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">One week, ${tasksCompleted} tasks — your garden is in good hands, ${firstName}</h1>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
+        You've been one of our most consistent users this week. That's exactly the habit that makes the difference — small actions compounding over the season.
       </p>
       <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 24px;">
-        Two quick questions — just hit reply:
+        Two quick questions — reply with whatever comes to mind:
       </p>
       <div style="background:#f4f8f2;border-radius:12px;padding:20px 24px;margin-bottom:32px;">
-        <p style="font-size:15px;color:#1a1a1a;font-weight:700;margin:0 0 8px;">1. What's the one thing Vercro does that you find most useful?</p>
-        <p style="font-size:15px;color:#1a1a1a;font-weight:700;margin:0;">2. What's the one thing that's missing or frustrating?</p>
+        <p style="font-size:15px;color:#1a1a1a;font-weight:700;margin:0 0 8px;">1. What's the single most useful thing Vercro does for you?</p>
+        <p style="font-size:15px;color:#1a1a1a;font-weight:700;margin:0;">2. What's the one thing you wish it did that it doesn't yet?</p>
       </div>
       <div style="text-align:center;margin-bottom:16px;">
-        <a href="${APP_URL}" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">
-          Open my garden →
-        </a>
+        <a href="${APP_URL}" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">Open my garden →</a>
+      </div>
+    </div>
+    <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
+      <p style="font-size:12px;color:#888;margin:0;">Mark · Founder of Vercro · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
+    </div>
+  </div>
+</body>
+</html>`,
+  };
+}
+
+function templateFeedbackDay7Quiet(name) {
+  const firstName = name ? name.split(" ")[0] : "there";
+  return {
+    subject: "A week in — is Vercro working for you?",
+    html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f8f2;font-family:Georgia,serif;">
+  <div style="max-width:560px;margin:40px auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 2px 16px rgba(47,93,80,0.08);">
+    <div style="background:#2F5D50;padding:32px 40px;text-align:center;">
+      <div style="font-size:32px;margin-bottom:8px;">🌱</div>
+      <div style="font-family:Georgia,serif;font-size:24px;font-weight:700;color:#ffffff;">Vercro</div>
+    </div>
+    <div style="padding:40px;">
+      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">Hey ${firstName} — honest question</h1>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
+        It's been a week since you joined Vercro. I noticed you haven't used it much yet — and I'd genuinely like to know why, because it helps me make it better.
+      </p>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 24px;">
+        Was it confusing to get started? Not relevant to what you're growing? Or just bad timing? No wrong answers — hit reply and tell me.
+      </p>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 32px;">
+        If you'd like another go, your garden is still there. Add a couple of crops and see your personalised plan — it usually clicks at that point.
+      </p>
+      <div style="text-align:center;margin-bottom:16px;">
+        <a href="${APP_URL}" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">Give it another go →</a>
       </div>
     </div>
     <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
@@ -312,6 +376,16 @@ async function runFeedbackSequence(supabase) {
   const userMap = {};
   (users || []).forEach(u => { userMap[u.id] = u; });
 
+  // Get task completion counts per user
+  const { data: taskCounts } = await supabase
+    .from("tasks")
+    .select("user_id")
+    .not("completed_at", "is", null);
+  const completedMap = {};
+  (taskCounts || []).forEach(t => {
+    completedMap[t.user_id] = (completedMap[t.user_id] || 0) + 1;
+  });
+
   const { data: alreadySent } = await supabase
     .from("email_log")
     .select("user_id, email_type");
@@ -331,30 +405,34 @@ async function runFeedbackSequence(supabase) {
     const createdAt  = new Date(user.created_at).getTime();
     const daysSince  = (now - createdAt) / 86400000;
     const userSent   = sentMap[profile.id] || new Set();
+    const tasksCompleted = completedMap[profile.id] || 0;
+    const isActive = tasksCompleted >= 3; // completed 3+ tasks = engaged user
 
-    // Day 3 email
+    // Day 3 email — different tone for active vs quiet users
     if (daysSince >= 3 && daysSince < 4 && !userSent.has("feedback_day3")) {
-      const result = await sendEmail(user.email, templateFeedbackDay3(profile.name));
+      const template = isActive
+        ? templateFeedbackDay3Active(profile.name, tasksCompleted)
+        : templateFeedbackDay3Quiet(profile.name);
+      const result = await sendEmail(user.email, template);
       if (result.sent) {
         await supabase.from("email_log").insert({
-          user_id:    profile.id,
-          email:      user.email,
-          email_type: "feedback_day3",
-          sent_at:    new Date().toISOString(),
+          user_id: profile.id, email: user.email,
+          email_type: "feedback_day3", sent_at: new Date().toISOString(),
         });
         sent++;
       }
     }
 
-    // Day 7 email
+    // Day 7 email — different tone for active vs quiet users
     if (daysSince >= 7 && daysSince < 8 && !userSent.has("feedback_day7")) {
-      const result = await sendEmail(user.email, templateFeedbackDay7(profile.name));
+      const template = isActive
+        ? templateFeedbackDay7Active(profile.name, tasksCompleted)
+        : templateFeedbackDay7Quiet(profile.name);
+      const result = await sendEmail(user.email, template);
       if (result.sent) {
         await supabase.from("email_log").insert({
-          user_id:    profile.id,
-          email:      user.email,
-          email_type: "feedback_day7",
-          sent_at:    new Date().toISOString(),
+          user_id: profile.id, email: user.email,
+          email_type: "feedback_day7", sent_at: new Date().toISOString(),
         });
         sent++;
       }
