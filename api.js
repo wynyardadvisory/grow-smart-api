@@ -986,19 +986,22 @@ app.post("/areas/:id/suggestions/generate", requireAuth, async (req, res) => {
   if (!area || area.locations?.user_id !== req.user.id)
     return res.status(403).json({ error: "Not authorised" });
 
-  // Check area is actually empty — planned crops don't count
+  // Get active crops in this area (planned don't count as "active")
   const { data: activeCrops } = await db.from("crop_instances")
-    .select("id").eq("area_id", req.params.id).eq("active", true)
+    .select("id, name, variety, status").eq("area_id", req.params.id).eq("active", true)
     .not("status", "eq", "harvested")
     .not("status", "eq", "planned");
-  if (activeCrops?.length > 0)
-    return res.status(400).json({ error: "Area is not empty" });
 
-  // Check suggestions don't already exist — if they do, return them instead of erroring
-  const { data: existing } = await db.from("planting_suggestions")
-    .select("*").eq("area_id", req.params.id).single();
-  if (existing)
-    return res.json({ suggestions: existing.suggestions, generated_at: existing.generated_at });
+  const isEmptyBed = !activeCrops?.length;
+
+  // For populated beds, always regenerate companion suggestions (don't cache — crops change)
+  // For empty beds, return cached suggestions if they exist
+  if (isEmptyBed) {
+    const { data: existing } = await db.from("planting_suggestions")
+      .select("*").eq("area_id", req.params.id).single();
+    if (existing)
+      return res.json({ suggestions: existing.suggestions, generated_at: existing.generated_at });
+  }
 
   // Get crop history for this area
   const { data: history } = await db.from("crop_instances")
@@ -1021,9 +1024,15 @@ app.post("/areas/:id/suggestions/generate", requireAuth, async (req, res) => {
   const currentStr = allCrops?.length
     ? [...new Set(allCrops.map(c => c.name))].join(", ")
     : "nothing currently";
+  const currentBedStr = activeCrops?.length
+    ? activeCrops.map(c => `${c.name}${c.variety ? " (" + c.variety + ")" : ""}`).join(", ")
+    : null;
 
   try {
-    const prompt = `You are a UK horticultural expert advising a home grower or allotment holder.
+    let prompt;
+
+    if (isEmptyBed) {
+      prompt = `You are a UK horticultural expert advising a home grower or allotment holder.
 
 Area details:
 - Type: ${areaType}
@@ -1066,6 +1075,49 @@ Respond ONLY with a JSON array of exactly 3 items — no markdown, no explanatio
 ]
 
 The prep suggestion can be: soil enrichment (compost, manure, green manure), a companion plant (marigolds, nasturtiums, borage), or seasonal ground prep. Pick the most relevant given rotation history and season.`;
+    } else {
+      prompt = `You are a UK horticultural expert advising a home grower or allotment holder.
+
+This bed already has crops growing in it. Suggest companion plants and beneficial additions that will help the existing crops thrive.
+
+Area details:
+- Type: ${areaType}
+- Location postcode: ${postcode}
+- Current month: ${month}
+- Currently growing in this bed: ${currentBedStr}
+- Also growing elsewhere in their garden: ${currentStr}
+
+Return exactly 3 companion/beneficial suggestions. These should be plants that can be interplanted or grown nearby to benefit the existing crops — companions, pest deterrents, pollinator attractors, or beneficial herbs.
+
+Respond ONLY with a JSON array of exactly 3 items — no markdown, no explanation:
+[
+  {
+    "type": "companion",
+    "crop": "Companion plant name",
+    "variety": "Specific variety if relevant, or null",
+    "reason": "One sentence explaining which existing crop this helps and how",
+    "sow_note": "When and how to add this companion in one sentence",
+    "companion_note": "The specific benefit e.g. repels aphids, attracts pollinators, fixes nitrogen"
+  },
+  {
+    "type": "companion",
+    "crop": "Companion plant name",
+    "variety": "Specific variety or null",
+    "reason": "One sentence why this companion suits the existing crops",
+    "sow_note": "When and how to add in one sentence",
+    "companion_note": "The specific benefit"
+  },
+  {
+    "type": "beneficial",
+    "crop": "Beneficial plant or amendment",
+    "variety": null,
+    "reason": "One sentence why this is beneficial for this bed right now",
+    "sow_note": "How and where to add it",
+    "companion_note": "The specific benefit"
+  }
+]
+
+Focus on plants that are easy to find as plugs or seeds in the UK and realistic to add in ${month}.`;
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -1087,14 +1139,16 @@ The prep suggestion can be: soil enrichment (compost, manure, green manure), a c
     if (!match) throw new Error("No JSON array in response");
     const suggestions = JSON.parse(match[0]);
 
-    // Store suggestions
-    await db.from("planting_suggestions").upsert({
-      area_id:      req.params.id,
-      suggestions,
-      generated_at: new Date().toISOString(),
-    }, { onConflict: "area_id" });
+    // Only cache suggestions for empty beds — companion suggestions are dynamic
+    if (isEmptyBed) {
+      await db.from("planting_suggestions").upsert({
+        area_id:      req.params.id,
+        suggestions,
+        generated_at: new Date().toISOString(),
+      }, { onConflict: "area_id" });
+    }
 
-    res.json({ suggestions, generated_at: new Date().toISOString() });
+    res.json({ suggestions, generated_at: new Date().toISOString(), is_companion: !isEmptyBed });
   } catch (e) {
     console.error("[Suggestions] Error:", e.message);
     res.status(500).json({ error: e.message });
