@@ -1,3 +1,8 @@
 {
-  "crons": []
+  "rewrites": [{ "source": "/(.*)", "destination": "/api/index.js" }],
+  "crons": [
+    { "path": "/cron/daily", "schedule": "0 6 * * *" },
+    { "path": "/cron/push-morning", "schedule": "30 7 * * *" },
+    { "path": "/cron/push-evening", "schedule": "0 18 * * *" }
+  ]
 }
