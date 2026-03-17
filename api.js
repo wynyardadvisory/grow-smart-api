@@ -2169,13 +2169,19 @@ app.get("/dashboard", requireAuth, async (req, res) => {
 
   // ── Missing data prompts ──────────────────────────────────────────────────
   const missingData = crops
-    .filter(c => (!c.variety_id && !c.variety) || (!c.sown_date && c.status !== "planned" && !c.crop_def?.is_perennial))
+    .filter(c => {
+      // Never flag planned crops — they haven't been sown yet, missing data is expected
+      if (c.status === "planned") return false;
+      const missingVariety  = !c.variety_id && !c.variety;
+      const missingSowDate  = !c.sown_date && !c.crop_def?.is_perennial;
+      return missingVariety || missingSowDate;
+    })
     .map(c => ({
       id:      c.id,
       name:    c.name,
       missing: [
         (!c.variety_id && !c.variety) && "variety not set",
-        (!c.sown_date && c.status !== "planned" && !c.crop_def?.is_perennial) && "sow date not recorded yet"
+        (!c.sown_date && !c.crop_def?.is_perennial) && "sow date not recorded yet"
       ].filter(Boolean),
     }));
 
