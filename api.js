@@ -32,6 +32,7 @@ require("dotenv").config();
 
 const { RuleEngine } = require("./rule-engine");
 const { runNotificationsForUser } = require("./notifications");
+const { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence } = require("./emails");
 
 // ── Supabase (service role — server only) ─────────────────────────────────────
 const supabaseService = createClient(
@@ -2806,15 +2807,44 @@ app.post("/notifications/test", requireAuth, requireAdmin, async (req, res) => {
 });
 
 // =============================================================================
+// EMAIL SEQUENCES
+// =============================================================================
+
+app.post("/cron/nudge-unactivated", async (req, res) => {
+  const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
+  if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  try {
+    const result = await runNudgeUnactivated(supabaseService);
+    res.json({ ok: true, ...result });
+  } catch(e) { console.error("[NudgeUnactivated]", e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post("/cron/nudge-unconfirmed", async (req, res) => {
+  const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
+  if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  try {
+    const result = await runNudgeUnconfirmed(supabaseService);
+    res.json({ ok: true, ...result });
+  } catch(e) { console.error("[NudgeUnconfirmed]", e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post("/cron/feedback-sequence", async (req, res) => {
+  const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
+  if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  try {
+    const result = await runFeedbackSequence(supabaseService);
+    res.json({ ok: true, ...result });
+  } catch(e) { console.error("[FeedbackSequence]", e.message); res.status(500).json({ error: e.message }); }
+});
+
+// =============================================================================
 // CRON — called by Vercel Cron at 06:00 UTC daily
 // Protected by CRON_SECRET header.
 // Configure in vercel.json: { "crons": [{ "path": "/cron/daily", "schedule": "0 6 * * *" }] }
 // =============================================================================
 
 app.post("/cron/daily", async (req, res) => {
-  const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET ||
-                   req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
-  if (!cronAuth) {
+  if (req.headers["x-cron-secret"] !== process.env.CRON_SECRET) {
     return res.status(403).json({ error: "Forbidden" });
   }
   const { data: profiles } = await supabaseService.from("profiles").select("id");
