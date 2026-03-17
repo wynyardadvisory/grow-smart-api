@@ -1,5 +1,11 @@
 {
-  "rewrites": [{ "source": "/(.*)", "destination": "/api/index.js" }],
+  "version": 2,
+  "builds": [
+    { "src": "api.js", "use": "@vercel/node" }
+  ],
+  "routes": [
+    { "src": "/(.*)", "dest": "api.js" }
+  ],
   "crons": [
     { "path": "/cron/daily", "schedule": "0 6 * * *" },
     { "path": "/cron/push-morning", "schedule": "30 7 * * *" },
