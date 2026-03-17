@@ -2775,14 +2775,14 @@ app.post("/cron/push-morning", async (req, res) => {
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
   try {
     const { data: profiles } = await supabaseService.from("profiles").select("id");
-    if (!profiles?.length) return res.json({ processed: 0 });
-    res.json({ ok: true, queued: profiles.length });
+    if (!profiles?.length) return res.json({ processed: 0, sent: 0 });
     let sent = 0;
     for (const p of profiles) {
       try { const result = await runNotificationsForUser(supabaseService, p.id, "morning"); if (result.sent > 0) sent++; } catch(e) { console.error(`[PushMorning] ${p.id}:`, e.message); }
     }
     console.log(`[PushMorning] Sent to ${sent}/${profiles.length} users`);
-  } catch(e) { console.error("[PushMorning]", e.message); }
+    res.json({ ok: true, processed: profiles.length, sent });
+  } catch(e) { console.error("[PushMorning]", e.message); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/cron/push-evening", async (req, res) => {
@@ -2790,14 +2790,14 @@ app.post("/cron/push-evening", async (req, res) => {
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
   try {
     const { data: profiles } = await supabaseService.from("profiles").select("id");
-    if (!profiles?.length) return res.json({ processed: 0 });
-    res.json({ ok: true, queued: profiles.length });
+    if (!profiles?.length) return res.json({ processed: 0, sent: 0 });
     let sent = 0;
     for (const p of profiles) {
       try { const result = await runNotificationsForUser(supabaseService, p.id, "evening"); if (result.sent > 0) sent++; } catch(e) { console.error(`[PushEvening] ${p.id}:`, e.message); }
     }
     console.log(`[PushEvening] Sent to ${sent}/${profiles.length} users`);
-  } catch(e) { console.error("[PushEvening]", e.message); }
+    res.json({ ok: true, processed: profiles.length, sent });
+  } catch(e) { console.error("[PushEvening]", e.message); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/notifications/test", requireAuth, requireAdmin, async (req, res) => {
