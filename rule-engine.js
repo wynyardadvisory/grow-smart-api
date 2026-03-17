@@ -1334,6 +1334,18 @@ class RuleEngine {
       .eq("user_id", userId).eq("active", true).eq("enriched", true);
     return data || [];
   }
+
+  async _loadRecentObservations(userId) {
+    if (!this.supabase) return [];
+    const since = new Date(Date.now() - 30 * 86400000).toISOString().split("T")[0];
+    const { data } = await this.supabase
+      .from("observation_logs")
+      .select("id, crop_id, observation_type, symptom_code, severity, observed_at, resolved_at")
+      .eq("user_id", userId)
+      .gte("observed_at", since)
+      .order("observed_at", { ascending: false });
+    return data || [];
+  }
 }
 
 module.exports = { RuleEngine, buildCropContext, resolveEffectiveValues: buildCropContext, inferStage: () => {}, daysSince };
