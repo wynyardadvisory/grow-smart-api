@@ -1118,6 +1118,7 @@ Respond ONLY with a JSON array of exactly 3 items — no markdown, no explanatio
 ]
 
 Focus on plants that are easy to find as plugs or seeds in the UK and realistic to add in ${month}.`;
+    }
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
