@@ -365,4 +365,157 @@ async function runFeedbackSequence(supabase) {
   return { sent };
 }
 
-module.exports = { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence };
+function templateWaitlistInvite(name) {
+  const firstName = name ? name.split(" ")[0] : "there";
+  return {
+    subject: "You're in — welcome to Vercro 🌱",
+    html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f8f2;font-family:Georgia,serif;">
+  <div style="max-width:560px;margin:40px auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 2px 16px rgba(47,93,80,0.08);">
+    <div style="background:#2F5D50;padding:32px 40px;text-align:center;">
+      <div style="font-size:32px;margin-bottom:8px;">🌱</div>
+      <div style="font-family:Georgia,serif;font-size:24px;font-weight:700;color:#ffffff;">Vercro</div>
+    </div>
+    <div style="padding:40px;">
+      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">You're in, ${firstName}!</h1>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
+        Your place on the Vercro beta is ready. Create your free account and we'll build you a personalised growing plan based on your crops, your postcode and the time of year.
+      </p>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 32px;">
+        Daily tasks, harvest forecasts, frost alerts, AI crop identification — all in one place, built for UK growers.
+      </p>
+      <div style="text-align:center;margin-bottom:24px;">
+        <a href="https://app.vercro.com" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">
+          Create my free account →
+        </a>
+      </div>
+      <div style="background:#f4f8f2;border-radius:12px;padding:16px 20px;margin-bottom:24px;">
+        <p style="font-size:13px;color:#2F5D50;font-weight:700;margin:0 0 8px;">Getting started takes 2 minutes:</p>
+        <p style="font-size:13px;color:#4a4a4a;line-height:1.6;margin:0;">1. Create your account<br>2. Add your crops<br>3. Get your personalised plan</p>
+      </div>
+      <p style="font-size:13px;color:#888;text-align:center;margin:0;">No cost · No payment details · Free beta access</p>
+    </div>
+    <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
+      <p style="font-size:12px;color:#888;margin:0;">Mark · Founder of Vercro · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
+    </div>
+  </div>
+</body>
+</html>`,
+  };
+}
+
+function templateWaitlistNudge(name) {
+  const firstName = name ? name.split(" ")[0] : "there";
+  return {
+    subject: `Still waiting for you, ${firstName} 🌱`,
+    html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f8f2;font-family:Georgia,serif;">
+  <div style="max-width:560px;margin:40px auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 2px 16px rgba(47,93,80,0.08);">
+    <div style="background:#2F5D50;padding:32px 40px;text-align:center;">
+      <div style="font-size:32px;margin-bottom:8px;">🌱</div>
+      <div style="font-family:Georgia,serif;font-size:24px;font-weight:700;color:#ffffff;">Vercro</div>
+    </div>
+    <div style="padding:40px;">
+      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">Hey ${firstName} — your garden is waiting</h1>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
+        We sent you an invite to Vercro a few days ago but haven't seen you inside yet. Your spot is still reserved — it only takes 2 minutes to get set up.
+      </p>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 32px;">
+        With the growing season getting started, now's the perfect time to get your garden plan in place.
+      </p>
+      <div style="text-align:center;margin-bottom:24px;">
+        <a href="https://app.vercro.com" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">
+          Set up my garden →
+        </a>
+      </div>
+      <p style="font-size:13px;color:#888;text-align:center;margin:0;">Free to use · No payment needed</p>
+    </div>
+    <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
+      <p style="font-size:12px;color:#888;margin:0;">Mark · Founder of Vercro · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
+    </div>
+  </div>
+</body>
+</html>`,
+  };
+}
+
+async function runWaitlistInvites(supabase) {
+  // Send invite to accepted waitlist members who haven't had one yet
+  const { data: pending } = await supabase
+    .from("waitlist")
+    .select("id, email, name")
+    .eq("status", "accepted")
+    .is("invite_sent_at", null);
+
+  if (!pending?.length) return { sent: 0, skipped: 0 };
+
+  let sent = 0, skipped = 0;
+  for (const person of pending) {
+    const result = await sendEmail(person.email, templateWaitlistInvite(person.name));
+    if (result.sent) {
+      await supabase.from("waitlist")
+        .update({
+          invite_sent_at: new Date().toISOString(),
+          nudge_count:    0,
+        })
+        .eq("id", person.id);
+      sent++;
+    } else {
+      skipped++;
+    }
+  }
+
+  console.log(`[WaitlistInvites] Sent: ${sent}, Skipped: ${skipped}`);
+  return { sent, skipped };
+}
+
+async function runWaitlistNudges(supabase) {
+  // Nudge people who got an invite 3+ days ago but never signed up (not in auth.users)
+  const threeDaysAgo = new Date(Date.now() - 3 * 86400000).toISOString();
+  const { data: invited } = await supabase
+    .from("waitlist")
+    .select("id, email, name, invite_sent_at, nudge_count")
+    .eq("status", "accepted")
+    .not("invite_sent_at", "is", null)
+    .lte("invite_sent_at", threeDaysAgo)
+    .lt("nudge_count", 1); // only nudge once
+
+  if (!invited?.length) return { sent: 0, skipped: 0 };
+
+  // Get all auth user emails so we can skip people who already signed up
+  const { data: { users } } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+  const signedUpEmails = new Set((users || []).map(u => u.email?.toLowerCase()));
+
+  let sent = 0, skipped = 0;
+  for (const person of invited) {
+    // Skip if they already created an account
+    if (signedUpEmails.has(person.email?.toLowerCase())) {
+      skipped++;
+      continue;
+    }
+
+    const result = await sendEmail(person.email, templateWaitlistNudge(person.name));
+    if (result.sent) {
+      await supabase.from("waitlist")
+        .update({
+          nudge_count:   (person.nudge_count || 0) + 1,
+          last_nudge_at: new Date().toISOString(),
+        })
+        .eq("id", person.id);
+      sent++;
+    } else {
+      skipped++;
+    }
+  }
+
+  console.log(`[WaitlistNudges] Sent: ${sent}, Skipped: ${skipped}`);
+  return { sent, skipped };
+}
+
+module.exports = { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges };

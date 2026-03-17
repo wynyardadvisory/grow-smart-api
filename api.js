@@ -32,7 +32,7 @@ require("dotenv").config();
 
 const { RuleEngine } = require("./rule-engine");
 const { runNotificationsForUser } = require("./notifications");
-const { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence } = require("./emails");
+const { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges } = require("./emails");
 
 // ── Supabase (service role — server only) ─────────────────────────────────────
 const supabaseService = createClient(
@@ -2835,6 +2835,24 @@ app.post("/cron/feedback-sequence", async (req, res) => {
     const result = await runFeedbackSequence(supabaseService);
     res.json({ ok: true, ...result });
   } catch(e) { console.error("[FeedbackSequence]", e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post("/cron/waitlist-invites", async (req, res) => {
+  const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
+  if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  try {
+    const result = await runWaitlistInvites(supabaseService);
+    res.json({ ok: true, ...result });
+  } catch(e) { console.error("[WaitlistInvites]", e.message); res.status(500).json({ error: e.message }); }
+});
+
+app.post("/cron/waitlist-nudges", async (req, res) => {
+  const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
+  if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  try {
+    const result = await runWaitlistNudges(supabaseService);
+    res.json({ ok: true, ...result });
+  } catch(e) { console.error("[WaitlistNudges]", e.message); res.status(500).json({ error: e.message }); }
 });
 
 // =============================================================================
