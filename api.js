@@ -30,7 +30,7 @@ const { createClient } = require("@supabase/supabase-js");
 const { body, validationResult } = require("express-validator");
 require("dotenv").config();
 
-const { RuleEngine } = require("./rule-engine");
+const { RuleEngine, buildCropContext, daysSince } = require("./rule-engine");
 const { runNotificationsForUser } = require("./notifications");
 
 // ── Supabase (service role — server only) ─────────────────────────────────────
@@ -524,6 +524,240 @@ Use null for any fields you don't have reliable data for. All month values are i
 }
 
 // =============================================================================
+// CROP TIMELINE BUILDER
+// Generates a timeline payload for a crop instance based on lifecycle model.
+// Uses stage boundaries from rule engine context, actual dates from crop record,
+// and observations to override predicted dates.
+// =============================================================================
+
+const TIMELINE_STAGES = ["planned","sown","seedling","vegetative","flowering","fruiting","harvesting","finished"];
+
+const STAGE_LABEL_MAP = {
+  planned:    "Planned",
+  sown:       "Sown",
+  seedling:   "Seedling",
+  vegetative: "Vegetative growth",
+  flowering:  "Flowering",
+  fruiting:   "Fruit set",
+  harvesting: "Harvest window",
+  finished:   "Finished",
+};
+
+const STAGE_DESCRIPTION_MAP = {
+  planned:    "This crop is waiting to be sown or planted.",
+  sown:       "Seeds or plants are in the ground and establishing.",
+  seedling:   "Your crop is germinating and producing its first true leaves.",
+  vegetative: "Your crop is building strong leaves and roots — its main growth phase.",
+  flowering:  "Flowers are opening. Pollinators are important right now.",
+  fruiting:   "Fruit, pods or edible growth should be forming after flowers.",
+  harvesting: "Your crop should be approaching harvest. Check regularly for ripeness.",
+  finished:   "This crop has completed its season.",
+};
+
+// Observation symptom codes that confirm a stage
+const OBS_STAGE_CONFIRM = {
+  seedling_emerged:      "seedling",
+  vegetative_confirmed:  "vegetative",
+  flowering_confirmed:   "flowering",
+  fruit_set_confirmed:   "fruiting",
+  harvest_started:       "harvesting",
+};
+
+function formatTimelineDate(dateStr) {
+  if (!dateStr) return null;
+  const d = new Date(dateStr);
+  return d.toLocaleDateString("en-GB", { day: "numeric", month: "long" });
+}
+
+function addDaysLocal(dateStr, n) {
+  const d = new Date(dateStr);
+  d.setDate(d.getDate() + n);
+  return d.toISOString().split("T")[0];
+}
+
+function buildCropTimeline(crop, observations = []) {
+  const def     = crop.crop_def || {};
+  const variety = crop.variety  || {};
+  const today   = new Date().toISOString().split("T")[0];
+
+  const dtm     = variety.days_to_maturity_min ?? def.days_to_maturity_min ?? null;
+  const sowDate = crop.sown_date || crop.transplanted_date || null;
+  const isPerennial = def.is_perennial || false;
+
+  const STAGE_DTM_PERCENT = {
+    seed:       0,
+    seedling:   0.08,
+    vegetative: 0.25,
+    flowering:  0.55,
+    fruiting:   0.70,
+    harvesting: 0.90,
+    finished:   1.10,
+  };
+
+  // Build stage boundary dates from sow date + DTM
+  const stageBoundaries = {};
+  if (sowDate && dtm) {
+    for (const [stage, pct] of Object.entries(STAGE_DTM_PERCENT)) {
+      stageBoundaries[stage] = addDaysLocal(sowDate, Math.round(dtm * pct));
+    }
+  }
+
+  // Map observations to confirmed stage dates
+  const confirmedStageDates = {};
+  let observationOffset = 0; // day shift from confirmed vs predicted
+  for (const obs of (observations || [])) {
+    const stage = OBS_STAGE_CONFIRM[obs.symptom_code];
+    if (stage && obs.observed_at) {
+      confirmedStageDates[stage] = obs.observed_at;
+      // Calculate offset vs predicted for downstream shifting
+      if (stageBoundaries[stage]) {
+        const predicted = new Date(stageBoundaries[stage]).getTime();
+        const actual    = new Date(obs.observed_at).getTime();
+        observationOffset = Math.round((actual - predicted) / 86400000);
+      }
+    }
+  }
+
+  // Explicit date anchors from crop record
+  const explicitDates = {
+    sown:       crop.sown_date || null,
+    seedling:   null,
+    vegetative: null,
+    flowering:  null,
+    fruiting:   null,
+    harvesting: crop.harvested_at || null,
+    finished:   crop.status === "finished" ? today : null,
+    planned:    null,
+  };
+
+  // Determine current stage
+  const currentStage = crop.stage || "seed";
+  const normalised   = currentStage === "seed" ? "sown" : currentStage;
+
+  // Build stages to show — filter to meaningful ones based on crop status
+  let stagesToShow = ["sown","seedling","vegetative","flowering","fruiting","harvesting"];
+  if (crop.status === "planned") stagesToShow = ["planned","sown","vegetative","flowering","fruiting","harvesting"];
+  if (isPerennial) stagesToShow = ["vegetative","flowering","fruiting","harvesting"];
+
+  // For establishment methods other than seed, relabel sown
+  const establishmentLabel = (() => {
+    const method = def.default_establishment || crop.establishment_method || "seed";
+    if (method === "tuber")  return "Tubers planted";
+    if (method === "crown")  return "Crowns planted";
+    if (method === "runner") return "Runners planted";
+    if (method === "cane")   return "Canes planted";
+    return "Sown";
+  })();
+
+  const nodes = stagesToShow.map(stage => {
+    // Resolve date: confirmed obs > explicit crop date > predicted boundary (+ offset)
+    let predictedDate = stageBoundaries[stage] || null;
+
+    // Apply observation offset to downstream stages
+    if (predictedDate && observationOffset !== 0) {
+      const stageIdx     = TIMELINE_STAGES.indexOf(stage);
+      const confirmedIdx = Math.max(...Object.keys(confirmedStageDates).map(s => TIMELINE_STAGES.indexOf(s)));
+      if (stageIdx > confirmedIdx) {
+        predictedDate = addDaysLocal(predictedDate, observationOffset);
+      }
+    }
+
+    // For perennials without sow date, use month-based windows
+    if (isPerennial && !predictedDate) {
+      const year = new Date().getFullYear();
+      const m = {
+        vegetative: def.sow_window_start,
+        flowering:  def.sow_window_start ? def.sow_window_start + 1 : null,
+        fruiting:   def.harvest_month_start ? def.harvest_month_start - 1 : null,
+        harvesting: def.harvest_month_start,
+      }[stage];
+      if (m) predictedDate = `${year}-${String(m).padStart(2,"0")}-01`;
+    }
+
+    const actualDate   = confirmedStageDates[stage] || explicitDates[stage] || null;
+    const displayDate  = actualDate || predictedDate;
+
+    // Determine status
+    let status;
+    if (actualDate || (stage === normalised && crop.status !== "planned")) {
+      const stageIdx   = TIMELINE_STAGES.indexOf(stage);
+      const currentIdx = TIMELINE_STAGES.indexOf(normalised);
+      if (stageIdx < currentIdx)       status = "completed";
+      else if (stageIdx === currentIdx) status = "current";
+      else                              status = "upcoming";
+    } else if (displayDate && displayDate < today) {
+      status = "completed";
+    } else {
+      status = displayDate ? "upcoming" : "upcoming";
+    }
+
+    // Mark planned as completed if crop is past planned
+    if (stage === "planned" && crop.status !== "planned") status = "completed";
+
+    const source = actualDate
+      ? (confirmedStageDates[stage] ? "observation" : "user")
+      : "system";
+
+    return {
+      key:           stage,
+      label:         stage === "sown" ? establishmentLabel : STAGE_LABEL_MAP[stage] || stage,
+      description:   STAGE_DESCRIPTION_MAP[stage] || null,
+      predicted_date: predictedDate,
+      actual_date:   actualDate,
+      display_date:  displayDate,
+      formatted_date: formatTimelineDate(displayDate),
+      status,
+      source,
+      can_confirm:   ["flowering","fruiting","harvesting","seedling"].includes(stage) && status === "upcoming" || status === "current",
+      confirm_symptom_code: {
+        seedling:   "seedling_emerged",
+        vegetative: "vegetative_confirmed",
+        flowering:  "flowering_confirmed",
+        fruiting:   "fruit_set_confirmed",
+        harvesting: "harvest_started",
+      }[stage] || null,
+    };
+  });
+
+  // Harvest window — add start/end if available
+  const harvestNode = nodes.find(n => n.key === "harvesting");
+  if (harvestNode && def.harvest_month_start && def.harvest_month_end) {
+    const year = new Date().getFullYear();
+    const MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    harvestNode.harvest_window_label = `${MONTH_NAMES[def.harvest_month_start-1]} – ${MONTH_NAMES[def.harvest_month_end-1]}`;
+  }
+
+  // Current stage summary
+  const currentNode = nodes.find(n => n.status === "current") || nodes.find(n => n.key === normalised);
+  const nextNode    = nodes.find(n => n.status === "upcoming");
+
+  const summaryText = (() => {
+    const base = STAGE_DESCRIPTION_MAP[normalised] || "Your crop is progressing well.";
+    if (nextNode) {
+      const when = nextNode.formatted_date ? `around ${nextNode.formatted_date}` : "soon";
+      return `${base} ${nextNode.label} is expected ${when}.`;
+    }
+    return base;
+  })();
+
+  const confidence = sowDate && dtm ? "medium"
+    : sowDate ? "low"
+    : "low";
+
+  return {
+    current_stage:       normalised,
+    current_stage_label: STAGE_LABEL_MAP[normalised] || normalised,
+    current_stage_description: summaryText,
+    next_stage:          nextNode?.key || null,
+    next_stage_label:    nextNode?.label || null,
+    next_stage_date:     nextNode?.formatted_date || null,
+    confidence,
+    observation_offset_days: observationOffset,
+    nodes,
+  };
+}
+
+// =============================================================================
 // CROPS
 // =============================================================================
 
@@ -541,7 +775,15 @@ app.get("/crops/:id", requireAuth, async (req, res) => {
     .select("*, area:area_id(*), crop_def:crop_def_id(*), variety:variety_id(*), tasks(*)")
     .eq("id", req.params.id).eq("user_id", req.user.id).single();
   if (error) return res.status(404).json({ error: "Crop not found" });
-  res.json(data);
+
+  // Load recent observations for timeline adjustment
+  const { data: observations } = await req.db.from("observation_logs")
+    .select("id, crop_id, observation_type, symptom_code, observed_at, resolved_at")
+    .eq("crop_id", req.params.id)
+    .order("observed_at", { ascending: true });
+
+  const timeline = buildCropTimeline(data, observations || []);
+  res.json({ ...data, timeline });
 });
 
 // POST /crops/preview — AI crop profile for confirmation screen
