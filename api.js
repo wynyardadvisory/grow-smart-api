@@ -1516,6 +1516,20 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
       { count: totalVarieties },
       { count: yieldDataPoints },
 
+      // Email sequences
+      { count: emailWaitlistInvites },
+      { count: emailFeedbackDay3 },
+      { count: emailFeedbackDay7 },
+      { count: emailReengageDay14 },
+      { count: emailReengageDay30 },
+      { count: emailDailyFallback },
+
+      // Push
+      { count: pushTokens },
+
+      // Feedback ratings
+      { data: feedbackRatings },
+
     ] = await Promise.all([
       db.from("profiles").select("*", { count: "exact", head: true }),
 
@@ -1530,7 +1544,7 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
       db.from("crop_instances").select("*", { count: "exact", head: true }).eq("status", "harvested"),
       db.from("harvest_log").select("*", { count: "exact", head: true }),
 
-      db.from("tasks").select("*", { count: "exact", head: true }),
+      db.from("tasks").select("*", { count: "exact", head: true }).is("completed_at", null).not("status", "eq", "expired"),
       db.from("tasks").select("*", { count: "exact", head: true }).not("completed_at", "is", null),
 
       db.from("user_feeds").select("*", { count: "exact", head: true }),
@@ -1539,6 +1553,20 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
 
       db.from("varieties").select("*", { count: "exact", head: true }),
       db.from("harvest_log").select("*", { count: "exact", head: true }).not("quantity_value", "is", null),
+
+      // Email sequences
+      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "waitlist_invite"),
+      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "feedback_day3"),
+      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "feedback_day7"),
+      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "reengage_day14"),
+      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "reengage_day30"),
+      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "daily_fallback"),
+
+      // Push tokens
+      db.from("device_push_tokens").select("*", { count: "exact", head: true }).eq("is_active", true),
+
+      // Feedback avg rating
+      db.from("feedback").select("rating").not("rating", "is", null),
     ]);
 
     // Unique active users
@@ -1563,7 +1591,10 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
     const avgCropsPerUser = totalActivated > 0 ? (totalCrops / totalActivated).toFixed(1) : 0;
 
     // Task completion rate
-    const taskCompletionRate = tasksGenerated > 0 ? Math.round((tasksCompleted / tasksGenerated) * 100) : 0;
+    const tasksPending = tasksGenerated || 0; // active incomplete tasks
+    const taskCompletionRate = (tasksPending + tasksCompleted) > 0
+      ? Math.round((tasksCompleted / (tasksPending + tasksCompleted)) * 100)
+      : 0;
 
     // Week on week growth
     const wowGrowth = newSignupsLastWeek > 0 ? Math.round(((newSignupsWeek - newSignupsLastWeek) / newSignupsLastWeek) * 100) : null;
@@ -1596,7 +1627,7 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
       harvestLogs,
 
       // Tasks
-      tasksGenerated,
+      tasksPending,
       tasksCompleted,
       taskCompletionRate,
 
@@ -1612,6 +1643,24 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
       // Dataset
       totalVarieties,
       yieldDataPoints,
+
+      // Email
+      emailWaitlistInvites: emailWaitlistInvites || 0,
+      emailFeedbackDay3:    emailFeedbackDay3    || 0,
+      emailFeedbackDay7:    emailFeedbackDay7    || 0,
+      emailReengageDay14:   emailReengageDay14   || 0,
+      emailReengageDay30:   emailReengageDay30   || 0,
+      emailDailyFallback:   emailDailyFallback   || 0,
+
+      // Push
+      pushTokens: pushTokens || 0,
+      pushOptIn:  totalActivated > 0 ? Math.round((pushTokens / totalActivated) * 100) : 0,
+
+      // Feedback
+      avgRating: feedbackRatings?.length > 0
+        ? (feedbackRatings.reduce((s, f) => s + (f.rating || 0), 0) / feedbackRatings.length).toFixed(1)
+        : null,
+      totalFeedback: feedbackRatings?.length || 0,
     });
   } catch (e) {
     console.error("[Metrics]", e.message);
