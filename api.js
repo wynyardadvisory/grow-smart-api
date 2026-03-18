@@ -32,7 +32,7 @@ require("dotenv").config();
 
 const { RuleEngine } = require("./rule-engine");
 const { runNotificationsForUser } = require("./notifications");
-const { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement } = require("./emails");
+const { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement, runDailyEmailFallback } = require("./emails");
 
 // ── Supabase (service role — server only) ─────────────────────────────────────
 const supabaseService = createClient(
@@ -1836,16 +1836,14 @@ app.get("/dashboard", requireAuth, async (req, res) => {
   // Run expiry only — rule engine runs on cron and crop changes, not every page view
   await expireOverdueTasks(req.user.id, req.db);
 
-  // Start of current week (Monday)
-  const now = new Date();
-  const dayOfWeek = now.getDay(); // 0=Sun, 1=Mon...
-  const daysToMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
-  const weekStart = new Date(now);
-  weekStart.setDate(now.getDate() - daysToMonday);
-  weekStart.setHours(0, 0, 0, 0);
-  const weekStartISO = weekStart.toISOString();
+  // Track last seen — used for email fallback suppression
+  req.db.from("profiles")
+    .update({ last_seen_at: new Date().toISOString() })
+    .eq("id", req.user.id)
+    .then(() => {}).catch(() => {});
 
-  const [tasksRes, cropsRes, profileRes, harvestRes, completedThisWeekRes] = await Promise.all([
+
+  const [tasksRes, cropsRes, profileRes, harvestRes] = await Promise.all([
     req.db.from("tasks")
       .select("*, crop:crop_instance_id(name, variety), area:area_id(name)")
       .eq("user_id", req.user.id).is("completed_at", null)
@@ -1861,17 +1859,11 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       .gte("harvested_at", new Date(new Date().getFullYear(), 0, 1).toISOString().split("T")[0])
       .order("harvested_at", { ascending: false })
       .limit(5),
-    req.db.from("tasks")
-      .select("id", { count: "exact", head: true })
-      .eq("user_id", req.user.id)
-      .not("completed_at", "is", null)
-      .gte("completed_at", weekStartISO),
   ]);
 
   const tasks   = tasksRes.data  || [];
   const crops   = cropsRes.data  || [];
   const profile = profileRes.data;
-  const tasksCompletedThisWeek = completedThisWeekRes.count || 0;
   const year    = new Date().getFullYear();
   const currentMonth = new Date().getMonth() + 1;
 
@@ -1989,7 +1981,6 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     frost_risk:  frostRisk,
     pest_risk:   pestRisk,
     pest_crops:  pestCrops,
-    tasks_completed_this_week: tasksCompletedThisWeek,
   });
 });
 
@@ -2797,7 +2788,10 @@ app.post("/cron/push-morning", async (req, res) => {
       try { const result = await runNotificationsForUser(supabaseService, p.id, "morning"); if (result.sent > 0) sent++; } catch(e) { console.error(`[PushMorning] ${p.id}:`, e.message); }
     }
     console.log(`[PushMorning] Sent to ${sent}/${profiles.length} users`);
-    res.json({ ok: true, processed: profiles.length, sent });
+    // Email fallback — for users with no push token or push disabled
+    const emailResult = await runDailyEmailFallback(supabaseService);
+    console.log(`[EmailFallback] Sent: ${emailResult.sent}, Skipped: ${emailResult.skipped}`);
+    res.json({ ok: true, processed: profiles.length, push_sent: sent, email_sent: emailResult.sent });
   } catch(e) { console.error("[PushMorning]", e.message); res.status(500).json({ error: e.message }); }
 });
 

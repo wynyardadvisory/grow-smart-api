@@ -891,4 +891,250 @@ async function runReengagement(supabase) {
   return { sent };
 }
 
-module.exports = { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement };
+// ── Daily email fallback templates ───────────────────────────────────────────
+
+function templateGardenToday(name, tasks, cropNames) {
+  const firstName = name ? name.split(" ")[0] : "there";
+  const taskCount = tasks.length;
+  const topTasks  = tasks.slice(0, 3);
+  return {
+    subject: `Your garden today 🌱 (${taskCount} thing${taskCount !== 1 ? "s" : ""} to do)`,
+    html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f8f2;font-family:Georgia,serif;">
+  <div style="max-width:560px;margin:40px auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 2px 16px rgba(47,93,80,0.08);">
+    <div style="background:#2F5D50;padding:32px 40px;text-align:center;">
+      <div style="font-size:32px;margin-bottom:8px;">🌱</div>
+      <div style="font-family:Georgia,serif;font-size:24px;font-weight:700;color:#ffffff;">Vercro</div>
+    </div>
+    <div style="padding:40px;">
+      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 8px;">Good morning, ${firstName}</h1>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 24px;">
+        You have <strong>${taskCount} task${taskCount !== 1 ? "s" : ""}</strong> in your garden today.
+      </p>
+      <div style="background:#f4f8f2;border-radius:12px;padding:20px 24px;margin-bottom:28px;">
+        ${topTasks.map(t => `
+        <div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:${topTasks.indexOf(t) < topTasks.length - 1 ? "14px" : "0"};">
+          <div style="width:20px;height:20px;border-radius:50%;background:#2F5D50;flex-shrink:0;margin-top:2px;"></div>
+          <div>
+            <div style="font-size:14px;font-weight:700;color:#1a1a1a;">${t.crop?.name || "Garden task"}</div>
+            <div style="font-size:13px;color:#4a4a4a;line-height:1.5;">${t.action}</div>
+          </div>
+        </div>`).join("")}
+        ${taskCount > 3 ? `<div style="font-size:13px;color:#6E6E6E;margin-top:14px;padding-top:14px;border-top:1px solid #D4E8CE;">+ ${taskCount - 3} more task${taskCount - 3 !== 1 ? "s" : ""} in the app</div>` : ""}
+      </div>
+      <div style="text-align:center;margin-bottom:16px;">
+        <a href="${APP_URL}" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">Open my garden →</a>
+      </div>
+    </div>
+    <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
+      <p style="font-size:12px;color:#888;margin:0;">Vercro · Built for UK growers · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
+    </div>
+  </div>
+</body>
+</html>`,
+  };
+}
+
+function templateGardenEngagement(name, cropNames) {
+  const firstName = name ? name.split(" ")[0] : "there";
+  const cropList  = cropNames.slice(0, 3).join(", ");
+  return {
+    subject: "Your garden's looking good 👌",
+    html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f8f2;font-family:Georgia,serif;">
+  <div style="max-width:560px;margin:40px auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 2px 16px rgba(47,93,80,0.08);">
+    <div style="background:#2F5D50;padding:32px 40px;text-align:center;">
+      <div style="font-size:32px;margin-bottom:8px;">🌱</div>
+      <div style="font-family:Georgia,serif;font-size:24px;font-weight:700;color:#ffffff;">Vercro</div>
+    </div>
+    <div style="padding:40px;">
+      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">Nothing urgent today, ${firstName}</h1>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
+        ${cropList ? `Your ${cropList} ${cropNames.length === 1 ? "is" : "are"} growing well` : "Your garden is on track"} — no pressing tasks today.
+      </p>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 32px;">
+        A quick 2-minute check is always worthwhile — tap in and see how everything's coming along.
+      </p>
+      <div style="text-align:center;margin-bottom:16px;">
+        <a href="${APP_URL}" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">Check my garden →</a>
+      </div>
+    </div>
+    <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
+      <p style="font-size:12px;color:#888;margin:0;">Vercro · Built for UK growers · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
+    </div>
+  </div>
+</body>
+</html>`,
+  };
+}
+
+function templateGardenLapsed(name, cropNames) {
+  const firstName = name ? name.split(" ")[0] : "there";
+  const topCrop   = cropNames[0] || "your garden";
+  return {
+    subject: `${topCrop !== "your garden" ? `Your ${topCrop} needs you 🌱` : "Your garden needs you 🌱"}`,
+    html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f8f2;font-family:Georgia,serif;">
+  <div style="max-width:560px;margin:40px auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 2px 16px rgba(47,93,80,0.08);">
+    <div style="background:#2F5D50;padding:32px 40px;text-align:center;">
+      <div style="font-size:32px;margin-bottom:8px;">🌱</div>
+      <div style="font-family:Georgia,serif;font-size:24px;font-weight:700;color:#ffffff;">Vercro</div>
+    </div>
+    <div style="padding:40px;">
+      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">Hey ${firstName} — been a little while</h1>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
+        ${cropNames.length > 0 ? `Your ${cropNames.slice(0, 2).join(" and ")} ${cropNames.length <= 2 ? "is" : "are"} still growing` : "Your garden is still there"} — and there may be tasks building up that need attention.
+      </p>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 32px;">
+        A quick check-in keeps everything on track. Takes 2 minutes.
+      </p>
+      <div style="text-align:center;margin-bottom:16px;">
+        <a href="${APP_URL}" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">Back to my garden →</a>
+      </div>
+    </div>
+    <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
+      <p style="font-size:12px;color:#888;margin:0;">Vercro · Built for UK growers · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
+    </div>
+  </div>
+</body>
+</html>`,
+  };
+}
+
+// ── Daily email fallback runner ───────────────────────────────────────────────
+// Fires after the morning push cron for users with no push token or push disabled
+// Suppressed if user opened the app in the last 6 hours
+
+async function runDailyEmailFallback(supabase) {
+  const { data: { users } } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+  const userMap = {};
+  (users || []).forEach(u => { userMap[u.id] = u; });
+
+  // Get all profiles with last_seen_at
+  const { data: profiles } = await supabase
+    .from("profiles")
+    .select("id, name, last_seen_at");
+  if (!profiles?.length) return { sent: 0, skipped: 0 };
+
+  // Get users with active push tokens
+  const { data: pushTokens } = await supabase
+    .from("device_push_tokens")
+    .select("user_id")
+    .eq("is_active", true);
+  const hasPush = new Set((pushTokens || []).map(t => t.user_id));
+
+  // Get push preferences
+  const { data: pushPrefs } = await supabase
+    .from("notification_preferences")
+    .select("user_id, push_enabled");
+  const pushEnabled = {};
+  (pushPrefs || []).forEach(p => { pushEnabled[p.user_id] = p.push_enabled; });
+
+  // Get already-sent today
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+  const { data: sentToday } = await supabase
+    .from("email_log")
+    .select("user_id")
+    .eq("email_type", "daily_fallback")
+    .gte("sent_at", todayStart.toISOString());
+  const sentTodayIds = new Set((sentToday || []).map(e => e.user_id));
+
+  // Get today's tasks per user
+  const today = new Date().toISOString().split("T")[0];
+  const { data: dueTasks } = await supabase
+    .from("tasks")
+    .select("user_id, action, task_type, urgency, crop:crop_instance_id(name)")
+    .is("completed_at", null)
+    .lte("due_date", today)
+    .not("status", "eq", "expired");
+  const tasksByUser = {};
+  (dueTasks || []).forEach(t => {
+    if (!tasksByUser[t.user_id]) tasksByUser[t.user_id] = [];
+    tasksByUser[t.user_id].push(t);
+  });
+
+  // Get crops per user for engagement emails
+  const { data: crops } = await supabase
+    .from("crop_instances")
+    .select("user_id, name")
+    .eq("active", true);
+  const cropsByUser = {};
+  (crops || []).forEach(c => {
+    if (!cropsByUser[c.user_id]) cropsByUser[c.user_id] = [];
+    cropsByUser[c.user_id].push(c.name);
+  });
+
+  const now = Date.now();
+  let sent = 0, skipped = 0;
+
+  for (const profile of profiles) {
+    const user = userMap[profile.id];
+    if (!user?.email) { skipped++; continue; }
+
+    // Skip if they have push enabled and a token — push handles them
+    if (hasPush.has(profile.id) && pushEnabled[profile.id] !== false) { skipped++; continue; }
+
+    // Skip if already emailed today
+    if (sentTodayIds.has(profile.id)) { skipped++; continue; }
+
+    // Skip if they opened the app in the last 6 hours
+    if (profile.last_seen_at) {
+      const lastSeen = new Date(profile.last_seen_at).getTime();
+      if (now - lastSeen < 6 * 3600000) { skipped++; continue; }
+    }
+
+    const userTasks   = tasksByUser[profile.id] || [];
+    const userCrops   = cropsByUser[profile.id]  || [];
+    const lastSeenMs  = profile.last_seen_at ? new Date(profile.last_seen_at).getTime() : 0;
+    const daysSinceSeen = lastSeenMs ? (now - lastSeenMs) / 86400000 : 999;
+
+    let template;
+    let emailType;
+
+    if (userTasks.length > 0) {
+      // Has tasks due — send garden today digest
+      template  = templateGardenToday(profile.name, userTasks, userCrops);
+      emailType = "daily_fallback";
+    } else if (daysSinceSeen >= 3) {
+      // Lapsed 3+ days — emotional re-engagement tone
+      template  = templateGardenLapsed(profile.name, userCrops);
+      emailType = "daily_fallback";
+    } else if (daysSinceSeen >= 1) {
+      // Inactive 1-3 days — gentle engagement
+      template  = templateGardenEngagement(profile.name, userCrops);
+      emailType = "daily_fallback";
+    } else {
+      // Active recently, no tasks — skip
+      skipped++;
+      continue;
+    }
+
+    const result = await sendEmail(user.email, template);
+    if (result.sent) {
+      await supabase.from("email_log").insert({
+        user_id:    profile.id,
+        email:      user.email,
+        email_type: emailType,
+        sent_at:    new Date().toISOString(),
+      });
+      sent++;
+    } else {
+      skipped++;
+    }
+  }
+
+  console.log(`[DailyEmailFallback] Sent: ${sent}, Skipped: ${skipped}`);
+  return { sent, skipped };
+}
+
+module.exports = { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement, runDailyEmailFallback };
