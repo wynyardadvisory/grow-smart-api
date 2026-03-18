@@ -870,8 +870,28 @@ class ScheduledRuleEngine {
       // Show harvest task leading up to and during harvest
       const harvestAlertDate = addDays(ctx.estimatedHarvestDate, -LEAD_TIME_DAYS.harvest);
       const today = todayISO();
-      if (withinLookahead(harvestAlertDate, LOOKAHEAD_DAYS.harvest) ||
-          (ctx.estimatedHarvestDate >= addDays(today, -7) && ctx.estimatedHarvestDate <= addDays(today, 14))) {
+
+      // Sanity check: if crop has a defined harvest window, don't fire the task
+      // more than 6 weeks before the window opens. This prevents DTM-based dates
+      // triggering harvest tasks for crops like peppers sown indoors in Jan/Feb
+      // whose DTM expires in March but real harvest isn't until July+.
+      let harvestWindowSuppressed = false;
+      if (ctx.harvestStart) {
+        const currentMonth = new Date().getMonth() + 1;
+        const weeksBeforeWindow = (ctx.harvestStart - currentMonth) * 4.3;
+        if (weeksBeforeWindow > 6) harvestWindowSuppressed = true;
+        // Also handle year wrap (e.g. harvest in Jan/Feb, currently Oct/Nov)
+        if (ctx.harvestStart < currentMonth) {
+          const weeksUntilNextYear = ((12 - currentMonth) + ctx.harvestStart) * 4.3;
+          if (weeksUntilNextYear > 6) harvestWindowSuppressed = true;
+          else harvestWindowSuppressed = false;
+        }
+      }
+
+      if (!harvestWindowSuppressed && (
+        withinLookahead(harvestAlertDate, LOOKAHEAD_DAYS.harvest) ||
+        (ctx.estimatedHarvestDate >= addDays(today, -7) && ctx.estimatedHarvestDate <= addDays(today, 14))
+      )) {
         const scheduledFor = harvestAlertDate < today ? today : harvestAlertDate;
         results.push(candidate(ctx, {
           ruleId:       "harvest_approaching",
@@ -1332,18 +1352,6 @@ class RuleEngine {
       .from("user_feeds")
       .select("id, brand, product_name, form, feed_type, npk, dilution_ml_per_litre, frequency_days, suitable_crop_types, application_method, notes, enriched")
       .eq("user_id", userId).eq("active", true).eq("enriched", true);
-    return data || [];
-  }
-
-  async _loadRecentObservations(userId) {
-    if (!this.supabase) return [];
-    const since = new Date(Date.now() - 30 * 86400000).toISOString().split("T")[0];
-    const { data } = await this.supabase
-      .from("observation_logs")
-      .select("id, crop_id, observation_type, symptom_code, severity, observed_at, resolved_at")
-      .eq("user_id", userId)
-      .gte("observed_at", since)
-      .order("observed_at", { ascending: false });
     return data || [];
   }
 }
