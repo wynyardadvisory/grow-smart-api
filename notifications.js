@@ -74,13 +74,14 @@ async function isRecentlySent(supabase, userId, notificationType, cooldownHours)
 
 // Cooldowns by type (hours)
 const COOLDOWNS = {
-  due_today:      12,
-  weather_alert:  6,
-  pest_alert:     24,
-  crop_check:     72,
-  upcoming:       24,
-  weekly_summary: 168,
-  milestone:      48,
+  due_today:        20,   // effectively once per day — resets well before next morning cron
+  weather_alert:    6,
+  pest_alert:       24,
+  crop_check:       48,   // reduced from 72 — more regular gentle checks
+  upcoming:         24,
+  weekly_summary:   168,
+  milestone:        48,
+  engagement_nudge: 20,   // once per day fallback
 };
 
 // ── Candidate builder ─────────────────────────────────────────────────────────
@@ -311,6 +312,43 @@ async function buildCandidates(supabase, userId, prefs) {
     }
   }
 
+  // ── 7. Engagement nudge — fallback when no action candidates ─────────────
+  // Fires when user has nothing urgent but we still want to keep the habit alive
+  if (prefs.due_today_enabled !== false) {
+    const hasActionCandidate = candidates.some(c =>
+      ["due_today", "upcoming", "weather_alert", "pest_alert"].includes(c.notification_type)
+    );
+
+    if (!hasActionCandidate) {
+      // Get crop count for personalised message
+      const { count: cropCount } = await supabase
+        .from("crop_instances")
+        .select("*", { count: "exact", head: true })
+        .eq("user_id", userId)
+        .eq("active", true);
+
+      const nudgeMessages = [
+        { title: "Garden check-in 🌱",          body: "Nothing urgent today — perfect time for a quick look around." },
+        { title: "Your garden is on track 👌",   body: "No pressing tasks today. Pop in and see how everything's growing." },
+        { title: "Quick garden visit? 🌿",       body: "All quiet today — a 2-minute check keeps things on track." },
+        { title: "Garden looking good 🌱",       body: `${cropCount || "Your"} crop${cropCount !== 1 ? "s are" : " is"} growing — tap to see how they're getting on.` },
+      ];
+
+      const msg = nudgeMessages[new Date().getDay() % nudgeMessages.length];
+
+      candidates.push({
+        notification_type: "engagement_nudge",
+        priority:          "low",
+        title:             msg.title,
+        body:              msg.body,
+        payload: {
+          url:     "/",
+          section: "dashboard",
+        },
+      });
+    }
+  }
+
   return candidates;
 }
 
@@ -323,8 +361,8 @@ async function selectCandidates(supabase, userId, candidates, window) {
   const counter = await getDailyCounter(supabase, userId, today);
   const PRIORITY_RANK = { critical: 4, high: 3, medium: 2, low: 1 };
 
-  // Daily caps
-  const CAPS = { total: 3, critical: 2, high: 1, medium: 1, low: 0 };
+  // Daily caps — low:1 allows engagement nudges, high:2 allows stacking
+  const CAPS = { total: 3, critical: 2, high: 2, medium: 1, low: 1 };
 
   if (counter.total_sent >= CAPS.total) return [];
 
@@ -336,17 +374,20 @@ async function selectCandidates(supabase, userId, candidates, window) {
   );
 
   for (const c of sorted) {
+    // Evening window: skip due_today if we already sent something today (use engagement instead)
+    if (window === "evening" && c.notification_type === "due_today" && counter.total_sent > 0) continue;
+
     // Check daily cap for this priority
     const capKey = `${c.priority}_sent`;
     if ((counter[capKey] || 0) >= (CAPS[c.priority] || 0)) continue;
     if (counter.total_sent + selected.length >= CAPS.total) break;
 
     // Check cooldown
-    const cooldownHours = COOLDOWNS[c.notification_type] || 24;
+    const cooldownHours = COOLDOWNS[c.notification_type] || 20;
     const suppressed = await isRecentlySent(supabase, userId, c.notification_type, cooldownHours);
     if (suppressed && c.priority !== "critical") continue;
 
-    // Check window (morning = due_today/upcoming, evening = alerts)
+    // Window routing
     if (window === "morning" && c.notification_type === "weekly_summary") continue;
     if (window === "evening" && c.notification_type === "due_today" && c.priority !== "high") continue;
 

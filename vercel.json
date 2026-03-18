@@ -8,8 +8,8 @@
   ],
   "crons": [
     { "path": "/cron/daily",              "schedule": "0 6 * * *"  },
-    { "path": "/cron/push-morning",       "schedule": "30 7 * * *" },
-    { "path": "/cron/push-evening",       "schedule": "0 18 * * *" },
+    { "path": "/cron/push-morning",       "schedule": "0 6 * * *"  },
+    { "path": "/cron/push-evening",       "schedule": "0 17 * * *" },
     { "path": "/cron/nudge-unactivated",  "schedule": "0 8 * * *"  },
     { "path": "/cron/nudge-unconfirmed",  "schedule": "0 8 * * *"  },
     { "path": "/cron/feedback-sequence",  "schedule": "0 9 * * *"  },
