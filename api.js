@@ -1836,6 +1836,15 @@ app.get("/dashboard", requireAuth, async (req, res) => {
   // Run expiry only — rule engine runs on cron and crop changes, not every page view
   await expireOverdueTasks(req.user.id, req.db);
 
+  // Start of current week (Monday)
+  const nowDate    = new Date();
+  const dayOfWeek  = nowDate.getDay();
+  const daysToMon  = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+  const weekStart  = new Date(nowDate);
+  weekStart.setDate(nowDate.getDate() - daysToMon);
+  weekStart.setHours(0, 0, 0, 0);
+  const weekStartISO = weekStart.toISOString();
+
   // Track last seen — used for email fallback suppression
   req.db.from("profiles")
     .update({ last_seen_at: new Date().toISOString() })
@@ -1843,7 +1852,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     .then(() => {}).catch(() => {});
 
 
-  const [tasksRes, cropsRes, profileRes, harvestRes] = await Promise.all([
+  const [tasksRes, cropsRes, profileRes, harvestRes, completedThisWeekRes] = await Promise.all([
     req.db.from("tasks")
       .select("*, crop:crop_instance_id(name, variety), area:area_id(name)")
       .eq("user_id", req.user.id).is("completed_at", null)
@@ -1859,11 +1868,17 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       .gte("harvested_at", new Date(new Date().getFullYear(), 0, 1).toISOString().split("T")[0])
       .order("harvested_at", { ascending: false })
       .limit(5),
+    req.db.from("tasks")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", req.user.id)
+      .not("completed_at", "is", null)
+      .gte("completed_at", weekStartISO),
   ]);
 
   const tasks   = tasksRes.data  || [];
   const crops   = cropsRes.data  || [];
   const profile = profileRes.data;
+  const tasksCompletedThisWeek = completedThisWeekRes.count || 0;
   const year    = new Date().getFullYear();
   const currentMonth = new Date().getMonth() + 1;
 
@@ -1981,6 +1996,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     frost_risk:  frostRisk,
     pest_risk:   pestRisk,
     pest_crops:  pestCrops,
+    tasks_completed_this_week: tasksCompletedThisWeek,
   });
 });
 
