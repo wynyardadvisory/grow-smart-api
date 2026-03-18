@@ -867,6 +867,16 @@ app.post("/tasks/:id/complete", requireAuth, async (req, res) => {
         .eq("id", data.crop_instance_id);
       await runRuleEngine(req.user.id);
 
+    } else if (data.task_type === "sow" && !transition) {
+      // Fallback: sow task completed but no status_transition meta — still set sown_date
+      const sowMethod = meta.sow_method || "outdoors";
+      const newStatus = sowMethod === "indoors" ? "sown_indoors" : "sown_outdoors";
+      await req.db.from("crop_instances")
+        .update({ status: newStatus, sown_date: today, updated_at: completedAt })
+        .eq("id", data.crop_instance_id)
+        .is("sown_date", null); // only update if not already set
+      await runRuleEngine(req.user.id);
+
     } else if (data.task_type === "transplant" && transition === "transplanted") {
       await req.db.from("crop_instances")
         .update({ status: "transplanted", transplant_date: today, updated_at: completedAt })
