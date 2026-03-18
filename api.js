@@ -112,6 +112,129 @@ async function requireAdmin(req, res, next) {
 // =============================================================================
 app.get("/health", (_req, res) => res.json({ status: "ok", ts: new Date().toISOString() }));
 
+// ── Timeline builder ──────────────────────────────────────────────────────────
+function buildTimeline(crop) {
+  const def     = crop.crop_def || {};
+  const variety = crop.variety  || {};
+
+  const sowDate  = crop.sown_date || crop.transplanted_date || null;
+  const dtm      = variety.days_to_maturity_max || variety.days_to_maturity_min
+                 || def.days_to_maturity_max    || def.days_to_maturity_min || null;
+
+  if (!sowDate) return null;
+
+  const addDays = (d, n) => {
+    const dt = new Date(d);
+    dt.setDate(dt.getDate() + n);
+    return dt.toISOString().split("T")[0];
+  };
+  const fmt = (d) => d ? new Date(d).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }) : null;
+  const today = new Date().toISOString().split("T")[0];
+  const daysSown = Math.floor((Date.now() - new Date(sowDate).getTime()) / 86400000);
+
+  // Stage DTM percentages
+  const STAGE_PCT = {
+    seed:       0,
+    seedling:   0.08,
+    vegetative: 0.25,
+    flowering:  0.55,
+    fruiting:   0.70,
+    harvesting: 0.90,
+  };
+
+  // Build predicted dates from sow date + DTM
+  const stageDates = {};
+  if (dtm) {
+    for (const [stage, pct] of Object.entries(STAGE_PCT)) {
+      stageDates[stage] = addDays(sowDate, Math.round(dtm * pct));
+    }
+  }
+
+  // Infer current stage from days grown
+  let currentStage = "seed";
+  if (dtm) {
+    const pct = daysSown / dtm;
+    if      (pct >= 0.90) currentStage = "harvesting";
+    else if (pct >= 0.70) currentStage = "fruiting";
+    else if (pct >= 0.55) currentStage = "flowering";
+    else if (pct >= 0.25) currentStage = "vegetative";
+    else if (pct >= 0.08) currentStage = "seedling";
+    else                  currentStage = "seed";
+  }
+
+  // Override with confirmed stage from crop record
+  if (crop.stage && crop.stage !== "seed") currentStage = crop.stage;
+
+  const STAGE_ORDER = ["seed", "seedling", "vegetative", "flowering", "fruiting", "harvesting"];
+  const currentIdx  = STAGE_ORDER.indexOf(currentStage);
+
+  // Harvest window from crop_def
+  const harvestStart = def.harvest_month_start;
+  const harvestEnd   = def.harvest_month_end;
+  const year         = new Date().getFullYear();
+  let harvestDate    = dtm ? addDays(sowDate, dtm) : null;
+  if (harvestStart) {
+    harvestDate = new Date(year, harvestStart - 1, 15).toISOString().split("T")[0];
+  }
+
+  const LABELS = {
+    seed:       "Seed",
+    seedling:   "Seedling",
+    vegetative: "Vegetative",
+    flowering:  "Flowering",
+    fruiting:   "Fruiting",
+    harvesting: "Harvest",
+  };
+
+  const DESCRIPTIONS = {
+    seed:       "Germinating — keep warm and moist.",
+    seedling:   "First leaves appearing. Keep on a sunny windowsill.",
+    vegetative: "Strong leaf and stem growth. Begin feeding fortnightly.",
+    flowering:  "Flowers forming. Switch to high potash feed.",
+    fruiting:   "Fruit setting. Feed weekly and water consistently.",
+    harvesting: "Ready to harvest. Pick regularly to encourage more.",
+  };
+
+  const SYMPTOM_CODES = {
+    seedling:   "seedling_emerged",
+    vegetative: "vegetative_confirmed",
+    flowering:  "flowering_confirmed",
+    fruiting:   "fruit_set_confirmed",
+    harvesting: "harvest_started",
+  };
+
+  const nodes = STAGE_ORDER.map((stage, i) => {
+    const status = i < currentIdx ? "completed" : i === currentIdx ? "current" : "upcoming";
+    const date   = stageDates[stage] || null;
+    const isHarvest = stage === "harvesting";
+    return {
+      key:          stage,
+      label:        LABELS[stage],
+      status,
+      formatted_date: isHarvest && harvestDate ? fmt(harvestDate) : date ? fmt(date) : null,
+      description:  DESCRIPTIONS[stage],
+      can_confirm:  status !== "completed",
+      confirm_symptom_code: SYMPTOM_CODES[stage] || null,
+      source:       "estimated",
+    };
+  });
+
+  // Find next stage node
+  const nextNode = nodes.find(n => n.status === "upcoming");
+
+  return {
+    nodes,
+    current_stage:       currentStage,
+    current_stage_label: LABELS[currentStage],
+    current_stage_description: DESCRIPTIONS[currentStage],
+    next_stage_label:    nextNode ? LABELS[nextNode.key] : null,
+    next_stage_date:     nextNode?.formatted_date || null,
+    harvest_date:        harvestDate ? fmt(harvestDate) : null,
+    confidence:          dtm ? "medium" : "low",
+    observation_offset_days: 0,
+  };
+}
+
 // =============================================================================
 // AUTH / PROFILE
 // =============================================================================
@@ -542,7 +665,11 @@ app.get("/crops/:id", requireAuth, async (req, res) => {
     .select("*, area:area_id(*), crop_def:crop_def_id(*), variety:variety_id(*), tasks(*)")
     .eq("id", req.params.id).eq("user_id", req.user.id).single();
   if (error) return res.status(404).json({ error: "Crop not found" });
-  res.json(data);
+
+  // ── Build timeline ────────────────────────────────────────────────────────
+  const timeline = buildTimeline(data);
+
+  res.json({ ...data, timeline });
 });
 
 // POST /crops/preview — AI crop profile for confirmation screen
