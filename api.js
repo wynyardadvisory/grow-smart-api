@@ -1682,10 +1682,21 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
 app.get("/admin/feedback", requireAuth, requireAdmin, async (req, res) => {
   const { data, error } = await supabaseService
     .from("feedback")
-    .select("*, profiles(name, email)")
+    .select("*, profiles(name)")
     .order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
+
+  // Enrich with email from auth.users
+  const { data: { users } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
+  const emailMap = {};
+  (users || []).forEach(u => { emailMap[u.id] = u.email; });
+
+  const enriched = (data || []).map(f => ({
+    ...f,
+    user_email: emailMap[f.user_id] || null,
+  }));
+
+  res.json(enriched);
 });
 
 // =============================================================================
