@@ -293,8 +293,29 @@ app.put("/locations/:id", requireAuth, async (req, res) => {
 });
 
 app.delete("/locations/:id", requireAuth, async (req, res) => {
+  const locId = req.params.id;
+  const userId = req.user.id;
+
+  // Get all areas in this location
+  const { data: areas } = await req.db.from("growing_areas")
+    .select("id").eq("location_id", locId).eq("user_id", userId);
+  const areaIds = (areas || []).map(a => a.id);
+
+  // Delete tasks for all crops in those areas
+  if (areaIds.length > 0) {
+    const { data: crops } = await req.db.from("crop_instances")
+      .select("id").in("area_id", areaIds).eq("user_id", userId);
+    const cropIds = (crops || []).map(c => c.id);
+    if (cropIds.length > 0) {
+      await req.db.from("tasks").delete().in("crop_instance_id", cropIds).eq("user_id", userId);
+      await req.db.from("crop_instances").delete().in("id", cropIds).eq("user_id", userId);
+    }
+    await req.db.from("growing_areas").delete().in("id", areaIds).eq("user_id", userId);
+  }
+
+  // Delete the location itself
   const { error } = await req.db.from("locations").delete()
-    .eq("id", req.params.id).eq("user_id", req.user.id);
+    .eq("id", locId).eq("user_id", userId);
   if (error) return res.status(500).json({ error: error.message });
   res.status(204).send();
 });
