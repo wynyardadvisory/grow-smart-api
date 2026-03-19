@@ -2501,10 +2501,141 @@ app.post("/admin/reset-tasks", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
+// POST /demo/reset — wipe and re-seed the demo account (demo users only)
+app.post("/demo/reset", requireAuth, async (req, res) => {
+  const userId = req.user.id;
 
+  // Verify this is the demo account
+  const { data: profile } = await req.db.from("profiles").select("is_demo").eq("id", userId).single();
+  if (!profile?.is_demo) return res.status(403).json({ error: "Not a demo account" });
 
-// =============================================================================
-// OBSERVATION LOGGING
+  try {
+    // Wipe all data for demo user
+    await supabaseService.from("tasks").delete().eq("user_id", userId);
+    await supabaseService.from("harvest_log").delete().eq("user_id", userId);
+    await supabaseService.from("crop_instances").delete().eq("user_id", userId);
+
+    // Get area IDs to delete areas
+    const { data: locs } = await supabaseService.from("locations").select("id").eq("user_id", userId);
+    const locIds = (locs || []).map(l => l.id);
+    if (locIds.length > 0) {
+      const { data: areas } = await supabaseService.from("growing_areas").select("id").in("location_id", locIds);
+      const areaIds = (areas || []).map(a => a.id);
+      if (areaIds.length > 0) await supabaseService.from("growing_areas").delete().in("id", areaIds);
+    }
+    await supabaseService.from("locations").delete().eq("user_id", userId);
+
+    // Re-seed locations and areas
+    const loc1 = crypto.randomUUID();
+    const loc2 = crypto.randomUUID();
+    const area1 = crypto.randomUUID();
+    const area2 = crypto.randomUUID();
+    const area3 = crypto.randomUUID();
+    const area4 = crypto.randomUUID();
+    const area5 = crypto.randomUUID();
+
+    await supabaseService.from("locations").insert([
+      { id: loc1, user_id: userId, name: "Back Garden", postcode: "M1 1AE" },
+      { id: loc2, user_id: userId, name: "Allotment",   postcode: "M1 1AE" },
+    ]);
+
+    await supabaseService.from("growing_areas").insert([
+      { id: area1, location_id: loc1, name: "Raised bed 1", type: "raised_bed" },
+      { id: area2, location_id: loc1, name: "Raised bed 2", type: "raised_bed" },
+      { id: area3, location_id: loc1, name: "Greenhouse",   type: "greenhouse" },
+      { id: area4, location_id: loc2, name: "Plot A",       type: "open_ground" },
+      { id: area5, location_id: loc2, name: "Fruit corner", type: "open_ground" },
+    ]);
+
+    // Get crop def IDs
+    const cropNames = ["tomato", "courgette", "carrot", "potato", "apple", "strawberry", "lettuce", "brussels", "garlic", "mint", "onion", "bean", "pea"];
+    const { data: defs } = await supabaseService.from("crop_definitions").select("id, name");
+    const def = (keyword) => defs.find(d => d.name.toLowerCase().includes(keyword))?.id || null;
+
+    // Active crops
+    const now = new Date();
+    const crops = [
+      { user_id: userId, area_id: area1, name: "Tomatoes",         crop_def_id: def("tomato"),     sown_date: "2026-02-15", stage: "seedling",   stage_confidence: "inferred", status: "sown_indoors",  active: true },
+      { user_id: userId, area_id: area1, name: "Lettuce",          crop_def_id: def("lettuce"),    sown_date: "2026-03-01", stage: "seedling",   stage_confidence: "inferred", status: "sown_outdoors", active: true },
+      { user_id: userId, area_id: area1, name: "Carrot",           crop_def_id: def("carrot"),     sown_date: "2026-02-20", stage: "seedling",   stage_confidence: "inferred", status: "sown_outdoors", active: true },
+      { user_id: userId, area_id: area2, name: "Courgette",        crop_def_id: def("courgette"),  sown_date: "2026-03-10", stage: "seed",       stage_confidence: "inferred", status: "sown_indoors",  active: true },
+      { user_id: userId, area_id: area2, name: "Brussels Sprouts", crop_def_id: def("brussels"),   sown_date: "2026-03-12", stage: "seed",       stage_confidence: "inferred", status: "sown_indoors",  active: true },
+      { user_id: userId, area_id: area2, name: "Garlic",           crop_def_id: def("garlic"),     sown_date: "2025-10-15", stage: "vegetative", stage_confidence: "inferred", status: "growing",       active: true },
+      { user_id: userId, area_id: area3, name: "Tomatoes",         crop_def_id: def("tomato"),     sown_date: "2026-01-20", stage: "vegetative", stage_confidence: "inferred", status: "sown_indoors",  active: true },
+      { user_id: userId, area_id: area3, name: "Mint",             crop_def_id: def("mint"),       sown_date: "2025-04-01", stage: "vegetative", stage_confidence: "inferred", status: "growing",       active: true },
+      { user_id: userId, area_id: area4, name: "Potato",           crop_def_id: def("potato"),     sown_date: "2026-02-23", stage: "seed",       stage_confidence: "inferred", status: "transplanted",  active: true },
+      { user_id: userId, area_id: area4, name: "Carrot",           crop_def_id: def("carrot"),     sown_date: "2026-03-05", stage: "seed",       stage_confidence: "inferred", status: "sown_outdoors", active: true },
+      { user_id: userId, area_id: area4, name: "Lettuce",          crop_def_id: def("lettuce"),    sown_date: "2026-03-10", stage: "seed",       stage_confidence: "inferred", status: "sown_outdoors", active: true },
+      { user_id: userId, area_id: area5, name: "Apple",            crop_def_id: def("apple"),      sown_date: "2025-04-01", stage: "vegetative", stage_confidence: "inferred", status: "growing",       active: true },
+      { user_id: userId, area_id: area5, name: "Strawberry",       crop_def_id: def("strawberry"), sown_date: "2025-04-01", stage: "vegetative", stage_confidence: "inferred", status: "growing",       active: true },
+    ];
+    const { data: insertedCrops } = await supabaseService.from("crop_instances").insert(crops).select("id, name, area_id");
+
+    // 2025 completed crops
+    const completed = [
+      { user_id: userId, area_id: area1, name: "Tomatoes",    crop_def_id: def("tomato"),     sown_date: "2025-02-10", stage: "finished", stage_confidence: "inferred", status: "harvested", active: false },
+      { user_id: userId, area_id: area1, name: "Courgette",   crop_def_id: def("courgette"),  sown_date: "2025-04-15", stage: "finished", stage_confidence: "inferred", status: "harvested", active: false },
+      { user_id: userId, area_id: area2, name: "Carrot",      crop_def_id: def("carrot"),     sown_date: "2025-03-20", stage: "finished", stage_confidence: "inferred", status: "harvested", active: false },
+      { user_id: userId, area_id: area4, name: "Potato",      crop_def_id: def("potato"),     sown_date: "2025-03-01", stage: "finished", stage_confidence: "inferred", status: "harvested", active: false },
+      { user_id: userId, area_id: area4, name: "Onion",       crop_def_id: def("onion"),      sown_date: "2025-02-28", stage: "finished", stage_confidence: "inferred", status: "harvested", active: false },
+      { user_id: userId, area_id: area4, name: "Runner Bean", crop_def_id: def("bean"),       sown_date: "2025-04-20", stage: "finished", stage_confidence: "inferred", status: "harvested", active: false },
+      { user_id: userId, area_id: area4, name: "Peas",        crop_def_id: def("pea"),        sown_date: "2025-03-15", stage: "finished", stage_confidence: "inferred", status: "harvested", active: false },
+      { user_id: userId, area_id: area5, name: "Apple",       crop_def_id: def("apple"),      sown_date: "2024-04-01", stage: "finished", stage_confidence: "inferred", status: "harvested", active: false },
+      { user_id: userId, area_id: area5, name: "Strawberry",  crop_def_id: def("strawberry"), sown_date: "2024-04-01", stage: "finished", stage_confidence: "inferred", status: "harvested", active: false },
+      { user_id: userId, area_id: area1, name: "Lettuce",     crop_def_id: def("lettuce"),    sown_date: "2025-05-01", stage: "finished", stage_confidence: "inferred", status: "harvested", active: false },
+    ];
+    const { data: completedCrops } = await supabaseService.from("crop_instances").insert(completed).select("id, name");
+
+    // Harvest logs
+    const ci = (name, arr) => arr?.find(c => c.name === name)?.id;
+    const harvests = [
+      { user_id: userId, crop_instance_id: ci("Tomatoes",   completedCrops), harvested_at: "2025-07-28", quantity_g: 420,  quality: 5, notes: "First pick — brilliant colour, Gardener's Delight never disappoints" },
+      { user_id: userId, crop_instance_id: ci("Tomatoes",   completedCrops), harvested_at: "2025-08-04", quantity_g: 680,  quality: 5, notes: "Best week yet — blight-free and loads of fruit" },
+      { user_id: userId, crop_instance_id: ci("Tomatoes",   completedCrops), harvested_at: "2025-08-11", quantity_g: 510,  quality: 4, notes: "Slight split on a few but taste excellent" },
+      { user_id: userId, crop_instance_id: ci("Tomatoes",   completedCrops), harvested_at: "2025-08-18", quantity_g: 390,  quality: 4, notes: "Tailing off but still going strong" },
+      { user_id: userId, crop_instance_id: ci("Tomatoes",   completedCrops), harvested_at: "2025-08-25", quantity_g: 220,  quality: 3, notes: "End of season — some blight on lower leaves" },
+      { user_id: userId, crop_instance_id: ci("Courgette",  completedCrops), harvested_at: "2025-07-01", quantity_g: 620,  quality: 4, notes: "First courgette — left it a day too long" },
+      { user_id: userId, crop_instance_id: ci("Courgette",  completedCrops), harvested_at: "2025-07-08", quantity_g: 480,  quality: 5, notes: "Perfect size, brilliant flavour" },
+      { user_id: userId, crop_instance_id: ci("Courgette",  completedCrops), harvested_at: "2025-07-15", quantity_g: 890,  quality: 3, notes: "Missed one — turned into a marrow!" },
+      { user_id: userId, crop_instance_id: ci("Courgette",  completedCrops), harvested_at: "2025-07-22", quantity_g: 540,  quality: 5, notes: "Back on track — picking every 3 days" },
+      { user_id: userId, crop_instance_id: ci("Courgette",  completedCrops), harvested_at: "2025-07-29", quantity_g: 720,  quality: 4, notes: "Still producing well" },
+      { user_id: userId, crop_instance_id: ci("Carrot",     completedCrops), harvested_at: "2025-07-20", quantity_g: 380,  quality: 4, notes: "Good first pull — decent size, sweet flavour" },
+      { user_id: userId, crop_instance_id: ci("Carrot",     completedCrops), harvested_at: "2025-08-02", quantity_g: 520,  quality: 5, notes: "Best carrots yet — perfect shape and size" },
+      { user_id: userId, crop_instance_id: ci("Carrot",     completedCrops), harvested_at: "2025-08-15", quantity_g: 290,  quality: 3, notes: "A few forked ones — probably hit a stone" },
+      { user_id: userId, crop_instance_id: ci("Potato",     completedCrops), harvested_at: "2025-07-10", quantity_g: 1200, quality: 5, notes: "Charlotte first early — superb, waxy and nutty" },
+      { user_id: userId, crop_instance_id: ci("Potato",     completedCrops), harvested_at: "2025-07-10", quantity_g: 980,  quality: 4, notes: "Second row — slightly smaller but good" },
+      { user_id: userId, crop_instance_id: ci("Potato",     completedCrops), harvested_at: "2025-07-17", quantity_g: 1450, quality: 5, notes: "Main haul — excellent yield this year" },
+      { user_id: userId, crop_instance_id: ci("Onion",      completedCrops), harvested_at: "2025-08-10", quantity_g: 1800, quality: 3, notes: "Dried off well but some smaller than hoped" },
+      { user_id: userId, crop_instance_id: ci("Onion",      completedCrops), harvested_at: "2025-08-10", quantity_g: 1200, quality: 4, notes: "Second batch much better sized" },
+      { user_id: userId, crop_instance_id: ci("Runner Bean",completedCrops), harvested_at: "2025-07-25", quantity_g: 340,  quality: 5, notes: "Tender and stringless — perfect timing" },
+      { user_id: userId, crop_instance_id: ci("Runner Bean",completedCrops), harvested_at: "2025-08-01", quantity_g: 520,  quality: 5, notes: "Peak of the season" },
+      { user_id: userId, crop_instance_id: ci("Runner Bean",completedCrops), harvested_at: "2025-08-08", quantity_g: 480,  quality: 4, notes: "Still excellent" },
+      { user_id: userId, crop_instance_id: ci("Runner Bean",completedCrops), harvested_at: "2025-08-15", quantity_g: 310,  quality: 3, notes: "Getting a bit stringy now" },
+      { user_id: userId, crop_instance_id: ci("Peas",       completedCrops), harvested_at: "2025-06-28", quantity_g: 180,  quality: 5, notes: "Sweet as anything — worth every pod" },
+      { user_id: userId, crop_instance_id: ci("Peas",       completedCrops), harvested_at: "2025-07-05", quantity_g: 220,  quality: 5, notes: "Last of the peas — froze half of them" },
+      { user_id: userId, crop_instance_id: ci("Apple",      completedCrops), harvested_at: "2025-09-14", quantity_g: 2200, quality: 4, notes: "First real harvest from this tree — really pleased" },
+      { user_id: userId, crop_instance_id: ci("Apple",      completedCrops), harvested_at: "2025-09-21", quantity_g: 1800, quality: 4, notes: "Second pick — some windfall included" },
+      { user_id: userId, crop_instance_id: ci("Strawberry", completedCrops), harvested_at: "2025-06-15", quantity_g: 280,  quality: 5, notes: "First strawberries of summer — incredible flavour" },
+      { user_id: userId, crop_instance_id: ci("Strawberry", completedCrops), harvested_at: "2025-06-22", quantity_g: 420,  quality: 5, notes: "Peak season — eating straight from the plant" },
+      { user_id: userId, crop_instance_id: ci("Strawberry", completedCrops), harvested_at: "2025-06-29", quantity_g: 380,  quality: 4, notes: "Still going strong" },
+      { user_id: userId, crop_instance_id: ci("Strawberry", completedCrops), harvested_at: "2025-07-06", quantity_g: 210,  quality: 3, notes: "End of main flush — a few botrytis affected" },
+      { user_id: userId, crop_instance_id: ci("Lettuce",    completedCrops), harvested_at: "2025-06-10", quantity_g: 150,  quality: 5, notes: "First cut — perfect for salads" },
+      { user_id: userId, crop_instance_id: ci("Lettuce",    completedCrops), harvested_at: "2025-06-24", quantity_g: 180,  quality: 5, notes: "Second cut even better" },
+      { user_id: userId, crop_instance_id: ci("Lettuce",    completedCrops), harvested_at: "2025-07-08", quantity_g: 120,  quality: 4, notes: "Starting to bolt slightly in the heat" },
+    ].filter(h => h.crop_instance_id); // skip any with no match
+    await supabaseService.from("harvest_log").insert(harvests);
+
+    // Run rule engine for fresh tasks
+    const { RuleEngine } = require("./rule-engine");
+    const engine = new RuleEngine(supabaseService);
+    const tasks = await engine.runForUser(userId);
+
+    res.json({ ok: true, crops: crops.length + completed.length, harvests: harvests.length, tasks: tasks.length });
+  } catch (err) {
+    console.error("[DemoReset]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 // =============================================================================
 app.post("/crops/:id/observe", requireAuth, async (req, res) => {
   const { observation_type, symptom_code, severity, notes, confirmed_stage } = req.body;
