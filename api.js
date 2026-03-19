@@ -2779,6 +2779,159 @@ app.post("/admin/reset-tasks", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
+
+// =============================================================================
+// ONBOARDING — complete setup in one call
+// Creates location + area silently, creates crop instances, runs rule engine.
+// Stage → sow_date mapping so user never has to enter exact dates.
+// =============================================================================
+
+// Stage → sow date offset (days before today)
+const STAGE_OFFSETS = {
+  not_sown:    null,       // no sow date — status = planned
+  just_sown:   3,          // sown ~3 days ago
+  growing:     21,         // sown ~3 weeks ago
+  near_harvest: null,      // calculated per crop DTM
+};
+
+function inferSowDate(stage, cropDef) {
+  const today = new Date();
+  const pad = n => String(n).padStart(2, "0");
+  const fmt = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+
+  if (stage === "not_sown") return null;
+  if (stage === "just_sown") {
+    const d = new Date(today); d.setDate(d.getDate() - 3);
+    return fmt(d);
+  }
+  if (stage === "growing") {
+    const d = new Date(today); d.setDate(d.getDate() - 21);
+    return fmt(d);
+  }
+  if (stage === "near_harvest") {
+    // Work back from DTM — set sow date so harvest is ~14 days away
+    const dtm = cropDef?.days_to_maturity_min || 60;
+    const d = new Date(today); d.setDate(d.getDate() - (dtm - 14));
+    return fmt(d);
+  }
+  return null;
+}
+
+function starterTaskForCrop(cropName, stage) {
+  if (stage === "not_sown") return `Sow ${cropName} — now is a good time to get started`;
+  if (stage === "just_sown") return `Check ${cropName} seedlings — water if soil is dry`;
+  if (stage === "growing")   return `Check ${cropName} — inspect for pests and feed if needed`;
+  if (stage === "near_harvest") return `Check ${cropName} — harvest may be approaching`;
+  return `Check on your ${cropName}`;
+}
+
+app.post("/onboarding/complete", requireAuth, async (req, res) => {
+  const db = req.db;
+  const userId = req.user.id;
+  const {
+    name, postcode,
+    crops,       // [{ name, crop_def_id, stage }]
+    area_type,
+    area_name,
+  } = req.body;
+
+  if (!name || !postcode || !crops?.length || !area_type) {
+    return res.status(400).json({ error: "name, postcode, crops and area_type required" });
+  }
+
+  try {
+    // 1. Save profile
+    await db.from("profiles")
+      .upsert({ id: userId, name, postcode, updated_at: new Date().toISOString() }, { onConflict: "id" });
+
+    // 2. Create default location (or reuse existing)
+    let locationId;
+    const { data: existingLocs } = await db.from("locations").select("id").eq("user_id", userId).limit(1);
+    if (existingLocs?.length) {
+      locationId = existingLocs[0].id;
+    } else {
+      const { data: loc, error: locErr } = await db.from("locations").insert({
+        user_id: userId, name: "My garden", postcode,
+        created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      }).select("id").single();
+      if (locErr) throw new Error("Location: " + locErr.message);
+      locationId = loc.id;
+    }
+
+    // 3. Create first area (or reuse existing)
+    let areaId;
+    const { data: existingAreas } = await db.from("growing_areas").select("id").eq("location_id", locationId).limit(1);
+    if (existingAreas?.length) {
+      areaId = existingAreas[0].id;
+    } else {
+      const finalAreaName = area_name?.trim() || "My first area";
+      const { data: area, error: areaErr } = await db.from("growing_areas").insert({
+        location_id: locationId, name: finalAreaName, type: area_type,
+        created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      }).select("id").single();
+      if (areaErr) throw new Error("Area: " + areaErr.message);
+      areaId = area.id;
+    }
+
+    // 4. Look up crop definitions for stage → sow date mapping
+    const defIds = crops.filter(c => c.crop_def_id).map(c => c.crop_def_id);
+    let cropDefs = {};
+    if (defIds.length) {
+      const { data: defs } = await supabaseService.from("crop_definitions")
+        .select("id, days_to_maturity_min").in("id", defIds);
+      for (const d of (defs || [])) cropDefs[d.id] = d;
+    }
+
+    // 5. Create crop instances
+    const cropInserts = crops.map(c => {
+      const def = cropDefs[c.crop_def_id] || null;
+      const sowDate = inferSowDate(c.stage, def);
+      const status = sowDate ? "growing" : "planned";
+      return {
+        user_id:               userId,
+        location_id:           locationId,
+        area_id:               areaId,
+        name:                  c.name,
+        crop_def_id:           c.crop_def_id || null,
+        sown_date:             sowDate,
+        status,
+        start_date_confidence: "inferred",
+        source:                "onboarding",
+        quantity:              1,
+        created_at:            new Date().toISOString(),
+        updated_at:            new Date().toISOString(),
+      };
+    });
+
+    await db.from("crop_instances").insert(cropInserts);
+
+    // 6. Run rule engine
+    const tasks = await runRuleEngine(userId);
+
+    // 7. Fallback — if engine generated nothing, insert starter tasks
+    if (!tasks?.length) {
+      const today = new Date().toISOString().split("T")[0];
+      const starterTasks = crops.map(c => ({
+        user_id:    userId,
+        area_id:    areaId,
+        action:     starterTaskForCrop(c.name, c.stage),
+        task_type:  "monitor",
+        due_date:   today,
+        urgency:    "low",
+        source_key: `onboarding_starter_${c.name}_${today}`,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      }));
+      await supabaseService.from("tasks").upsert(starterTasks, { onConflict: "source_key" });
+    }
+
+    res.json({ ok: true, locationId, areaId, tasksGenerated: tasks?.length || 0 });
+  } catch (err) {
+    console.error("[Onboarding] Error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /demo/reset — wipe and re-seed the demo account (demo users only)
 app.post("/demo/reset", requireAuth, async (req, res) => {
   const userId = req.user.id;
