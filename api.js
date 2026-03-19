@@ -31,6 +31,7 @@ const { body, validationResult } = require("express-validator");
 require("dotenv").config();
 
 const { RuleEngine } = require("./rule-engine");
+const { applyBlockedPeriodAdjustments, reapplyAllBlockedPeriods } = require("./blocked-period-adjustment");
 const { runNotificationsForUser } = require("./notifications");
 const { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement, runDailyEmailFallback } = require("./emails");
 
@@ -85,11 +86,15 @@ async function requireAuth(req, res, next) {
 }
 
 // ── Rule engine runner ────────────────────────────────────────────────────────
+// Always re-applies blocked period adjustments after task generation.
+// This ensures time-away overlays survive any task reset or regeneration.
 async function runRuleEngine(userId) {
   try {
     const engine = new RuleEngine(supabaseService);
     const tasks  = await engine.runForUser(userId);
     console.log(`[RuleEngine] ${tasks.length} tasks generated for ${userId}`);
+    // Re-apply any active blocked periods so adjustments are never lost on regeneration
+    await reapplyAllBlockedPeriods(supabaseService, userId);
     return tasks;
   } catch (err) {
     console.error("[RuleEngine] Error:", err.message);
@@ -859,12 +864,32 @@ app.get("/tasks", requireAuth, async (req, res) => {
   const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
 
+  // Fetch any active adjustments for this user and merge onto tasks
+  const { data: adjustments } = await req.db.from("task_adjustments")
+    .select("task_id, adjustment_type, adjusted_due_date, original_due_date")
+    .eq("user_id", req.user.id);
+
+  const adjMap = {};
+  for (const a of (adjustments || [])) adjMap[a.task_id] = a;
+
+  const enriched = data.map(t => {
+    const adj = adjMap[t.id];
+    if (!adj) return t;
+    return {
+      ...t,
+      effective_due_date: adj.adjusted_due_date || t.due_date,
+      adjustment_type:    adj.adjustment_type,
+      original_due_date:  adj.original_due_date,
+    };
+  });
+
+  // Use effective_due_date for grouping so adjusted tasks appear in the right bucket
   res.json({
-    tasks: data,
+    tasks: enriched,
     grouped: {
-      today:     data.filter(t => t.due_date === today),
-      this_week: data.filter(t => t.due_date > today && t.due_date <= weekEnd),
-      coming_up: data.filter(t => t.due_date > weekEnd),
+      today:     enriched.filter(t => (t.effective_due_date || t.due_date) === today),
+      this_week: enriched.filter(t => (t.effective_due_date || t.due_date) > today && (t.effective_due_date || t.due_date) <= weekEnd),
+      coming_up: enriched.filter(t => (t.effective_due_date || t.due_date) > weekEnd),
     },
   });
 });
@@ -1122,6 +1147,140 @@ app.delete("/feeds/:id", requireAuth, async (req, res) => {
 
 
 
+
+// =============================================================================
+// TIME AWAY — BLOCKED PERIODS
+// Lets users mark date ranges as unavailable. Tasks falling in those ranges
+// are adjusted (moved earlier/later/at_risk) via the adjustment service.
+// Canonical task due_dates are never mutated — overlays only.
+// =============================================================================
+
+app.get("/blocked-periods", requireAuth, async (req, res) => {
+  const { data, error } = await req.db.from("blocked_periods")
+    .select("*")
+    .eq("user_id", req.user.id)
+    .eq("status", "active")
+    .order("start_date", { ascending: true });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+app.post("/blocked-periods", requireAuth, async (req, res) => {
+  const { start_date, end_date, label, note } = req.body;
+  if (!start_date || !end_date)
+    return res.status(400).json({ error: "start_date and end_date required" });
+  if (end_date < start_date)
+    return res.status(400).json({ error: "end_date must be on or after start_date" });
+
+  const durationDays = Math.round((new Date(end_date) - new Date(start_date)) / 86400000);
+  if (durationDays > 90)
+    return res.status(400).json({ error: "Blocked period cannot exceed 90 days" });
+
+  const { data: bp, error } = await req.db.from("blocked_periods").insert({
+    user_id:    req.user.id,
+    start_date,
+    end_date,
+    label:      label || null,
+    note:       note  || null,
+    status:     "active",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  }).select().single();
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Apply adjustments immediately
+  const summary = await applyBlockedPeriodAdjustments(req.db, req.user.id, bp.id);
+
+  res.status(201).json({ blockedPeriod: bp, summary });
+});
+
+app.patch("/blocked-periods/:id", requireAuth, async (req, res) => {
+  const { start_date, end_date, label, note } = req.body;
+
+  if (start_date && end_date && end_date < start_date)
+    return res.status(400).json({ error: "end_date must be on or after start_date" });
+
+  const updates = { updated_at: new Date().toISOString() };
+  if (start_date) updates.start_date = start_date;
+  if (end_date)   updates.end_date   = end_date;
+  if (label !== undefined) updates.label = label;
+  if (note  !== undefined) updates.note  = note;
+
+  const { data: bp, error } = await req.db.from("blocked_periods")
+    .update(updates)
+    .eq("id", req.params.id)
+    .eq("user_id", req.user.id)
+    .eq("status", "active")
+    .select().single();
+
+  if (error || !bp) return res.status(404).json({ error: "Not found" });
+
+  // Recompute adjustments with new dates
+  const summary = await applyBlockedPeriodAdjustments(req.db, req.user.id, bp.id);
+
+  res.json({ blockedPeriod: bp, summary });
+});
+
+app.delete("/blocked-periods/:id", requireAuth, async (req, res) => {
+  // Verify ownership
+  const { data: bp } = await req.db.from("blocked_periods")
+    .select("id")
+    .eq("id", req.params.id)
+    .eq("user_id", req.user.id)
+    .eq("status", "active")
+    .single();
+
+  if (!bp) return res.status(404).json({ error: "Not found" });
+
+  // Remove all adjustments created by this blocked period
+  await req.db.from("task_adjustments")
+    .delete()
+    .eq("blocked_period_id", req.params.id)
+    .eq("user_id", req.user.id);
+
+  // Soft delete the period
+  await req.db.from("blocked_periods")
+    .update({ status: "deleted", updated_at: new Date().toISOString() })
+    .eq("id", req.params.id)
+    .eq("user_id", req.user.id);
+
+  res.status(204).send();
+});
+
+// GET /blocked-periods/:id/adjustments — summary of affected tasks for a period
+app.get("/blocked-periods/:id/adjustments", requireAuth, async (req, res) => {
+  const { data: bp } = await req.db.from("blocked_periods")
+    .select("*")
+    .eq("id", req.params.id)
+    .eq("user_id", req.user.id)
+    .single();
+
+  if (!bp) return res.status(404).json({ error: "Not found" });
+
+  const { data: adjustments } = await req.db.from("task_adjustments")
+    .select("*, task:task_id(id, action, task_type, due_date, crop:crop_instance_id(name, variety))")
+    .eq("blocked_period_id", req.params.id)
+    .eq("user_id", req.user.id)
+    .order("adjustment_type", { ascending: true });
+
+  const grouped = {
+    moved_earlier: (adjustments || []).filter(a => a.adjustment_type === "moved_earlier"),
+    moved_later:   (adjustments || []).filter(a => a.adjustment_type === "moved_later"),
+    at_risk:       (adjustments || []).filter(a => a.adjustment_type === "at_risk"),
+  };
+
+  res.json({
+    blockedPeriod: bp,
+    summary: {
+      total:        (adjustments || []).length,
+      movedEarlier: grouped.moved_earlier.length,
+      movedLater:   grouped.moved_later.length,
+      atRisk:       grouped.at_risk.length,
+    },
+    grouped,
+  });
+});
 
 // =============================================================================
 // AREA OPTIMISER
