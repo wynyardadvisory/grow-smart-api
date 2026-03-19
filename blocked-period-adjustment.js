@@ -89,6 +89,50 @@ function diffDays(laterDateStr, earlierDateStr) {
 }
 
 // ---------------------------------------------------------------------------
+// Human-readable explanation per task type and outcome
+// ---------------------------------------------------------------------------
+function buildExplanation(taskType, outcomeType, policy) {
+  if (outcomeType === "moved_earlier") {
+    const msgs = {
+      feed:      "Brought forward so your plants are fed before you leave.",
+      harvest:   "Brought forward to catch the harvest before you go.",
+      sow:       "Brought forward — sowing slightly early is better than missing the window.",
+      transplant:"Brought forward to get plants established before you leave.",
+      monitor:   "Brought forward so you can check in before your time away.",
+      prune:     "Brought forward so this can be done before you leave.",
+      thin:      "Brought forward — better done a little early than skipped.",
+      other:     "Brought forward before your unavailable dates.",
+    };
+    return msgs[taskType] || "Brought forward before your unavailable dates.";
+  }
+  if (outcomeType === "moved_later") {
+    const msgs = {
+      feed:      "Moved back to after you return — a short delay won't harm feeding.",
+      sow:       "Moved back — a few days' delay is within safe sowing tolerance.",
+      transplant:"Moved back to when you're available to care for newly transplanted seedlings.",
+      monitor:   "Moved back — this check can wait until you return.",
+      prune:     "Moved back — pruning can safely wait a few days.",
+      thin:      "Moved back — thinning can wait until after you return.",
+      other:     "Moved to after your unavailable dates.",
+    };
+    return msgs[taskType] || "Moved to after your unavailable dates.";
+  }
+  if (outcomeType === "at_risk") {
+    const msgs = {
+      water:     "Watering cannot safely be moved — plants may dry out. Consider asking someone to water while you're away.",
+      harvest:   "Harvest window is time-sensitive and cannot be safely moved — crops may over-mature or be lost.",
+      protect:   "Frost or pest protection is time-critical and cannot be rescheduled.",
+      transplant:"Transplanting timing is sensitive — newly moved plants need care that cannot be deferred.",
+      sow:       "Sowing window is outside safe movement tolerance — timing matters for this crop.",
+      feed:      "Feeding cannot be moved within safe tolerance — plants may show stress.",
+      other:     "This task cannot safely be moved outside your unavailable dates.",
+    };
+    return msgs[taskType] || "This task cannot safely be moved — it may need attention while you're away.";
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Core decision logic for a single task
 // ---------------------------------------------------------------------------
 function evaluateTask(task, blockedPeriod, policy) {
@@ -134,19 +178,19 @@ function evaluateTask(task, blockedPeriod, policy) {
 
   // Preferred direction first, fallback to other direction, then at_risk
   if (policy.preferDirection === "earlier" && earlierValid) {
-    return { type: "moved_earlier", adjustedDueDate: earlierCandidate, metadata: meta };
+    return { type: "moved_earlier", adjustedDueDate: earlierCandidate, metadata: { ...meta, explanation: buildExplanation(task.task_type, "moved_earlier") } };
   }
   if (policy.preferDirection === "later" && laterValid) {
-    return { type: "moved_later", adjustedDueDate: laterCandidate, metadata: meta };
+    return { type: "moved_later", adjustedDueDate: laterCandidate, metadata: { ...meta, explanation: buildExplanation(task.task_type, "moved_later") } };
   }
   if (earlierValid) {
-    return { type: "moved_earlier", adjustedDueDate: earlierCandidate, metadata: meta };
+    return { type: "moved_earlier", adjustedDueDate: earlierCandidate, metadata: { ...meta, explanation: buildExplanation(task.task_type, "moved_earlier") } };
   }
   if (laterValid) {
-    return { type: "moved_later", adjustedDueDate: laterCandidate, metadata: meta };
+    return { type: "moved_later", adjustedDueDate: laterCandidate, metadata: { ...meta, explanation: buildExplanation(task.task_type, "moved_later") } };
   }
   if (policy.riskIfUnmovable) {
-    return { type: "at_risk", adjustedDueDate: null, metadata: { ...meta, reason: "no_safe_date" } };
+    return { type: "at_risk", adjustedDueDate: null, metadata: { ...meta, reason: "no_safe_date", explanation: buildExplanation(task.task_type, "at_risk") } };
   }
 
   return null; // no adjustment needed
@@ -206,7 +250,7 @@ async function applyBlockedPeriodAdjustments(db, userId, blockedPeriodId) {
         adjustment_type:   "at_risk",
         original_due_date: task.due_date,
         adjusted_due_date: null,
-        metadata:          { reason: "no_policy_for_task_type", task_type: task.task_type },
+        metadata:          { reason: "no_policy_for_task_type", task_type: task.task_type, explanation: "This task could not be automatically adjusted — it may need attention while you're away." },
       });
       atRisk++;
       continue;
