@@ -821,10 +821,18 @@ app.get("/crops/:id/enrichment", requireAuth, async (req, res) => {
 });
 
 app.delete("/crops/:id", requireAuth, async (req, res) => {
+  // Fetch area_id before soft-deleting so we can invalidate suggestions cache
+  const { data: crop } = await req.db.from("crop_instances")
+    .select("area_id").eq("id", req.params.id).eq("user_id", req.user.id).single();
+
   const { error } = await req.db.from("crop_instances")
     .update({ active: false, updated_at: new Date().toISOString() })
     .eq("id", req.params.id).eq("user_id", req.user.id);
   if (error) return res.status(500).json({ error: error.message });
+
+  // Invalidate suggestions cache — area contents have changed
+  if (crop?.area_id) await clearSuggestions(crop.area_id, req.db);
+
   res.status(204).send();
 });
 
@@ -1116,13 +1124,13 @@ app.delete("/feeds/:id", requireAuth, async (req, res) => {
 
 
 // =============================================================================
-// PLANTING SUGGESTIONS
-// AI-powered suggestions for empty beds. Stored per area, cleared when a crop
-// is added. One generation per empty bed per planting cycle.
+// AREA OPTIMISER
+// AI-powered suggestions for every area — empty or populated.
+// Empty areas: "what to plant here". Populated areas: "what to add / boost with".
+// Cache is invalidated whenever crops are added, deleted or harvested in the area.
 // =============================================================================
 
 app.get("/areas/:id/suggestions", requireAuth, async (req, res) => {
-  // Verify ownership via supabaseService to avoid RLS issues
   const { data: area } = await supabaseService.from("growing_areas")
     .select("id, location_id, locations(user_id)")
     .eq("id", req.params.id).single();
@@ -1145,86 +1153,184 @@ app.post("/areas/:id/suggestions/generate", requireAuth, async (req, res) => {
   if (!area || area.locations?.user_id !== req.user.id)
     return res.status(403).json({ error: "Not authorised" });
 
-  // Check area is actually empty — planned crops don't count
-  const { data: activeCrops } = await db.from("crop_instances")
-    .select("id").eq("area_id", req.params.id).eq("active", true)
+  // Get active crops in THIS area
+  const { data: areaCrops } = await db.from("crop_instances")
+    .select("name, variety, status, sown_date")
+    .eq("area_id", req.params.id)
+    .eq("active", true)
     .not("status", "eq", "harvested")
     .not("status", "eq", "planned");
-  if (activeCrops?.length > 0)
-    return res.status(400).json({ error: "Area is not empty" });
 
-  // Check suggestions don't already exist — if they do, return them instead of erroring
+  const isEmpty = !areaCrops || areaCrops.length === 0;
+
+  // Check cache — only use if the area state matches what was cached
+  // We store a crop_fingerprint so we can detect staleness
+  const cropFingerprint = (areaCrops || [])
+    .map(c => `${c.name}|${c.variety || ""}`)
+    .sort()
+    .join(",");
+
   const { data: existing } = await db.from("planting_suggestions")
     .select("*").eq("area_id", req.params.id).single();
-  if (existing)
-    return res.json({ suggestions: existing.suggestions, generated_at: existing.generated_at });
 
-  // Get crop history for this area
+  if (existing && existing.crop_fingerprint === cropFingerprint) {
+    return res.json({
+      suggestions:   existing.suggestions,
+      generated_at:  existing.generated_at,
+      summary:       existing.summary || null,
+      is_empty_area: existing.is_empty_area || false,
+    });
+  }
+
+  // Get crop history for this area (rotation awareness)
   const { data: history } = await db.from("crop_instances")
-    .select("name, variety, status, harvested_at")
+    .select("name, variety")
     .eq("area_id", req.params.id)
     .eq("active", false)
     .order("created_at", { ascending: false })
     .limit(6);
 
-  // Get what user is growing elsewhere (to avoid duplication)
-  const { data: allCrops } = await db.from("crop_instances")
-    .select("name").eq("user_id", req.user.id).eq("active", true);
+  // Get ALL active crops across the whole location (location-aware signal)
+  const { data: locationCrops } = await db.from("crop_instances")
+    .select("name, variety, area_id")
+    .eq("active", true)
+    .not("status", "eq", "harvested")
+    .not("status", "eq", "planned")
+    .in("area_id",
+      (await db.from("growing_areas")
+        .select("id")
+        .eq("location_id", area.location_id)
+      ).data?.map(a => a.id) || []
+    );
 
-  const month      = new Date().toLocaleString("en-GB", { month: "long" });
-  const areaType   = area.type?.replace(/_/g, " ") || "growing area";
-  const postcode   = area.locations?.postcode || "UK";
+  const month        = new Date().toLocaleString("en-GB", { month: "long" });
+  const areaType     = area.type?.replace(/_/g, " ") || "growing area";
+  const postcode     = area.locations?.postcode || "UK";
+  const areaNameStr  = area.name || areaType;
+
+  const areaCropsStr = areaCrops?.length
+    ? areaCrops.map(c => `${c.name}${c.variety ? " (" + c.variety + ")" : ""}${c.status ? " [" + c.status + "]" : ""}`).join(", ")
+    : "nothing currently in this area";
+
   const historyStr = history?.length
     ? history.map(c => `${c.name}${c.variety ? " (" + c.variety + ")" : ""}`).join(", ")
     : "nothing previously recorded";
-  const currentStr = allCrops?.length
-    ? [...new Set(allCrops.map(c => c.name))].join(", ")
-    : "nothing currently";
 
-  try {
-    const prompt = `You are a UK horticultural expert advising a home grower or allotment holder.
+  // Deduplicate location crops, exclude this area's own crops
+  const locationCropsElsewhere = (locationCrops || [])
+    .filter(c => c.area_id !== req.params.id);
+  const locationStr = locationCropsElsewhere.length
+    ? [...new Set(locationCropsElsewhere.map(c => c.name))].join(", ")
+    : "nothing else in this location";
+
+  // Check if any beneficial flowers/herbs exist in the wider location
+  const beneficialKeywords = ["marigold", "nasturtium", "borage", "calendula", "lavender", "phacelia"];
+  const hasBeneficials = locationCropsElsewhere.some(c =>
+    beneficialKeywords.some(b => c.name.toLowerCase().includes(b))
+  );
+
+  const emptyPrompt = `You are a UK horticultural expert advising a home grower or allotment holder.
+
+This area is currently empty. Suggest what they should plant here now.
 
 Area details:
+- Name: ${areaNameStr}
 - Type: ${areaType}
 - Location postcode: ${postcode}
 - Current month: ${month}
 - Previously grown here: ${historyStr}
-- Currently growing elsewhere in their garden: ${currentStr}
+- Other crops growing elsewhere in the same garden: ${locationStr}
+- Beneficial flowers/herbs already in garden: ${hasBeneficials ? "yes" : "none detected"}
 
-Return exactly 3 suggestions: 2 crop suggestions and 1 bed preparation or companion suggestion.
-Consider:
-1. Seasonality — what can realistically be sown or planted in ${month} in the UK
-2. Crop rotation — avoid repeating the same crop family as what was previously grown
-3. What the grower already likes (infer from what they grow elsewhere) — suggest complementary crops, avoid duplicates
-4. Suggest a specific named variety for each crop, not just the species name
+Rules:
+1. Seasonality — only suggest crops that can realistically be sown or planted outdoors (or started indoors if appropriate) in ${month} in the UK
+2. Rotation — avoid the same crop family as previous crops in this area
+3. Suggest specific named varieties, not just species names
+4. Since no beneficial flowers/herbs exist in the garden${hasBeneficials ? " elsewhere" : ""}, consider including one as a companion suggestion
+5. Bias toward high-confidence crops — fast-growing, beginner-friendly options that work in most ${areaType} setups
 
-Respond ONLY with a JSON array of exactly 3 items — no markdown, no explanation:
+Return a JSON object with:
+- "summary": one sentence starting with "This area is empty —" explaining the best starting move
+- "suggestions": array of exactly 3 items
+
+Suggestion types and schema:
 [
   {
     "type": "crop",
-    "crop": "Crop name",
-    "variety": "Specific variety name e.g. Cobra, Black Beauty, Gardener's Delight",
-    "reason": "One sentence why this crop and variety is ideal right now for this grower",
-    "sow_note": "When and how to sow this variety in one sentence",
-    "companion_note": "Companion benefit with their existing crops or null"
-  },
-  {
-    "type": "crop",
+    "confidence": "high" | "medium",
     "crop": "Crop name",
     "variety": "Specific variety name",
-    "reason": "One sentence why this crop and variety is ideal right now",
-    "sow_note": "When and how to sow in one sentence",
-    "companion_note": "Companion benefit or null"
+    "reason": "One sentence why this is the best choice for this area right now",
+    "sow_note": "When and how to sow/plant in one sentence",
+    "placement_note": "Soft placement guidance e.g. 'sow in rows across the bed' or null",
+    "companion_note": "Companion benefit if relevant or null",
+    "benefit_tags": ["quick crop", "easy to grow"] — pick from: quick crop, easy to grow, succession candidate, good for ${areaType}, frost hardy, good for pollinators, nitrogen fixing
   },
   {
-    "type": "prep",
-    "title": "e.g. Add well-rotted manure, Sow green manure (Phacelia), Plant pot marigolds as companions",
-    "reason": "One sentence why this prep or companion planting benefits this bed right now",
-    "timing_note": "Brief note on when or how to do this"
+    "type": "companion",
+    "confidence": "high",
+    "crop": "Flower or herb name",
+    "variety": "Specific variety or null",
+    "reason": "One sentence benefit",
+    "sow_note": "When and how in one sentence",
+    "placement_note": "e.g. 'sow around the edges' or null",
+    "companion_note": "What it helps with",
+    "benefit_tags": ["good for pollinators"] — pick relevant tags
+  },
+  { ... third suggestion as crop or companion ... }
+]
+
+Respond ONLY with a JSON object — no markdown, no explanation:
+{ "summary": "...", "suggestions": [...] }`;
+
+  const populatedPrompt = `You are a UK horticultural expert advising a home grower or allotment holder.
+
+This area already has crops growing. Suggest what they could add to boost it.
+
+Area details:
+- Name: ${areaNameStr}
+- Type: ${areaType}
+- Location postcode: ${postcode}
+- Current month: ${month}
+- Crops currently in THIS area: ${areaCropsStr}
+- Previously grown here: ${historyStr}
+- Other crops growing elsewhere in the same garden: ${locationStr}
+- Beneficial flowers/herbs already in garden: ${hasBeneficials ? "yes" : "none detected"}
+
+Scoring priorities (apply in this order):
+1. Direct companion benefit to crops already in this area (highest weight)
+2. Seasonal fit — only suggest things that can realistically be added in ${month} in the UK
+3. Space confidence — prefer HIGH confidence options (compact, low-space crops like lettuce, radish, spring onion, marigold) over large sprawling crops
+4. Location benefit — if no beneficial flowers/herbs exist in the garden, prioritise one as a companion suggestion
+5. Avoid suggesting crops already well-represented in the wider garden
+
+Because exact free space in the area is unknown, only suggest HIGH or MEDIUM confidence additions.
+Do NOT suggest large space-hungry crops (courgette, cabbage, squash) unless the area appears very lightly planted.
+
+Return a JSON object with:
+- "summary": one sentence starting with "Best next step:" or "Good option for this area:" explaining the top recommendation in plain English
+- "suggestions": array of 1 to 3 items (only include items with genuine value — do not force 3 if only 1 or 2 are strong)
+
+Suggestion schema:
+[
+  {
+    "type": "primary_crop" | "companion" | "beneficial",
+    "confidence": "high" | "medium",
+    "crop": "Crop name",
+    "variety": "Specific variety or null",
+    "reason": "One sentence — why this works well with what's already in this area",
+    "sow_note": "When and how to add this in one sentence",
+    "placement_note": "Soft placement e.g. 'sow between rows', 'around the edges', 'in gaps if available' — never claim guaranteed space",
+    "companion_note": "Specific benefit to named crops in this area e.g. 'deters aphids from the potatoes' or null",
+    "benefit_tags": [] — pick from: quick crop, supports pollinators, deters pests, nitrogen fixing, improves soil, easy to grow, succession candidate, compact, good for ${areaType}
   }
 ]
 
-The prep suggestion can be: soil enrichment (compost, manure, green manure), a companion plant (marigolds, nasturtiums, borage), or seasonal ground prep. Pick the most relevant given rotation history and season.`;
+Respond ONLY with a JSON object — no markdown, no explanation:
+{ "summary": "...", "suggestions": [...] }`;
+
+  try {
+    const prompt = isEmpty ? emptyPrompt : populatedPrompt;
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -1235,32 +1341,41 @@ The prep suggestion can be: soil enrichment (compost, manure, green manure), a c
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 1200,
+        max_tokens: 1400,
         messages: [{ role: "user", content: prompt }],
       }),
     });
 
     const raw  = await response.json();
     const text = raw.content?.[0]?.text || "";
-    const match = text.match(/\[[\s\S]*\]/);
-    if (!match) throw new Error("No JSON array in response");
-    const suggestions = JSON.parse(match[0]);
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) throw new Error("No JSON object in response");
+    const parsed = JSON.parse(match[0]);
+    const suggestions = parsed.suggestions || [];
+    const summary     = parsed.summary || null;
 
-    // Store suggestions
     await db.from("planting_suggestions").upsert({
-      area_id:      req.params.id,
+      area_id:          req.params.id,
       suggestions,
-      generated_at: new Date().toISOString(),
+      summary,
+      is_empty_area:    isEmpty,
+      crop_fingerprint: cropFingerprint,
+      generated_at:     new Date().toISOString(),
     }, { onConflict: "area_id" });
 
-    res.json({ suggestions, generated_at: new Date().toISOString() });
+    res.json({
+      suggestions,
+      summary,
+      is_empty_area: isEmpty,
+      generated_at:  new Date().toISOString(),
+    });
   } catch (e) {
-    console.error("[Suggestions] Error:", e.message);
+    console.error("[Area Optimiser] Error:", e.message);
     res.status(500).json({ error: e.message });
   }
 });
 
-// DELETE suggestions when a crop is added to the area (called internally)
+// Clear suggestions cache for an area — call whenever crops change in that area
 async function clearSuggestions(areaId, db) {
   await db.from("planting_suggestions").delete().eq("area_id", areaId);
 }
@@ -1917,10 +2032,14 @@ app.post("/harvest-log", requireAuth,
 
     // Mark crop instance as harvested
     if (crop_instance_id) {
-      await req.db.from("crop_instances")
+      const { data: harvestedCrop } = await req.db.from("crop_instances")
         .update({ status: "harvested", updated_at: new Date().toISOString() })
         .eq("id", crop_instance_id)
-        .eq("user_id", req.user.id);
+        .eq("user_id", req.user.id)
+        .select("area_id").single();
+
+      // Invalidate suggestions cache — area contents have changed
+      if (harvestedCrop?.area_id) await clearSuggestions(harvestedCrop.area_id, req.db);
     }
 
     res.status(201).json(data);
