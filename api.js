@@ -2845,12 +2845,13 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
       .upsert({ id: userId, name, postcode, updated_at: new Date().toISOString() }, { onConflict: "id" });
 
     // 2. Create default location (or reuse existing)
+    // Use supabaseService to bypass RLS — user record may not be visible to user-scoped client yet
     let locationId;
-    const { data: existingLocs } = await db.from("locations").select("id").eq("user_id", userId).limit(1);
+    const { data: existingLocs } = await supabaseService.from("locations").select("id").eq("user_id", userId).limit(1);
     if (existingLocs?.length) {
       locationId = existingLocs[0].id;
     } else {
-      const { data: loc, error: locErr } = await db.from("locations").insert({
+      const { data: loc, error: locErr } = await supabaseService.from("locations").insert({
         user_id: userId, name: "My garden", postcode,
       }).select("id").single();
       if (locErr) throw new Error("Location: " + locErr.message);
@@ -2859,12 +2860,12 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
 
     // 3. Create first area (or reuse existing)
     let areaId;
-    const { data: existingAreas } = await db.from("growing_areas").select("id").eq("location_id", locationId).limit(1);
+    const { data: existingAreas } = await supabaseService.from("growing_areas").select("id").eq("location_id", locationId).limit(1);
     if (existingAreas?.length) {
       areaId = existingAreas[0].id;
     } else {
       const finalAreaName = area_name?.trim() || "My first area";
-      const { data: area, error: areaErr } = await db.from("growing_areas").insert({
+      const { data: area, error: areaErr } = await supabaseService.from("growing_areas").insert({
         location_id: locationId, name: finalAreaName, type: area_type,
       }).select("id").single();
       if (areaErr) throw new Error("Area: " + areaErr.message);
@@ -2899,7 +2900,7 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
       };
     });
 
-    await db.from("crop_instances").insert(cropInserts);
+    await supabaseService.from("crop_instances").insert(cropInserts);
 
     // 6. Run rule engine
     const tasks = await runRuleEngine(userId);
