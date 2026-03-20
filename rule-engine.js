@@ -172,10 +172,19 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = []) 
     : (harvestStart ? monthToDate(harvestStart) : null);
 
   // Feed next due
+  // If the calculated due date is in the past and the task was never completed
+  // (no lastFedAt), advance the anchor to today so we don't pile up overdue tasks.
+  // This handles the "missed task" case — next occurrence reschedules from now.
   let feedNextDue = null;
   if (feedInterval) {
     const anchor = lastFedAt || transplantDate || sowDate;
-    if (anchor) feedNextDue = addDays(anchor, feedInterval);
+    if (anchor) {
+      const rawNextDue = addDays(anchor, feedInterval);
+      const today = todayISO();
+      // If overdue and never been fed (lastFedAt is null), reschedule from today
+      // so the task appears as "due now" rather than stacking up past-dated tasks
+      feedNextDue = (!lastFedAt && rawNextDue < today) ? today : rawNextDue;
+    }
   }
 
   // Environment
@@ -851,6 +860,8 @@ class ScheduledRuleEngine {
     if (ctx.feedNextDue && ctx.feedInterval) {
       const feedDue = ctx.feedNextDue;
       if (withinLookahead(feedDue, LOOKAHEAD_DAYS.feed) || isOverdue(feedDue)) {
+        // If overdue, schedule for today — feedNextDue already accounts for missed
+        // tasks by anchoring from today when never fed (see buildCropContext)
         const scheduledFor = isOverdue(feedDue) ? today : feedDue;
         results.push(candidate(ctx, {
           ruleId:       "feed_scheduled",
@@ -1208,7 +1219,7 @@ class RuleEngine {
           .from("tasks")
           .upsert(task, {
             onConflict:       "source_key",
-            ignoreDuplicates: false,
+            ignoreDuplicates: true,   // never overwrite existing tasks — preserves completed_at
           })
           .select("id, engine_type, status")
           .single();
@@ -1252,16 +1263,53 @@ class RuleEngine {
         .from("crop_instances").select("id")
         .eq("user_id", userId).eq("active", true);
       if (error || !activeCrops) return;
+
       const activeIds = activeCrops.map(c => c.id);
-      if (!activeIds.length) return;
-      const { data: orphans } = await this.supabase
-        .from("tasks").select("id")
+
+      if (activeIds.length) {
+        // Delete incomplete tasks linked to crop_instance_ids that are no longer active
+        const { data: orphans } = await this.supabase
+          .from("tasks").select("id")
+          .eq("user_id", userId).is("completed_at", null)
+          .not("crop_instance_id", "in", `(${activeIds.join(",")})`)
+          .not("crop_instance_id", "is", null);
+        if (orphans?.length) {
+          const ids = orphans.map(t => t.id);
+          await this.supabase.from("rule_log").delete().in("task_id", ids);
+          await this.supabase.from("tasks").delete().in("id", ids);
+        }
+      } else {
+        // No active crops — delete all incomplete crop-linked tasks
+        const { data: allLinked } = await this.supabase
+          .from("tasks").select("id")
+          .eq("user_id", userId).is("completed_at", null)
+          .not("crop_instance_id", "is", null);
+        if (allLinked?.length) {
+          const ids = allLinked.map(t => t.id);
+          await this.supabase.from("rule_log").delete().in("task_id", ids);
+          await this.supabase.from("tasks").delete().in("id", ids);
+        }
+      }
+
+      // Delete area-level tasks (no crop_instance_id) whose source_key
+      // references a crop UUID that is no longer active — catches sow/check
+      // tasks for deleted crops that have no crop_instance_id set
+      const activeIdSet = new Set(activeIds);
+      const { data: areaTasks } = await this.supabase
+        .from("tasks").select("id, source_key")
         .eq("user_id", userId).is("completed_at", null)
-        .not("crop_instance_id", "in", `(${activeIds.join(",")})`);
-      if (orphans?.length) {
-        const ids = orphans.map(t => t.id);
-        await this.supabase.from("rule_log").delete().in("task_id", ids);
-        await this.supabase.from("tasks").delete().in("id", ids);
+        .is("crop_instance_id", null);
+      if (areaTasks?.length) {
+        const stale = areaTasks.filter(t => {
+          if (!t.source_key) return false;
+          const uuids = t.source_key.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g) || [];
+          return uuids.some(id => !activeIdSet.has(id));
+        });
+        if (stale.length) {
+          const ids = stale.map(t => t.id);
+          await this.supabase.from("rule_log").delete().in("task_id", ids);
+          await this.supabase.from("tasks").delete().in("id", ids);
+        }
       }
     } catch (err) {
       console.error("[RuleEngine] Cleanup error:", err.message);
