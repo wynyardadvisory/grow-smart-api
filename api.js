@@ -2986,13 +2986,13 @@ app.post("/admin/onboarding-recovery-email", requireAuth, requireAdmin, async (r
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "Authorization": \`Bearer \${process.env.RESEND_API_KEY}\`,
+            "Authorization": `Bearer \${process.env.RESEND_API_KEY}`,
           },
           body: JSON.stringify({
             from: "Vercro <hello@vercro.com>",
             to: user.email,
             subject: "Your Vercro garden plan is ready 🌱",
-            html: \`
+            html: `
               <div style="font-family: Georgia, serif; max-width: 520px; margin: 0 auto; padding: 40px 24px; color: #1A2E28;">
                 <div style="font-size: 28px; margin-bottom: 8px;">🌱</div>
                 <h1 style="font-size: 24px; font-weight: 900; margin: 0 0 16px; color: #2F5D50;">
@@ -3014,7 +3014,7 @@ app.post("/admin/onboarding-recovery-email", requireAuth, requireAdmin, async (r
                 <hr style="border: none; border-top: 1px solid #eee; margin: 32px 0;" />
                 <p style="font-size: 12px; color: #aaa;">vercro.com · Built for UK growers</p>
               </div>
-            \`,
+            `,
           }),
         });
 
