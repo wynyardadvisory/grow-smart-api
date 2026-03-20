@@ -2183,15 +2183,13 @@ app.post("/harvest-log", requireAuth,
       quantity_value, quantity_unit, notes,
     } = req.body;
 
-    // Map frontend field names to actual DB column names
+    // Insert using actual DB columns only
     const { data, error } = await req.db.from("harvest_log").insert({
       user_id:          req.user.id,
       crop_instance_id: crop_instance_id || null,
-      crop_name,
-      variety:          variety || null,
       harvested_at:     harvested_at || new Date().toISOString().split("T")[0],
-      yield_score:      yield_score  || null,   // volume/quantity rating 1-10
-      quality:          quality_score || null,   // quality rating 1-10
+      yield_score:      yield_score   || null,
+      quality:          quality_score || null,
       quantity_g:       quantity_value ? parseFloat(quantity_value) : null,
       notes:            notes || null,
     }).select().single();
