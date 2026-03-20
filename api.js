@@ -2852,7 +2852,6 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
     } else {
       const { data: loc, error: locErr } = await db.from("locations").insert({
         user_id: userId, name: "My garden", postcode,
-        created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
       }).select("id").single();
       if (locErr) throw new Error("Location: " + locErr.message);
       locationId = loc.id;
@@ -2867,7 +2866,6 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
       const finalAreaName = area_name?.trim() || "My first area";
       const { data: area, error: areaErr } = await db.from("growing_areas").insert({
         location_id: locationId, name: finalAreaName, type: area_type,
-        created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
       }).select("id").single();
       if (areaErr) throw new Error("Area: " + areaErr.message);
       areaId = area.id;
@@ -2898,8 +2896,6 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
         start_date_confidence: "inferred",
         source:                "onboarding",
         quantity:              1,
-        created_at:            new Date().toISOString(),
-        updated_at:            new Date().toISOString(),
       };
     });
 
