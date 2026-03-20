@@ -2840,9 +2840,11 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
   }
 
   try {
-    // 1. Save profile
-    await db.from("profiles")
+    // 1. Save profile — use supabaseService so it bypasses RLS and definitely commits
+    // locations.user_id FK references profiles.id so profile MUST exist before location insert
+    const { error: profileErr } = await supabaseService.from("profiles")
       .upsert({ id: userId, name, postcode, updated_at: new Date().toISOString() }, { onConflict: "id" });
+    if (profileErr) throw new Error("Profile: " + profileErr.message);
 
     // 2. Create default location (or reuse existing)
     // Use supabaseService to bypass RLS — user record may not be visible to user-scoped client yet
