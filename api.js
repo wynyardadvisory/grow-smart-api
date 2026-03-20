@@ -313,7 +313,16 @@ app.delete("/locations/:id", requireAuth, async (req, res) => {
     const cropIds = (crops || []).map(c => c.id);
     if (cropIds.length > 0) {
       await req.db.from("tasks").delete().in("crop_instance_id", cropIds).eq("user_id", userId);
-      await req.db.from("crop_instances").delete().in("id", cropIds).eq("user_id", userId);
+      // Soft-delete active crops — preserves harvested crop history for future rotation suggestions
+      // Harvested crops (status=harvested) are kept with area_id intact so rotation is queryable
+      const { data: activeCrops } = await req.db.from("crop_instances")
+        .select("id").in("id", cropIds).eq("active", true);
+      const activeCropIds = (activeCrops || []).map(c => c.id);
+      if (activeCropIds.length > 0) {
+        await req.db.from("crop_instances")
+          .update({ active: false, updated_at: new Date().toISOString() })
+          .in("id", activeCropIds).eq("user_id", userId);
+      }
     }
     await req.db.from("growing_areas").delete().in("id", areaIds).eq("user_id", userId);
   }
@@ -2174,31 +2183,42 @@ app.post("/harvest-log", requireAuth,
       quantity_value, quantity_unit, notes,
     } = req.body;
 
+    // Map frontend field names to actual DB column names
     const { data, error } = await req.db.from("harvest_log").insert({
       user_id:          req.user.id,
       crop_instance_id: crop_instance_id || null,
       crop_name,
       variety:          variety || null,
       harvested_at:     harvested_at || new Date().toISOString().split("T")[0],
-      yield_score:      yield_score || null,
-      quality_score:    quality_score || null,
-      quantity_value:   quantity_value || null,
-      quantity_unit:    quantity_unit || null,
+      yield_score:      yield_score  || null,   // volume/quantity rating 1-10
+      quality:          quality_score || null,   // quality rating 1-10
+      quantity_g:       quantity_value ? parseFloat(quantity_value) : null,
       notes:            notes || null,
     }).select().single();
 
     if (error) return res.status(500).json({ error: error.message });
 
-    // Mark crop instance as harvested
+    // Mark crop instance as harvested and preserve rotation history
+    // active=false removes from Garden/tasks. harvested_at stored for future rotation suggestions.
+    // area_id retained on the row — never nulled — so rotation history is queryable per bed.
     if (crop_instance_id) {
+      const harvestedAt = new Date().toISOString().split("T")[0];
       const { data: harvestedCrop } = await req.db.from("crop_instances")
-        .update({ status: "harvested", updated_at: new Date().toISOString() })
+        .update({
+          status:       "harvested",
+          active:       false,
+          harvested_at: harvestedAt,
+          updated_at:   new Date().toISOString(),
+        })
         .eq("id", crop_instance_id)
         .eq("user_id", req.user.id)
         .select("area_id").single();
 
       // Invalidate suggestions cache — area contents have changed
       if (harvestedCrop?.area_id) await clearSuggestions(harvestedCrop.area_id, req.db);
+
+      // Re-run rule engine so tasks for this crop are cleaned up immediately
+      await runRuleEngine(req.user.id);
     }
 
     res.status(201).json(data);
@@ -2382,10 +2402,11 @@ app.get("/dashboard", requireAuth, async (req, res) => {
   const harvestForecast = crops
     .filter(c => c.crop_def?.harvest_month_start)
     .map(c => ({
-      crop:         c.name,
-      variety:      c.variety || null,
-      window_start: new Date(year, c.crop_def.harvest_month_start - 1, 1).toISOString().split("T")[0],
-      window_end:   new Date(year, c.crop_def.harvest_month_end   - 1, 28).toISOString().split("T")[0],
+      crop:             c.name,
+      variety:          c.variety || null,
+      crop_instance_id: c.id,   // required to mark crop as harvested + preserve rotation history
+      window_start:     new Date(year, c.crop_def.harvest_month_start - 1, 1).toISOString().split("T")[0],
+      window_end:       new Date(year, c.crop_def.harvest_month_end   - 1, 28).toISOString().split("T")[0],
     }));
 
   // ── Missing data prompts ──────────────────────────────────────────────────
@@ -2927,6 +2948,102 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
     res.json({ ok: true, locationId, areaId, tasksGenerated: tasks?.length || 0 });
   } catch (err) {
     console.error("[Onboarding] Error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// =============================================================================
+// POST /admin/onboarding-recovery-email
+// One-shot: finds last 50 signups with no crops (unactivated due to bug),
+// skips anyone already sent this email, sends recovery email via Resend.
+// =============================================================================
+app.post("/admin/onboarding-recovery-email", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    // Get last 50 auth users by signup date
+    const { data: { users: allUsers } } = await supabaseService.auth.admin.listUsers({ perPage: 50, page: 1 });
+    const recent = (allUsers || [])
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+      .slice(0, 50);
+
+    // Find which have no crop_instances (unactivated)
+    const userIds = recent.map(u => u.id);
+    const { data: activatedCrops } = await supabaseService.from("crop_instances")
+      .select("user_id").in("user_id", userIds);
+    const activatedIds = new Set((activatedCrops || []).map(c => c.user_id));
+    const unactivated = recent.filter(u => !activatedIds.has(u.id));
+
+    // Skip anyone already sent this recovery email
+    const { data: alreadySent } = await supabaseService.from("email_log")
+      .select("user_id").eq("email_type", "onboarding_recovery").in("user_id", userIds);
+    const alreadySentIds = new Set((alreadySent || []).map(e => e.user_id));
+    const toEmail = unactivated.filter(u => !alreadySentIds.has(u.id) && u.email);
+
+    const results = [];
+    for (const user of toEmail) {
+      try {
+        const resp = await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": \`Bearer \${process.env.RESEND_API_KEY}\`,
+          },
+          body: JSON.stringify({
+            from: "Vercro <hello@vercro.com>",
+            to: user.email,
+            subject: "Your Vercro garden plan is ready 🌱",
+            html: \`
+              <div style="font-family: Georgia, serif; max-width: 520px; margin: 0 auto; padding: 40px 24px; color: #1A2E28;">
+                <div style="font-size: 28px; margin-bottom: 8px;">🌱</div>
+                <h1 style="font-size: 24px; font-weight: 900; margin: 0 0 16px; color: #2F5D50;">
+                  Sorry — we had a setup issue
+                </h1>
+                <p style="font-size: 16px; line-height: 1.6; margin: 0 0 16px; color: #444;">
+                  When you signed up for Vercro, a technical issue meant we couldn't finish setting up your garden plan. That's now fixed.
+                </p>
+                <p style="font-size: 16px; line-height: 1.6; margin: 0 0 24px; color: #444;">
+                  It takes under 60 seconds to complete — and once you do, you'll have a personalised daily task plan waiting for you based on exactly what you're growing.
+                </p>
+                <a href="https://app.vercro.com" style="display: inline-block; background: #2F5D50; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 10px; font-size: 16px; font-weight: 700; margin-bottom: 32px;">
+                  Complete my garden setup →
+                </a>
+                <p style="font-size: 14px; color: #888; line-height: 1.6; margin: 0;">
+                  If you have any questions just reply to this email.<br>
+                  — The Vercro team
+                </p>
+                <hr style="border: none; border-top: 1px solid #eee; margin: 32px 0;" />
+                <p style="font-size: 12px; color: #aaa;">vercro.com · Built for UK growers</p>
+              </div>
+            \`,
+          }),
+        });
+
+        if (resp.ok) {
+          // Log so we never send twice
+          await supabaseService.from("email_log").insert({
+            user_id:    user.id,
+            email_type: "onboarding_recovery",
+            sent_at:    new Date().toISOString(),
+          });
+          results.push({ email: user.email, status: "sent" });
+        } else {
+          const err = await resp.json();
+          results.push({ email: user.email, status: "failed", error: err });
+        }
+      } catch (e) {
+        results.push({ email: user.email, status: "error", error: e.message });
+      }
+    }
+
+    res.json({
+      total_recent:    recent.length,
+      unactivated:     unactivated.length,
+      already_sent:    alreadySentIds.size,
+      emails_sent:     results.filter(r => r.status === "sent").length,
+      results,
+    });
+  } catch (err) {
+    console.error("[OnboardingRecovery]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
