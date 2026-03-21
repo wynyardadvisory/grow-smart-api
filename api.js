@@ -3213,7 +3213,7 @@ app.post("/crops/:id/observe", requireAuth, async (req, res) => {
   if (symptom_code === "fruit_set_confirmed" || confirmed_stage === "fruiting") { updates.stage = "fruiting"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; engineActions.push("stage_updated"); }
   if (symptom_code === "seedling_emerged" || confirmed_stage === "seedling") { updates.stage = "seedling"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; engineActions.push("stage_updated"); }
   if (symptom_code === "vegetative_confirmed" || confirmed_stage === "vegetative") { updates.stage = "vegetative"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; engineActions.push("stage_updated"); }
-  if (symptom_code === "harvest_started") { updates.status = "harvesting"; engineActions.push("harvest_started"); processBadgeEvent(req.user.id, "harvest_logged").catch(console.error); }
+  if (symptom_code === "harvest_started" || confirmed_stage === "harvesting") { updates.status = "harvesting"; updates.stage = "harvesting"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; engineActions.push("harvest_started"); processBadgeEvent(req.user.id, "harvest_logged").catch(console.error); }
   if (symptom_code === "transplant_done") { updates.status = "transplanted"; updates.transplant_date = new Date().toISOString().split("T")[0]; engineActions.push("transplant_done"); }
   if (symptom_code === "plant_struggling") { updates.missed_task_note = "Plant reported as struggling — check growing conditions"; engineActions.push("struggling_flagged"); }
   if (symptom_code === "looks_healthy") { updates.missed_task_note = null; engineActions.push("health_confirmed"); }
