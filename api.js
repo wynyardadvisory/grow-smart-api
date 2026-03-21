@@ -3200,7 +3200,7 @@ app.post("/crops/:id/observe", requireAuth, async (req, res) => {
     .select("id, name, status, stage, crop_def_id")
     .eq("id", req.params.id).eq("user_id", req.user.id).single();
   if (cropErr || !crop) return res.status(404).json({ error: "Crop not found" });
-  const { data: obs, error: obsErr } = await req.db.from("observation_logs").insert({
+  const { data: obs, error: obsErr } = await supabaseService.from("observation_logs").insert({
     user_id: req.user.id, crop_id: req.params.id,
     observed_at: new Date().toISOString().split("T")[0],
     observation_type, symptom_code: symptom_code || null,
@@ -3217,7 +3217,7 @@ app.post("/crops/:id/observe", requireAuth, async (req, res) => {
   if (symptom_code === "transplant_done") { updates.status = "transplanted"; updates.transplant_date = new Date().toISOString().split("T")[0]; engineActions.push("transplant_done"); }
   if (symptom_code === "plant_struggling") { updates.missed_task_note = "Plant reported as struggling — check growing conditions"; engineActions.push("struggling_flagged"); }
   if (symptom_code === "looks_healthy") { updates.missed_task_note = null; engineActions.push("health_confirmed"); }
-  if (Object.keys(updates).length > 0) { updates.updated_at = new Date().toISOString(); await req.db.from("crop_instances").update(updates).eq("id", req.params.id).eq("user_id", req.user.id); }
+  if (Object.keys(updates).length > 0) { updates.updated_at = new Date().toISOString(); const { error: updateErr } = await supabaseService.from("crop_instances").update(updates).eq("id", req.params.id).eq("user_id", req.user.id); if (updateErr) console.error("[Observe] crop update error:", updateErr.message); }
   await runRuleEngine(req.user.id);
   res.json({ observation: obs, crop_updated: Object.keys(updates).length > 0, engine_actions: engineActions });
 });
