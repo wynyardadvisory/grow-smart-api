@@ -110,6 +110,27 @@ function sourceKey(parts) {
     .join("|");
 }
 
+// Snap a date to a stable window anchor so window-based tasks
+// don't regenerate every day with a new key.
+// - expiryDays >= 21  → snap to month (YYYY-MM)   — monthly tasks
+// - expiryDays >= 7   → snap to week  (YYYY-Www)  — weekly tasks
+// - expiryDays < 7    → use exact date             — urgent/daily tasks
+function windowAnchor(dateStr, expiryDays) {
+  if (!dateStr) return dateStr;
+  const d = new Date(dateStr + "T12:00:00Z");
+  if (expiryDays >= 21) {
+    // Month anchor: YYYY-MM
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+  }
+  if (expiryDays >= 7) {
+    // ISO week anchor: YYYY-Www
+    const jan4 = new Date(Date.UTC(d.getUTCFullYear(), 0, 4));
+    const weekNum = Math.ceil(((d - jan4) / 86400000 + jan4.getUTCDay() + 1) / 7);
+    return `${d.getUTCFullYear()}-W${String(weekNum).padStart(2, "0")}`;
+  }
+  return dateStr; // exact date for urgent tasks
+}
+
 // ── Crop Context Builder ──────────────────────────────────────────────────────
 
 function buildCropContext(crop, weather, envMods, userFeeds, observations = []) {
@@ -311,11 +332,16 @@ function candidate(ctx, opts) {
     ? ctx.cropName.toLowerCase().replace(/\s+/g, "_")
     : ctx.cropId;
 
+  // Use a window-stable date anchor in the key so tasks that fire
+  // within a broad window (mulch, prune, monitor) don't regenerate
+  // every day with a new key after being completed.
+  // Feed and precise-date tasks use exact date; window tasks snap to month/week.
+  const keyDate = windowAnchor(scheduledFor || today, expiryDays);
   const key = sourceKey({
     u: ctx.userId,
     c: cropKey,
     r: ruleId,
-    d: scheduledFor || today,
+    d: keyDate,
   });
 
   return {
