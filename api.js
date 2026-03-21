@@ -122,7 +122,7 @@ function buildTimeline(crop) {
   const def     = crop.crop_def || {};
   const variety = crop.variety  || {};
 
-  const sowDate  = crop.sown_date || crop.transplanted_date || null;
+  const sowDate  = crop.stage_adjusted_sow_date || crop.sown_date || crop.transplanted_date || null;
   const dtm      = variety.days_to_maturity_max || variety.days_to_maturity_min
                  || def.days_to_maturity_max    || def.days_to_maturity_min || null;
 
@@ -155,9 +155,9 @@ function buildTimeline(crop) {
     }
   }
 
-  // Infer current stage from days grown
-  let currentStage = "seed";
-  if (dtm) {
+  // Infer current stage from days grown, unless stage has been manually confirmed
+  let currentStage = crop.stage || "seed";
+  if (crop.stage_confidence !== "confirmed" && dtm) {
     const pct = daysSown / dtm;
     if      (pct >= 0.90) currentStage = "harvesting";
     else if (pct >= 0.70) currentStage = "fruiting";
@@ -166,9 +166,6 @@ function buildTimeline(crop) {
     else if (pct >= 0.08) currentStage = "seedling";
     else                  currentStage = "seed";
   }
-
-  // Override with confirmed stage from crop record
-  if (crop.stage && crop.stage !== "seed") currentStage = crop.stage;
 
   const STAGE_ORDER = ["seed", "seedling", "vegetative", "flowering", "fruiting", "harvesting"];
   const currentIdx  = STAGE_ORDER.indexOf(currentStage);
