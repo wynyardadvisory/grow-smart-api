@@ -156,7 +156,11 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = []) 
   const cropGroup      = def.category ?? null;
 
   // Date anchors
-  const sowDate         = crop.sown_date         || crop.transplanted_date || null;
+  // If the user has manually confirmed a stage, we use stage_adjusted_sow_date
+  // as the effective sow anchor for harvest date and pct calculations.
+  // The original sown_date is never modified — null out stage_adjusted_sow_date to revert.
+  const rawSowDate      = crop.sown_date         || crop.transplanted_date || null;
+  const sowDate         = crop.stage_adjusted_sow_date || rawSowDate;
   const transplantDate  = crop.transplanted_date  || crop.transplant_date  || null;
   const plantedOutDate  = crop.planted_out_date   || null;
   const lastFedAt       = crop.last_fed_at        || null;
@@ -165,9 +169,10 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = []) 
   const daysSown = daysSince(sowDate);
   const pctGrown = daysSown !== null && dtm > 0 ? daysSown / dtm : null;
 
+  // If stage_confidence is confirmed, respect the stored stage rather than re-inferring
   let inferredStage = crop.stage || "seed";
   const vegEstablishments = ["runner","tuber","crown","cane"];
-  if (!vegEstablishments.includes(def.default_establishment) && sowDate) {
+  if (crop.stage_confidence !== "confirmed" && !vegEstablishments.includes(def.default_establishment) && sowDate) {
     // Infer from DTM percentage
     if      (pctGrown === null)    inferredStage = "seed";
     else if (pctGrown < 0.08)     inferredStage = "seed";

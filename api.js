@@ -3209,10 +3209,32 @@ app.post("/crops/:id/observe", requireAuth, async (req, res) => {
   if (obsErr) return res.status(500).json({ error: obsErr.message });
   const updates = {};
   const engineActions = [];
-  if (symptom_code === "flowering_confirmed" || confirmed_stage === "flowering") { updates.stage = "flowering"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; engineActions.push("stage_updated"); }
-  if (symptom_code === "fruit_set_confirmed" || confirmed_stage === "fruiting") { updates.stage = "fruiting"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; engineActions.push("stage_updated"); }
-  if (symptom_code === "seedling_emerged" || confirmed_stage === "seedling") { updates.stage = "seedling"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; engineActions.push("stage_updated"); }
-  if (symptom_code === "vegetative_confirmed" || confirmed_stage === "vegetative") { updates.stage = "vegetative"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; engineActions.push("stage_updated"); }
+  // STAGE_DTM_PERCENT mirrors rule-engine.js — used to back-calculate adjusted sow date
+  const STAGE_DTM_PERCENT = { seed: 0, seedling: 0.08, vegetative: 0.25, flowering: 0.55, fruiting: 0.70, harvesting: 0.90 };
+
+  // When a stage is confirmed, back-calculate stage_adjusted_sow_date so that:
+  //   today = sow_date + (dtm * stage_pct)  =>  sow_date = today - (dtm * stage_pct)
+  // This shifts the harvest date and % bar to reflect the confirmed stage.
+  // Original sown_date is never modified. Set stage_adjusted_sow_date = null to revert.
+  const calcAdjustedSowDate = async (stageKey) => {
+    const pct = STAGE_DTM_PERCENT[stageKey];
+    if (pct === undefined || pct === 0) return null;
+    const { data: cropDef } = await supabaseService
+      .from("crop_instances")
+      .select("crop_def:crop_def_id(days_to_maturity_min), variety:variety_id(days_to_maturity_min)")
+      .eq("id", req.params.id).single();
+    const dtm = cropDef?.variety?.days_to_maturity_min ?? cropDef?.crop_def?.days_to_maturity_min ?? null;
+    if (!dtm) return null;
+    const daysToSubtract = Math.round(dtm * pct);
+    const adjusted = new Date();
+    adjusted.setDate(adjusted.getDate() - daysToSubtract);
+    return adjusted.toISOString().split("T")[0];
+  };
+
+  if (symptom_code === "flowering_confirmed" || confirmed_stage === "flowering") { updates.stage = "flowering"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; updates.stage_adjusted_sow_date = await calcAdjustedSowDate("flowering"); engineActions.push("stage_updated"); }
+  if (symptom_code === "fruit_set_confirmed" || confirmed_stage === "fruiting") { updates.stage = "fruiting"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; updates.stage_adjusted_sow_date = await calcAdjustedSowDate("fruiting"); engineActions.push("stage_updated"); }
+  if (symptom_code === "seedling_emerged" || confirmed_stage === "seedling") { updates.stage = "seedling"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; updates.stage_adjusted_sow_date = await calcAdjustedSowDate("seedling"); engineActions.push("stage_updated"); }
+  if (symptom_code === "vegetative_confirmed" || confirmed_stage === "vegetative") { updates.stage = "vegetative"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; updates.stage_adjusted_sow_date = await calcAdjustedSowDate("vegetative"); engineActions.push("stage_updated"); }
   if (symptom_code === "harvest_started" || confirmed_stage === "harvesting") { updates.status = "harvesting"; updates.stage = "harvesting"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; engineActions.push("harvest_started"); processBadgeEvent(req.user.id, "harvest_logged").catch(console.error); }
   if (symptom_code === "transplant_done") { updates.status = "transplanted"; updates.transplant_date = new Date().toISOString().split("T")[0]; engineActions.push("transplant_done"); }
   if (symptom_code === "plant_struggling") { updates.missed_task_note = "Plant reported as struggling — check growing conditions"; engineActions.push("struggling_flagged"); }
