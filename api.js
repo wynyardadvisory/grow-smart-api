@@ -175,7 +175,9 @@ function buildTimeline(crop) {
   const harvestEnd   = def.harvest_month_end;
   const year         = new Date().getFullYear();
   let harvestDate    = dtm ? addDays(sowDate, dtm) : null;
-  if (harvestStart) {
+  // Only use fixed harvest month if stage has NOT been manually confirmed.
+  // If confirmed, use the DTM-based calculation from stage_adjusted_sow_date instead.
+  if (harvestStart && crop.stage_confidence !== "confirmed") {
     harvestDate = new Date(year, harvestStart - 1, 15).toISOString().split("T")[0];
   }
 
