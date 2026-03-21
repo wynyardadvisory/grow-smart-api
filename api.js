@@ -3206,25 +3206,30 @@ app.post("/crops/:id/observe", requireAuth, async (req, res) => {
   if (obsErr) return res.status(500).json({ error: obsErr.message });
   const updates = {};
   const engineActions = [];
-  // STAGE_DTM_PERCENT mirrors rule-engine.js — used to back-calculate adjusted sow date
+  // STAGE_DTM_PERCENT mirrors rule-engine.js
   const STAGE_DTM_PERCENT = { seed: 0, seedling: 0.08, vegetative: 0.25, flowering: 0.55, fruiting: 0.70, harvesting: 0.90 };
 
-  // When a stage is confirmed, back-calculate stage_adjusted_sow_date so that:
-  //   today = sow_date + (dtm * stage_pct)  =>  sow_date = today - (dtm * stage_pct)
-  // This shifts the harvest date and % bar to reflect the confirmed stage.
-  // Original sown_date is never modified. Set stage_adjusted_sow_date = null to revert.
+  // When a stage is confirmed, calculate an adjusted sow date so that:
+  //   adjusted_sow_date = today - (DTM * stage_pct)
+  // This means the harvest date (adjusted_sow_date + DTM) = today + (DTM * remaining_pct)
+  // Example: confirmed fruiting today, DTM=76, fruiting=70%
+  //   => adjusted_sow_date = today - 53 days
+  //   => harvest = adjusted_sow_date + 76 = today + 23 days
+  // Original sown_date is NEVER modified. Set stage_adjusted_sow_date = null to revert.
   const calcAdjustedSowDate = async (stageKey) => {
     const pct = STAGE_DTM_PERCENT[stageKey];
     if (pct === undefined || pct === 0) return null;
-    const { data: cropDef } = await supabaseService
+    const { data: cropData } = await supabaseService
       .from("crop_instances")
       .select("crop_def:crop_def_id(days_to_maturity_min), variety:variety_id(days_to_maturity_min)")
       .eq("id", req.params.id).single();
-    const dtm = cropDef?.variety?.days_to_maturity_min ?? cropDef?.crop_def?.days_to_maturity_min ?? null;
+    const dtm = cropData?.variety?.days_to_maturity_min ?? cropData?.crop_def?.days_to_maturity_min ?? null;
     if (!dtm) return null;
-    const daysToSubtract = Math.round(dtm * pct);
+    // adjusted_sow = today - (dtm * stage_pct)
+    // so that harvest = adjusted_sow + dtm = today + (dtm * remaining_pct)
+    const daysFromSowToStage = Math.round(dtm * pct);
     const adjusted = new Date();
-    adjusted.setDate(adjusted.getDate() - daysToSubtract);
+    adjusted.setDate(adjusted.getDate() - daysFromSowToStage);
     return adjusted.toISOString().split("T")[0];
   };
 
