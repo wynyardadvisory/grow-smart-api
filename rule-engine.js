@@ -1238,8 +1238,10 @@ class RuleEngine {
       const locId = crop.location_id || crop.area?.location_id;
       const weather = weatherByLocation[locId] || null;
       const areaType = crop.area?.type || "raised_bed";
+      const areaName = crop.area?.name || "Garden area";
+      console.log(`[Watering] crop=${crop.name} areaId=${areaId} locId=${locId} rainMm=${weather?.rain_mm ?? null} areaType=${areaType}`);
       if (!areaMap.has(areaId)) {
-        areaMap.set(areaId, { crops: [], areaType, areaName: crop.area?.name || "Garden area", locId, weather, userId });
+        areaMap.set(areaId, { crops: [], areaType, areaName, locId, weather, userId });
       }
       areaMap.get(areaId).crops.push(crop);
     }
