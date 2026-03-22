@@ -1231,6 +1231,7 @@ class RuleEngine {
     // ── Watering tasks — one per area ────────────────────────────────────────
     // Group active outdoor crops by area, check dry conditions, generate one
     // watering task per area rather than per crop.
+    console.log("[Watering] block reached, crops.length=" + crops.length);
     const areaMap = new Map();
     for (const crop of crops) {
       if (crop.status === "planned" || crop.status === "sown_indoors" || crop.status === "finished") continue;
