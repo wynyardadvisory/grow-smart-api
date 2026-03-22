@@ -917,7 +917,20 @@ app.post("/tasks/:id/complete", requireAuth, async (req, res) => {
     const meta = data.meta ? (typeof data.meta === "string" ? JSON.parse(data.meta) : data.meta) : {};
     const transition = meta.status_transition;
 
-    if (data.task_type === "feed") {
+    if (data.task_type === "water") {
+      // Water tasks are area-level — update last_watered_at on all crops in the area
+      if (data.area_id) {
+        await supabaseService.from("crop_instances")
+          .update({ last_watered_at: completedAt, updated_at: completedAt })
+          .eq("area_id", data.area_id).eq("user_id", req.user.id);
+      } else if (data.crop_instance_id) {
+        await supabaseService.from("crop_instances")
+          .update({ last_watered_at: completedAt, updated_at: completedAt })
+          .eq("id", data.crop_instance_id).eq("user_id", req.user.id);
+      }
+      await runRuleEngine(req.user.id);
+
+    } else if (data.task_type === "feed") {
       // Use supabaseService — req.db (user JWT) is blocked by RLS on crop_instances writes
       await supabaseService.from("crop_instances")
         .update({ last_fed_at: completedAt, updated_at: completedAt })
