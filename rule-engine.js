@@ -1203,7 +1203,7 @@ class RuleEngine {
     const allCandidates = [];
 
     for (const crop of crops) {
-      const locId   = crop.location_id || crop.area?.location_id;
+      const locId   = crop.area?.location_id || crop.location_id;
       const weather = weatherByLocation[locId] || null;
       const areaType = crop.area?.type;
       const envMods  = envModifiers[areaType] || {};
@@ -1236,7 +1236,7 @@ class RuleEngine {
       if (crop.status === "planned" || crop.status === "sown_indoors" || crop.status === "finished") continue;
       const areaId = crop.area_id;
       if (!areaId) continue;
-      const locId = crop.location_id || crop.area?.location_id;
+      const locId = crop.area?.location_id || crop.location_id;
       const weather = weatherByLocation[locId] || null;
       const areaType = crop.area?.type || "raised_bed";
       const areaName = crop.area?.name || "Garden area";
