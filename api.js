@@ -95,6 +95,19 @@ async function runRuleEngine(userId) {
     console.log(`[RuleEngine] ${tasks.length} tasks generated for ${userId}`);
     // Re-apply any active blocked periods so adjustments are never lost on regeneration
     await reapplyAllBlockedPeriods(supabaseService, userId);
+
+    // ── Standalone watering task generator (debug) ────────────────────────
+    console.error("[WateringAPI] Starting standalone watering check for", userId);
+    try {
+      const { data: crops } = await supabaseService.from("crop_instances")
+        .select("id, name, status, stage, area_id, location_id, last_watered_at, area:area_id(type, name, location_id)")
+        .eq("user_id", userId).eq("active", true);
+      console.error("[WateringAPI] crops loaded:", crops?.length ?? 0);
+    } catch (we) {
+      console.error("[WateringAPI] Error:", we.message);
+    }
+    // ── End standalone watering debug ─────────────────────────────────────
+
     return tasks;
   } catch (err) {
     console.error("[RuleEngine] Error:", err.message);
@@ -2466,7 +2479,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
 
       // Check cache first
       const { data: cached } = await supabaseService.from("weather_cache")
-        .select("temp_c, condition, frost_risk, frost_risk_7day, icon_code, expires_at")
+        .select("temp_c, rain_mm, condition, frost_risk, frost_risk_7day, icon_code, expires_at")
         .eq("postcode", postcode)
         .gt("expires_at", new Date().toISOString())
         .single();
