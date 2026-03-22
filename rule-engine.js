@@ -1284,7 +1284,8 @@ class RuleEngine {
 
       // Only fire if overdue
       if (daysSinceWatered !== null && daysSinceWatered < DRY_DAY_THRESHOLD) continue;
-      if (daysSinceWatered === null && rainMm === null) continue; // unknown conditions — skip
+      // If never watered and no weather data, fire anyway — unknown is treated as dry
+      // (better to over-remind than under-remind for watering)
 
       // Prioritise crops most at risk: flowering/fruiting > seedling > vegetative
       const STAGE_PRIORITY = { flowering: 0, fruiting: 0, harvesting: 0, seedling: 1, vegetative: 2, seed: 3 };
