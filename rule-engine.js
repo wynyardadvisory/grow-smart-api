@@ -1247,6 +1247,10 @@ class RuleEngine {
     }
 
     const wateringToday = todayISO();
+    console.log(`[Watering] areaMap size=${areaMap.size} weatherByLocationKeys=${JSON.stringify(Object.keys(weatherByLocation))}`);
+    for (const [areaId, area] of areaMap.entries()) {
+      console.log(`[Watering] area=${area.areaName} locId=${area.locId} rainMm=${area.weather?.rain_mm ?? 'null'} crops=${area.crops.map(c=>c.name+'/'+c.status).join(',')}`);
+    }
 
     for (const [areaId, area] of areaMap.entries()) {
       const { crops: areaCrops, areaType, areaName, weather } = area;
