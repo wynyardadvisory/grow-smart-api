@@ -1492,10 +1492,12 @@ class RuleEngine {
     const result = {};
     for (const loc of locations || []) {
       if (!loc.postcode) continue;
+      // Trim to outward code only (e.g. "M1 1AE" -> "M1") to match weather_cache format
+      const outwardCode = loc.postcode.trim().split(" ")[0].toUpperCase();
       const { data: cached } = await this.supabase
         .from("weather_cache")
         .select("temp_c, frost_risk, frost_risk_7day, rain_mm, condition")
-        .eq("postcode", loc.postcode)
+        .eq("postcode", outwardCode)
         .gt("expires_at", new Date().toISOString())
         .single();
       if (cached) result[loc.id] = cached;
