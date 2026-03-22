@@ -372,7 +372,16 @@ app.put("/areas/:id", requireAuth, async (req, res) => {
 });
 
 app.delete("/areas/:id", requireAuth, async (req, res) => {
-  const { error } = await req.db.from("growing_areas").delete().eq("id", req.params.id);
+  const areaId = req.params.id;
+  // Must delete tasks and deactivate crops before removing the area
+  // to avoid foreign key constraint violations
+  const { error: taskErr } = await supabaseService.from("tasks")
+    .delete().eq("area_id", areaId).eq("user_id", req.user.id).is("completed_at", null);
+  if (taskErr) return res.status(500).json({ error: taskErr.message });
+  const { error: cropErr } = await supabaseService.from("crop_instances")
+    .update({ active: false, area_id: null }).eq("area_id", areaId).eq("user_id", req.user.id);
+  if (cropErr) return res.status(500).json({ error: cropErr.message });
+  const { error } = await supabaseService.from("growing_areas").delete().eq("id", areaId);
   if (error) return res.status(500).json({ error: error.message });
   res.status(204).send();
 });
