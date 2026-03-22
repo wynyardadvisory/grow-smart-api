@@ -1231,7 +1231,7 @@ class RuleEngine {
     // ── Watering tasks — one per area ────────────────────────────────────────
     // Group active outdoor crops by area, check dry conditions, generate one
     // watering task per area rather than per crop.
-    console.log("[Watering] block reached, crops.length=" + crops.length);
+    console.error("[Watering] block reached, crops.length=" + crops.length);
     const areaMap = new Map();
     for (const crop of crops) {
       if (crop.status === "planned" || crop.status === "sown_indoors" || crop.status === "finished") continue;
@@ -1248,9 +1248,9 @@ class RuleEngine {
     }
 
     const wateringToday = todayISO();
-    console.log(`[Watering] areaMap size=${areaMap.size} weatherByLocationKeys=${JSON.stringify(Object.keys(weatherByLocation))}`);
+    console.error(`[Watering] areaMap size=${areaMap.size} weatherByLocationKeys=${JSON.stringify(Object.keys(weatherByLocation))}`);
     for (const [areaId, area] of areaMap.entries()) {
-      console.log(`[Watering] area=${area.areaName} locId=${area.locId} rainMm=${area.weather?.rain_mm ?? 'null'} crops=${area.crops.map(c=>c.name+'/'+c.status).join(',')}`);
+      console.error(`[Watering] area=${area.areaName} locId=${area.locId} rainMm=${area.weather?.rain_mm ?? 'null'} crops=${area.crops.map(c=>c.name+'/'+c.status).join(',')}`);
     }
 
     for (const [areaId, area] of areaMap.entries()) {
