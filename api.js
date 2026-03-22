@@ -122,7 +122,7 @@ function buildTimeline(crop) {
   const def     = crop.crop_def || {};
   const variety = crop.variety  || {};
 
-  const sowDate  = crop.stage_adjusted_sow_date || crop.sown_date || crop.transplanted_date || null;
+  const sowDate  = crop.sown_date || crop.transplanted_date || null;
   const dtm      = variety.days_to_maturity_max || variety.days_to_maturity_min
                  || def.days_to_maturity_max    || def.days_to_maturity_min || null;
 
@@ -155,9 +155,9 @@ function buildTimeline(crop) {
     }
   }
 
-  // Infer current stage from days grown, unless stage has been manually confirmed
-  let currentStage = crop.stage || "seed";
-  if (crop.stage_confidence !== "confirmed" && dtm) {
+  // Infer current stage from days grown
+  let currentStage = "seed";
+  if (dtm) {
     const pct = daysSown / dtm;
     if      (pct >= 0.90) currentStage = "harvesting";
     else if (pct >= 0.70) currentStage = "fruiting";
@@ -167,6 +167,9 @@ function buildTimeline(crop) {
     else                  currentStage = "seed";
   }
 
+  // Override with confirmed stage from crop record
+  if (crop.stage && crop.stage !== "seed") currentStage = crop.stage;
+
   const STAGE_ORDER = ["seed", "seedling", "vegetative", "flowering", "fruiting", "harvesting"];
   const currentIdx  = STAGE_ORDER.indexOf(currentStage);
 
@@ -175,9 +178,7 @@ function buildTimeline(crop) {
   const harvestEnd   = def.harvest_month_end;
   const year         = new Date().getFullYear();
   let harvestDate    = dtm ? addDays(sowDate, dtm) : null;
-  // Only use fixed harvest month if stage has NOT been manually confirmed.
-  // If confirmed, use the DTM-based calculation from stage_adjusted_sow_date instead.
-  if (harvestStart && crop.stage_confidence !== "confirmed") {
+  if (harvestStart) {
     harvestDate = new Date(year, harvestStart - 1, 15).toISOString().split("T")[0];
   }
 
@@ -372,16 +373,7 @@ app.put("/areas/:id", requireAuth, async (req, res) => {
 });
 
 app.delete("/areas/:id", requireAuth, async (req, res) => {
-  const areaId = req.params.id;
-  // Must delete tasks and deactivate crops before removing the area
-  // to avoid foreign key constraint violations
-  const { error: taskErr } = await supabaseService.from("tasks")
-    .delete().eq("area_id", areaId).eq("user_id", req.user.id).is("completed_at", null);
-  if (taskErr) return res.status(500).json({ error: taskErr.message });
-  const { error: cropErr } = await supabaseService.from("crop_instances")
-    .update({ active: false, area_id: null }).eq("area_id", areaId).eq("user_id", req.user.id);
-  if (cropErr) return res.status(500).json({ error: cropErr.message });
-  const { error } = await supabaseService.from("growing_areas").delete().eq("id", areaId);
+  const { error } = await req.db.from("growing_areas").delete().eq("id", req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   res.status(204).send();
 });
@@ -926,9 +918,10 @@ app.post("/tasks/:id/complete", requireAuth, async (req, res) => {
     const transition = meta.status_transition;
 
     if (data.task_type === "feed") {
-      await req.db.from("crop_instances")
+      // Use supabaseService — req.db (user JWT) is blocked by RLS on crop_instances writes
+      await supabaseService.from("crop_instances")
         .update({ last_fed_at: completedAt, updated_at: completedAt })
-        .eq("id", data.crop_instance_id);
+        .eq("id", data.crop_instance_id).eq("user_id", req.user.id);
       // Re-run engine so next feed task is anchored from today
       await runRuleEngine(req.user.id);
 
@@ -937,32 +930,32 @@ app.post("/tasks/:id/complete", requireAuth, async (req, res) => {
       // Completing them means the current window key is marked done — engine
       // will not regenerate until next window period. No crop state update needed.
       // Touch updated_at so dashboard reflects activity.
-      await req.db.from("crop_instances")
+      await supabaseService.from("crop_instances")
         .update({ updated_at: completedAt })
-        .eq("id", data.crop_instance_id);
+        .eq("id", data.crop_instance_id).eq("user_id", req.user.id);
 
     } else if (data.task_type === "sow" && transition === "sown") {
       const sowMethod = meta.sow_method || "outdoors";
       const newStatus = sowMethod === "indoors" ? "sown_indoors" : "sown_outdoors";
-      await req.db.from("crop_instances")
+      await supabaseService.from("crop_instances")
         .update({ status: newStatus, sown_date: today, updated_at: completedAt })
-        .eq("id", data.crop_instance_id);
+        .eq("id", data.crop_instance_id).eq("user_id", req.user.id);
       await runRuleEngine(req.user.id);
 
     } else if (data.task_type === "sow" && !transition) {
       // Fallback: sow task completed but no status_transition meta — still set sown_date
       const sowMethod = meta.sow_method || "outdoors";
       const newStatus = sowMethod === "indoors" ? "sown_indoors" : "sown_outdoors";
-      await req.db.from("crop_instances")
+      await supabaseService.from("crop_instances")
         .update({ status: newStatus, sown_date: today, updated_at: completedAt })
-        .eq("id", data.crop_instance_id)
+        .eq("id", data.crop_instance_id).eq("user_id", req.user.id)
         .is("sown_date", null); // only update if not already set
       await runRuleEngine(req.user.id);
 
     } else if (data.task_type === "transplant" && transition === "transplanted") {
-      await req.db.from("crop_instances")
+      await supabaseService.from("crop_instances")
         .update({ status: "transplanted", transplant_date: today, updated_at: completedAt })
-        .eq("id", data.crop_instance_id);
+        .eq("id", data.crop_instance_id).eq("user_id", req.user.id);
       await runRuleEngine(req.user.id);
     }
   }
@@ -978,9 +971,9 @@ app.post("/tasks/:id/uncomplete", requireAuth, async (req, res) => {
 
   // Reverse last_fed_at if it was a feed task — set back to null
   if (data.task_type === "feed" && data.crop_instance_id) {
-    await req.db.from("crop_instances")
+    await supabaseService.from("crop_instances")
       .update({ last_fed_at: null })
-      .eq("id", data.crop_instance_id);
+      .eq("id", data.crop_instance_id).eq("user_id", req.user.id);
   }
   res.json(data);
 });
@@ -3208,7 +3201,7 @@ app.post("/crops/:id/observe", requireAuth, async (req, res) => {
     .select("id, name, status, stage, crop_def_id")
     .eq("id", req.params.id).eq("user_id", req.user.id).single();
   if (cropErr || !crop) return res.status(404).json({ error: "Crop not found" });
-  const { data: obs, error: obsErr } = await supabaseService.from("observation_logs").insert({
+  const { data: obs, error: obsErr } = await req.db.from("observation_logs").insert({
     user_id: req.user.id, crop_id: req.params.id,
     observed_at: new Date().toISOString().split("T")[0],
     observation_type, symptom_code: symptom_code || null,
@@ -3217,42 +3210,15 @@ app.post("/crops/:id/observe", requireAuth, async (req, res) => {
   if (obsErr) return res.status(500).json({ error: obsErr.message });
   const updates = {};
   const engineActions = [];
-  // STAGE_DTM_PERCENT mirrors rule-engine.js
-  const STAGE_DTM_PERCENT = { seed: 0, seedling: 0.08, vegetative: 0.25, flowering: 0.55, fruiting: 0.70, harvesting: 0.90 };
-
-  // When a stage is confirmed, calculate an adjusted sow date so that:
-  //   adjusted_sow_date = today - (DTM * stage_pct)
-  // This means the harvest date (adjusted_sow_date + DTM) = today + (DTM * remaining_pct)
-  // Example: confirmed fruiting today, DTM=76, fruiting=70%
-  //   => adjusted_sow_date = today - 53 days
-  //   => harvest = adjusted_sow_date + 76 = today + 23 days
-  // Original sown_date is NEVER modified. Set stage_adjusted_sow_date = null to revert.
-  const calcAdjustedSowDate = async (stageKey) => {
-    const pct = STAGE_DTM_PERCENT[stageKey];
-    if (pct === undefined || pct === 0) return null;
-    const { data: cropData } = await supabaseService
-      .from("crop_instances")
-      .select("crop_def:crop_def_id(days_to_maturity_min), variety:variety_id(days_to_maturity_min)")
-      .eq("id", req.params.id).single();
-    const dtm = cropData?.variety?.days_to_maturity_min ?? cropData?.crop_def?.days_to_maturity_min ?? null;
-    if (!dtm) return null;
-    // adjusted_sow = today - (dtm * stage_pct)
-    // so that harvest = adjusted_sow + dtm = today + (dtm * remaining_pct)
-    const daysFromSowToStage = Math.round(dtm * pct);
-    const adjusted = new Date();
-    adjusted.setDate(adjusted.getDate() - daysFromSowToStage);
-    return adjusted.toISOString().split("T")[0];
-  };
-
-  if (symptom_code === "flowering_confirmed" || confirmed_stage === "flowering") { updates.stage = "flowering"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; updates.stage_adjusted_sow_date = await calcAdjustedSowDate("flowering"); engineActions.push("stage_updated"); }
-  if (symptom_code === "fruit_set_confirmed" || confirmed_stage === "fruiting") { updates.stage = "fruiting"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; updates.stage_adjusted_sow_date = await calcAdjustedSowDate("fruiting"); engineActions.push("stage_updated"); }
-  if (symptom_code === "seedling_emerged" || confirmed_stage === "seedling") { updates.stage = "seedling"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; updates.stage_adjusted_sow_date = await calcAdjustedSowDate("seedling"); engineActions.push("stage_updated"); }
-  if (symptom_code === "vegetative_confirmed" || confirmed_stage === "vegetative") { updates.stage = "vegetative"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; updates.stage_adjusted_sow_date = await calcAdjustedSowDate("vegetative"); engineActions.push("stage_updated"); }
+  if (symptom_code === "flowering_confirmed" || confirmed_stage === "flowering") { updates.stage = "flowering"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; engineActions.push("stage_updated"); }
+  if (symptom_code === "fruit_set_confirmed" || confirmed_stage === "fruiting") { updates.stage = "fruiting"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; engineActions.push("stage_updated"); }
+  if (symptom_code === "seedling_emerged" || confirmed_stage === "seedling") { updates.stage = "seedling"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; engineActions.push("stage_updated"); }
+  if (symptom_code === "vegetative_confirmed" || confirmed_stage === "vegetative") { updates.stage = "vegetative"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; engineActions.push("stage_updated"); }
   if (symptom_code === "harvest_started" || confirmed_stage === "harvesting") { updates.status = "harvesting"; updates.stage = "harvesting"; updates.stage_confidence = "confirmed"; updates.stage_check_snoozed_until = null; engineActions.push("harvest_started"); processBadgeEvent(req.user.id, "harvest_logged").catch(console.error); }
   if (symptom_code === "transplant_done") { updates.status = "transplanted"; updates.transplant_date = new Date().toISOString().split("T")[0]; engineActions.push("transplant_done"); }
   if (symptom_code === "plant_struggling") { updates.missed_task_note = "Plant reported as struggling — check growing conditions"; engineActions.push("struggling_flagged"); }
   if (symptom_code === "looks_healthy") { updates.missed_task_note = null; engineActions.push("health_confirmed"); }
-  if (Object.keys(updates).length > 0) { updates.updated_at = new Date().toISOString(); const { error: updateErr } = await supabaseService.from("crop_instances").update(updates).eq("id", req.params.id).eq("user_id", req.user.id); if (updateErr) console.error("[Observe] crop update error:", updateErr.message); }
+  if (Object.keys(updates).length > 0) { updates.updated_at = new Date().toISOString(); await req.db.from("crop_instances").update(updates).eq("id", req.params.id).eq("user_id", req.user.id); }
   await runRuleEngine(req.user.id);
   res.json({ observation: obs, crop_updated: Object.keys(updates).length > 0, engine_actions: engineActions });
 });
