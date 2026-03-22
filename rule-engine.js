@@ -164,7 +164,6 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = []) 
   const transplantDate  = crop.transplanted_date  || crop.transplant_date  || null;
   const plantedOutDate  = crop.planted_out_date   || null;
   const lastFedAt       = crop.last_fed_at        || null;
-  const lastWateredAt   = crop.last_watered_at    || null;
 
   // Stage
   const daysSown = daysSince(sowDate);
@@ -262,7 +261,7 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = []) 
     daysSown, pctGrown,
 
     // Weather
-    frostRisk, frostRisk7day, tempC, rainMm, lastWateredAt,
+    frostRisk, frostRisk7day, tempC, rainMm,
     areaType,
 
     // Feed
@@ -1228,97 +1227,6 @@ class RuleEngine {
     }
 
 
-    // ── Watering tasks — one per area ────────────────────────────────────────
-    // Group active outdoor crops by area, check dry conditions, generate one
-    // watering task per area rather than per crop.
-    console.error("[Watering] block reached, crops.length=" + crops.length);
-    const areaMap = new Map();
-    for (const crop of crops) {
-      if (crop.status === "planned" || crop.status === "sown_indoors" || crop.status === "finished") continue;
-      const areaId = crop.area_id;
-      if (!areaId) continue;
-      const locId = crop.area?.location_id || crop.location_id;
-      const weather = weatherByLocation[locId] || null;
-      const areaType = crop.area?.type || "raised_bed";
-      const areaName = crop.area?.name || "Garden area";
-      if (!areaMap.has(areaId)) {
-        areaMap.set(areaId, { crops: [], areaType, areaName, locId, weather, userId });
-      }
-      areaMap.get(areaId).crops.push(crop);
-    }
-
-    const wateringToday = todayISO();
-    console.error(`[Watering] areaMap size=${areaMap.size} weatherByLocationKeys=${JSON.stringify(Object.keys(weatherByLocation))}`);
-    for (const [areaId, area] of areaMap.entries()) {
-      console.error(`[Watering] area=${area.areaName} locId=${area.locId} rainMm=${area.weather?.rain_mm ?? 'null'} crops=${area.crops.map(c=>c.name+'/'+c.status).join(',')}`);
-    }
-
-    for (const [areaId, area] of areaMap.entries()) {
-      const { crops: areaCrops, areaType, areaName, weather } = area;
-      const rainMm = weather?.rain_mm ?? null;
-
-      // Suppress if it rained more than 5mm today
-      if (rainMm !== null && rainMm >= 5) continue;
-
-      // Dry day thresholds per area type
-      const BASE_THRESHOLD = areaType === "greenhouse" ? 1
-        : areaType === "container" || areaType === "pot" ? 2
-        : areaType === "raised_bed" ? 4
-        : 6; // ground/border
-
-      // Reduce threshold by 1 for flowering/fruiting crops — more drought sensitive
-      const hasHighRiskCrop = areaCrops.some(c => ["flowering", "fruiting", "harvesting"].includes(c.stage));
-      const DRY_DAY_THRESHOLD = hasHighRiskCrop && BASE_THRESHOLD > 1 ? BASE_THRESHOLD - 1 : BASE_THRESHOLD;
-
-      // Find most recent watering across all crops in this area
-      let lastWateredDate = null;
-      for (const crop of areaCrops) {
-        const lw = crop.last_watered_at ? crop.last_watered_at.split("T")[0] : null;
-        if (lw && (!lastWateredDate || lw > lastWateredDate)) lastWateredDate = lw;
-      }
-
-      // Calculate days since last watered
-      const daysSinceWatered = lastWateredDate
-        ? Math.floor((Date.now() - new Date(lastWateredDate).getTime()) / 86400000)
-        : null;
-
-      // Only fire if overdue
-      if (daysSinceWatered !== null && daysSinceWatered < DRY_DAY_THRESHOLD) continue;
-      // If never watered and no weather data, fire anyway — unknown is treated as dry
-      // (better to over-remind than under-remind for watering)
-
-      // Prioritise crops most at risk: flowering/fruiting > seedling > vegetative
-      const STAGE_PRIORITY = { flowering: 0, fruiting: 0, harvesting: 0, seedling: 1, vegetative: 2, seed: 3 };
-      const sortedCrops = [...areaCrops].sort((a, b) =>
-        (STAGE_PRIORITY[a.stage] ?? 3) - (STAGE_PRIORITY[b.stage] ?? 3)
-      );
-      const atRiskCrops = sortedCrops.slice(0, 3).map(c => c.name);
-      const atRiskText = atRiskCrops.length > 0 ? ` — pay particular attention to: ${atRiskCrops.join(", ")}` : "";
-      const daysText = daysSinceWatered !== null ? ` (${daysSinceWatered} days since last watered)` : "";
-      const urgency = daysSinceWatered !== null && daysSinceWatered >= DRY_DAY_THRESHOLD + 2 ? "high" : "medium";
-
-      allCandidates.push({
-        user_id:          userId,
-        crop_instance_id: null,
-        area_id:          areaId,
-        action:           `Water ${areaName}${daysText}${atRiskText}`,
-        task_type:        "water",
-        urgency,
-        due_date:         wateringToday,
-        scheduled_for:    wateringToday,
-        visible_from:     wateringToday,
-        expires_at:       new Date(addDays(wateringToday, 1) + "T23:59:59Z").toISOString(),
-        status:           "due",
-        engine_type:      "risk",
-        record_type:      "task",
-        source:           "rule_engine",
-        rule_id:          "watering_due",
-        source_key:       sourceKey({ u: userId, a: areaId, r: "watering_due", d: wateringToday }),
-        date_confidence:  "exact",
-        meta:             JSON.stringify({ dry_days: daysSinceWatered, area_type: areaType }),
-        risk_payload:     null,
-      });
-    }
 
     // Upsert all candidates
     if (!this.dryRun && this.supabase) {
