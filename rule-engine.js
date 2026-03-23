@@ -1291,9 +1291,9 @@ class RuleEngine {
         (STAGE_PRIORITY[a.stage] ?? 3) - (STAGE_PRIORITY[b.stage] ?? 3)
       );
       const atRiskCrops = sortedCrops.slice(0, 3).map(c => c.name);
-      const atRiskText = atRiskCrops.length > 0 ?  : "";
+      const atRiskText = atRiskCrops.length > 0 ? " — pay particular attention to: " + atRiskCrops.join(", ") : "";
 
-      const daysText = daysSinceWatered !== null ?  : "";
+      const daysText = daysSinceWatered !== null ? " (" + daysSinceWatered + " days since last watered)" : "";
       const urgency = daysSinceWatered !== null && daysSinceWatered >= DRY_DAY_THRESHOLD + 2 ? "high" : "medium";
 
       // Use first crop in area for context (area_id, user_id)
