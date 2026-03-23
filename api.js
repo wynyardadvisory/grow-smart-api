@@ -2218,7 +2218,7 @@ app.get("/harvest-log", requireAuth, async (req, res) => {
   res.json(data || []);
 });
 
-// POST /harvest-log — create a harvest entry + mark crop as harvested
+// POST /harvest-log — create a harvest entry + optionally mark crop as harvested
 app.post("/harvest-log", requireAuth,
   [body("crop_name").trim().notEmpty()],
   async (req, res) => {
@@ -2227,6 +2227,7 @@ app.post("/harvest-log", requireAuth,
       crop_instance_id, crop_name, variety,
       harvested_at, yield_score, quality_score,
       quantity_value, quantity_unit, notes,
+      partial, // if true, crop stays active — more harvests to come
     } = req.body;
 
     // Insert using actual DB columns only
@@ -2238,14 +2239,13 @@ app.post("/harvest-log", requireAuth,
       quality:          quality_score || null,
       quantity_g:       quantity_value ? parseFloat(quantity_value) : null,
       notes:            notes || null,
+      partial:          partial ? true : false,
     }).select().single();
 
     if (error) return res.status(500).json({ error: error.message });
 
-    // Mark crop instance as harvested and preserve rotation history
-    // active=false removes from Garden/tasks. harvested_at stored for future rotation suggestions.
-    // area_id retained on the row — never nulled — so rotation history is queryable per bed.
-    if (crop_instance_id) {
+    // Only mark crop as harvested if this is the final harvest
+    if (crop_instance_id && !partial) {
       const harvestedAt = new Date().toISOString().split("T")[0];
       const { data: harvestedCrop } = await req.db.from("crop_instances")
         .update({
@@ -2296,6 +2296,69 @@ app.delete("/harvest-log/:id", requireAuth, async (req, res) => {
   }
 
   res.json({ success: true, reverted_crop: entry.crop_instance_id });
+});
+
+// GET /harvest-log/summary — season summary grouped by crop with averages + individual records
+app.get("/harvest-log/summary", requireAuth, async (req, res) => {
+  const year = req.query.year || new Date().getFullYear();
+  const { data, error } = await req.db.from("harvest_log")
+    .select("id, crop_instance_id, harvested_at, yield_score, quality, quantity_g, notes, photo_url, partial, crop_instances(name, variety)")
+    .gte("harvested_at", `${year}-01-01`)
+    .lte("harvested_at", `${year}-12-31`)
+    .order("harvested_at", { ascending: false });
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Group by crop_instance_id (or crop name if no instance)
+  const groups = {};
+  for (const entry of data || []) {
+    const cropName = entry.crop_instances?.name || entry.crop_name || "Unknown";
+    const variety  = entry.crop_instances?.variety || null;
+    const key      = entry.crop_instance_id || cropName;
+
+    if (!groups[key]) {
+      groups[key] = {
+        crop_instance_id: entry.crop_instance_id,
+        crop_name:        cropName,
+        variety:          variety,
+        entries:          [],
+      };
+    }
+    groups[key].entries.push({
+      id:           entry.id,
+      harvested_at: entry.harvested_at,
+      yield_score:  entry.yield_score,
+      quality:      entry.quality,
+      quantity_g:   entry.quantity_g,
+      notes:        entry.notes,
+      photo_url:    entry.photo_url,
+      partial:      entry.partial,
+    });
+  }
+
+  // Calculate averages and totals per group
+  const summary = Object.values(groups).map(g => {
+    const yields    = g.entries.map(e => e.yield_score).filter(Boolean);
+    const qualities = g.entries.map(e => e.quality).filter(Boolean);
+    const quantities = g.entries.map(e => e.quantity_g).filter(Boolean);
+
+    return {
+      crop_instance_id:  g.crop_instance_id,
+      crop_name:         g.crop_name,
+      variety:           g.variety,
+      harvest_count:     g.entries.length,
+      avg_yield_score:   yields.length    ? Math.round((yields.reduce((a, b) => a + b, 0) / yields.length) * 10) / 10 : null,
+      avg_quality_score: qualities.length ? Math.round((qualities.reduce((a, b) => a + b, 0) / qualities.length) * 10) / 10 : null,
+      total_quantity_g:  quantities.length ? quantities.reduce((a, b) => a + b, 0) : null,
+      latest_harvest:    g.entries[0]?.harvested_at || null,
+      entries:           g.entries,
+    };
+  });
+
+  // Sort by latest harvest date
+  summary.sort((a, b) => new Date(b.latest_harvest) - new Date(a.latest_harvest));
+
+  res.json(summary);
 });
 
 // POST /harvest-log/:id/photo — upload a photo for a harvest entry
