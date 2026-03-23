@@ -10,7 +10,7 @@
  *
  * Install:
  *   npm install express @supabase/supabase-js
- *               express-validator cors dotenv helmet morgan
+ *               express-validator cors dotenv helmet morgan @sentry/node
  *
  * .env:
  *   SUPABASE_URL=
@@ -19,6 +19,7 @@
  *   OPENWEATHER_API_KEY=
  *   FRONTEND_URL=
  *   CRON_SECRET=
+ *   SENTRY_DSN=
  *   PORT=3001
  */
 
@@ -28,7 +29,15 @@ const helmet     = require("helmet");
 const morgan     = require("morgan");
 const { createClient } = require("@supabase/supabase-js");
 const { body, validationResult } = require("express-validator");
+const Sentry     = require("@sentry/node");
 require("dotenv").config();
+
+// ── Sentry — initialise before anything else ──────────────────────────────────
+Sentry.init({
+  dsn: process.env.SENTRY_DSN,
+  environment: process.env.VERCEL_ENV || "development",
+  tracesSampleRate: 0.1, // 10% of requests — plenty for free tier
+});
 
 const { RuleEngine } = require("./rule-engine");
 const { applyBlockedPeriodAdjustments, reapplyAllBlockedPeriods } = require("./blocked-period-adjustment");
@@ -3852,6 +3861,10 @@ app.post("/cron/daily", async (req, res) => {
 // ERROR HANDLER + START
 // =============================================================================
 
+// ── Sentry error handler — must be before any other error middleware ──────────
+Sentry.setupExpressErrorHandler(app);
+
+// ── Fallback error handler ────────────────────────────────────────────────────
 app.use((err, _req, res, _next) => {
   console.error(err.stack);
   res.status(500).json({ error: "Internal server error" });
