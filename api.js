@@ -39,6 +39,12 @@ Sentry.init({
   tracesSampleRate: 0.1, // 10% of requests — plenty for free tier
 });
 
+// ── Sentry helper — use instead of console.error for caught exceptions ────────
+function captureError(context, err, extra = {}) {
+  console.error(`[${context}]`, err.message);
+  Sentry.captureException(err, { tags: { context }, extra });
+}
+
 const { RuleEngine } = require("./rule-engine");
 const { applyBlockedPeriodAdjustments, reapplyAllBlockedPeriods } = require("./blocked-period-adjustment");
 const { runNotificationsForUser } = require("./notifications");
@@ -106,7 +112,7 @@ async function runRuleEngine(userId) {
     await reapplyAllBlockedPeriods(supabaseService, userId);
     return tasks;
   } catch (err) {
-    console.error("[RuleEngine] Error:", err.message);
+    captureError("RuleEngine", err, { userId });
     return [];
   }
 }
@@ -3730,14 +3736,14 @@ app.post("/cron/push-morning", async (req, res) => {
     if (!profiles?.length) return res.json({ processed: 0, sent: 0 });
     let sent = 0;
     for (const p of profiles) {
-      try { const result = await runNotificationsForUser(supabaseService, p.id, "morning"); if (result.sent > 0) sent++; } catch(e) { console.error(`[PushMorning] ${p.id}:`, e.message); }
+      try { const result = await runNotificationsForUser(supabaseService, p.id, "morning"); if (result.sent > 0) sent++; } catch(e) { captureError("PushMorning", e, { userId: p.id }); }
     }
     console.log(`[PushMorning] Sent to ${sent}/${profiles.length} users`);
     // Email fallback — for users with no push token or push disabled
     const emailResult = await runDailyEmailFallback(supabaseService);
     console.log(`[EmailFallback] Sent: ${emailResult.sent}, Skipped: ${emailResult.skipped}`);
     res.json({ ok: true, processed: profiles.length, push_sent: sent, email_sent: emailResult.sent });
-  } catch(e) { console.error("[PushMorning]", e.message); res.status(500).json({ error: e.message }); }
+  } catch(e) { captureError("PushMorning", e); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/cron/push-evening", async (req, res) => {
@@ -3748,11 +3754,11 @@ app.post("/cron/push-evening", async (req, res) => {
     if (!profiles?.length) return res.json({ processed: 0, sent: 0 });
     let sent = 0;
     for (const p of profiles) {
-      try { const result = await runNotificationsForUser(supabaseService, p.id, "evening"); if (result.sent > 0) sent++; } catch(e) { console.error(`[PushEvening] ${p.id}:`, e.message); }
+      try { const result = await runNotificationsForUser(supabaseService, p.id, "evening"); if (result.sent > 0) sent++; } catch(e) { captureError("PushEvening", e, { userId: p.id }); }
     }
     console.log(`[PushEvening] Sent to ${sent}/${profiles.length} users`);
     res.json({ ok: true, processed: profiles.length, sent });
-  } catch(e) { console.error("[PushEvening]", e.message); res.status(500).json({ error: e.message }); }
+  } catch(e) { captureError("PushEvening", e); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/notifications/test", requireAuth, requireAdmin, async (req, res) => {
@@ -3770,7 +3776,7 @@ app.post("/cron/nudge-unactivated", async (req, res) => {
   try {
     const result = await runNudgeUnactivated(supabaseService);
     res.json({ ok: true, ...result });
-  } catch(e) { console.error("[NudgeUnactivated]", e.message); res.status(500).json({ error: e.message }); }
+  } catch(e) { captureError("NudgeUnactivated", e); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/cron/nudge-unconfirmed", async (req, res) => {
@@ -3779,7 +3785,7 @@ app.post("/cron/nudge-unconfirmed", async (req, res) => {
   try {
     const result = await runNudgeUnconfirmed(supabaseService);
     res.json({ ok: true, ...result });
-  } catch(e) { console.error("[NudgeUnconfirmed]", e.message); res.status(500).json({ error: e.message }); }
+  } catch(e) { captureError("NudgeUnconfirmed", e); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/cron/feedback-sequence", async (req, res) => {
@@ -3788,7 +3794,7 @@ app.post("/cron/feedback-sequence", async (req, res) => {
   try {
     const result = await runFeedbackSequence(supabaseService);
     res.json({ ok: true, ...result });
-  } catch(e) { console.error("[FeedbackSequence]", e.message); res.status(500).json({ error: e.message }); }
+  } catch(e) { captureError("FeedbackSequence", e); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/cron/waitlist-invites", async (req, res) => {
@@ -3797,7 +3803,7 @@ app.post("/cron/waitlist-invites", async (req, res) => {
   try {
     const result = await runWaitlistInvites(supabaseService);
     res.json({ ok: true, ...result });
-  } catch(e) { console.error("[WaitlistInvites]", e.message); res.status(500).json({ error: e.message }); }
+  } catch(e) { captureError("WaitlistInvites", e); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/cron/waitlist-nudges", async (req, res) => {
@@ -3806,7 +3812,7 @@ app.post("/cron/waitlist-nudges", async (req, res) => {
   try {
     const result = await runWaitlistNudges(supabaseService);
     res.json({ ok: true, ...result });
-  } catch(e) { console.error("[WaitlistNudges]", e.message); res.status(500).json({ error: e.message }); }
+  } catch(e) { captureError("WaitlistNudges", e); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/cron/waitlist-nudges-2", async (req, res) => {
@@ -3815,7 +3821,7 @@ app.post("/cron/waitlist-nudges-2", async (req, res) => {
   try {
     const result = await runWaitlistNudges2(supabaseService);
     res.json({ ok: true, ...result });
-  } catch(e) { console.error("[WaitlistNudges2]", e.message); res.status(500).json({ error: e.message }); }
+  } catch(e) { captureError("WaitlistNudges2", e); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/cron/waitlist-nudges-3", async (req, res) => {
@@ -3824,7 +3830,7 @@ app.post("/cron/waitlist-nudges-3", async (req, res) => {
   try {
     const result = await runWaitlistNudges3(supabaseService);
     res.json({ ok: true, ...result });
-  } catch(e) { console.error("[WaitlistNudges3]", e.message); res.status(500).json({ error: e.message }); }
+  } catch(e) { captureError("WaitlistNudges3", e); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/cron/reengagement", async (req, res) => {
@@ -3833,7 +3839,7 @@ app.post("/cron/reengagement", async (req, res) => {
   try {
     const result = await runReengagement(supabaseService);
     res.json({ ok: true, ...result });
-  } catch(e) { console.error("[Reengagement]", e.message); res.status(500).json({ error: e.message }); }
+  } catch(e) { captureError("Reengagement", e); res.status(500).json({ error: e.message }); }
 });
 
 // =============================================================================
@@ -3861,12 +3867,18 @@ app.post("/cron/daily", async (req, res) => {
 // ERROR HANDLER + START
 // =============================================================================
 
+// ── Sentry test endpoint — remove after confirming Sentry works ───────────────
+app.get("/sentry-test", (_req, _res) => {
+  throw new Error("Sentry test error — Vercro API staging");
+});
+
 // ── Sentry error handler — must be before any other error middleware ──────────
 Sentry.setupExpressErrorHandler(app);
 
 // ── Fallback error handler ────────────────────────────────────────────────────
 app.use((err, _req, res, _next) => {
   console.error(err.stack);
+  Sentry.captureException(err);
   res.status(500).json({ error: "Internal server error" });
 });
 
