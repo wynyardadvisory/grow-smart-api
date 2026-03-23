@@ -10,7 +10,7 @@
  *
  * Install:
  *   npm install express @supabase/supabase-js
- *               express-validator cors dotenv helmet morgan @sentry/node
+ *               express-validator cors dotenv helmet morgan
  *
  * .env:
  *   SUPABASE_URL=
@@ -19,7 +19,6 @@
  *   OPENWEATHER_API_KEY=
  *   FRONTEND_URL=
  *   CRON_SECRET=
- *   SENTRY_DSN=
  *   PORT=3001
  */
 
@@ -29,21 +28,7 @@ const helmet     = require("helmet");
 const morgan     = require("morgan");
 const { createClient } = require("@supabase/supabase-js");
 const { body, validationResult } = require("express-validator");
-const Sentry     = require("@sentry/node");
 require("dotenv").config();
-
-// ── Sentry — initialise before anything else ──────────────────────────────────
-Sentry.init({
-  dsn: process.env.SENTRY_DSN,
-  environment: process.env.VERCEL_ENV || "development",
-  tracesSampleRate: 0.1, // 10% of requests — plenty for free tier
-});
-
-// ── Sentry helper — use instead of console.error for caught exceptions ────────
-function captureError(context, err, extra = {}) {
-  console.error(`[${context}]`, err.message);
-  Sentry.captureException(err, { tags: { context }, extra });
-}
 
 const { RuleEngine } = require("./rule-engine");
 const { applyBlockedPeriodAdjustments, reapplyAllBlockedPeriods } = require("./blocked-period-adjustment");
@@ -110,9 +95,105 @@ async function runRuleEngine(userId) {
     console.log(`[RuleEngine] ${tasks.length} tasks generated for ${userId}`);
     // Re-apply any active blocked periods so adjustments are never lost on regeneration
     await reapplyAllBlockedPeriods(supabaseService, userId);
+
+    // ── Watering tasks — one per area ─────────────────────────────────────
+    try {
+      const { data: waterCrops } = await supabaseService.from("crop_instances")
+        .select("id, name, status, stage, area_id, location_id, last_watered_at, area:area_id(type, name, location_id)")
+        .eq("user_id", userId).eq("active", true);
+
+      // Load weather for this user
+      const { data: locations } = await supabaseService.from("locations").select("id, postcode").eq("user_id", userId);
+      const weatherMap = {};
+      for (const loc of locations || []) {
+        if (!loc.postcode) continue;
+        const outwardCode = loc.postcode.trim().split(" ")[0].toUpperCase();
+        const { data: w } = await supabaseService.from("weather_cache")
+          .select("temp_c, rain_mm, frost_risk")
+          .eq("postcode", outwardCode)
+          .gt("expires_at", new Date().toISOString())
+          .single();
+        if (w) weatherMap[loc.id] = w;
+      }
+
+      const areaMap = new Map();
+      for (const crop of waterCrops || []) {
+        if (["planned", "sown_indoors", "finished"].includes(crop.status)) continue;
+        if (!crop.area_id) continue;
+        const locId = crop.area?.location_id || crop.location_id;
+        const weather = weatherMap[locId] || null;
+        const areaType = crop.area?.type || "raised_bed";
+        const areaName = crop.area?.name || "Garden area";
+        if (!areaMap.has(crop.area_id)) {
+          areaMap.set(crop.area_id, { crops: [], areaType, areaName, weather });
+        }
+        areaMap.get(crop.area_id).crops.push(crop);
+      }
+
+      const wateringToday = new Date().toISOString().split("T")[0];
+      const wateringTasks = [];
+
+      for (const [areaId, area] of areaMap.entries()) {
+        const { crops: areaCrops, areaType, areaName, weather } = area;
+        const rainMm = weather?.rain_mm ?? null;
+        if (rainMm !== null && rainMm >= 5) continue;
+
+        const BASE_THRESHOLD = areaType === "greenhouse" ? 1
+          : areaType === "container" || areaType === "pot" ? 2
+          : areaType === "raised_bed" ? 4 : 6;
+        const hasHighRisk = areaCrops.some(c => ["flowering","fruiting","harvesting"].includes(c.stage));
+        const threshold = hasHighRisk && BASE_THRESHOLD > 1 ? BASE_THRESHOLD - 1 : BASE_THRESHOLD;
+
+        let lastWateredDate = null;
+        for (const crop of areaCrops) {
+          const lw = crop.last_watered_at ? crop.last_watered_at.split("T")[0] : null;
+          if (lw && (!lastWateredDate || lw > lastWateredDate)) lastWateredDate = lw;
+        }
+        const daysSince = lastWateredDate
+          ? Math.floor((Date.now() - new Date(lastWateredDate).getTime()) / 86400000)
+          : null;
+
+        if (daysSince !== null && daysSince < threshold) continue;
+
+        const STAGE_PRIORITY = { flowering: 0, fruiting: 0, harvesting: 0, seedling: 1, vegetative: 2, seed: 3 };
+        const sorted = [...areaCrops].sort((a, b) => (STAGE_PRIORITY[a.stage] ?? 3) - (STAGE_PRIORITY[b.stage] ?? 3));
+        const atRisk = sorted.slice(0, 3).map(c => c.name);
+        const atRiskText = atRisk.length ? " — pay particular attention to: " + atRisk.join(", ") : "";
+        const daysText = daysSince !== null ? " (" + daysSince + " days since last watered)" : "";
+        const urgency = daysSince !== null && daysSince >= threshold + 2 ? "high" : "medium";
+        const sourceKey = "u:" + userId + "|a:" + areaId + "|r:watering_due|d:" + wateringToday;
+        const expiresAt = new Date(wateringToday + "T23:59:59Z");
+        expiresAt.setDate(expiresAt.getDate() + 1);
+
+        wateringTasks.push({
+          user_id: userId, crop_instance_id: null, area_id: areaId,
+          action: "Water " + areaName + daysText + atRiskText,
+          task_type: "water", urgency, due_date: wateringToday,
+          scheduled_for: wateringToday, visible_from: wateringToday,
+          expires_at: expiresAt.toISOString(), status: "due",
+          engine_type: "risk", record_type: "task", source: "rule_engine",
+          rule_id: "watering_due", source_key: sourceKey, date_confidence: "exact",
+          meta: JSON.stringify({ dry_days: daysSince, area_type: areaType }), risk_payload: null,
+        });
+      }
+
+      if (wateringTasks.length > 0) {
+        for (const wt of wateringTasks) {
+          const { error } = await supabaseService.from("tasks").upsert(wt, {
+            onConflict: "source_key", ignoreDuplicates: true,
+          });
+          if (error) console.error("[Watering] Upsert error:", error.message);
+        }
+        console.log("[Watering] Generated " + wateringTasks.length + " watering tasks for " + userId);
+      }
+    } catch (we) {
+      console.error("[Watering] Error:", we.message);
+    }
+    // ── End watering ────────────────────────────────────────────────────────
+
     return tasks;
   } catch (err) {
-    captureError("RuleEngine", err, { userId });
+    console.error("[RuleEngine] Error:", err.message);
     return [];
   }
 }
@@ -939,7 +1020,6 @@ app.post("/tasks/:id/complete", requireAuth, async (req, res) => {
           .update({ last_watered_at: completedAt, updated_at: completedAt })
           .eq("area_id", data.area_id).eq("user_id", req.user.id);
       } else if (data.crop_instance_id) {
-        // Fallback: crop-level water task
         await supabaseService.from("crop_instances")
           .update({ last_watered_at: completedAt, updated_at: completedAt })
           .eq("id", data.crop_instance_id).eq("user_id", req.user.id);
@@ -2482,7 +2562,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
 
       // Check cache first
       const { data: cached } = await supabaseService.from("weather_cache")
-        .select("temp_c, condition, frost_risk, frost_risk_7day, icon_code, expires_at")
+        .select("temp_c, rain_mm, condition, frost_risk, frost_risk_7day, icon_code, expires_at")
         .eq("postcode", postcode)
         .gt("expires_at", new Date().toISOString())
         .single();
@@ -3736,14 +3816,14 @@ app.post("/cron/push-morning", async (req, res) => {
     if (!profiles?.length) return res.json({ processed: 0, sent: 0 });
     let sent = 0;
     for (const p of profiles) {
-      try { const result = await runNotificationsForUser(supabaseService, p.id, "morning"); if (result.sent > 0) sent++; } catch(e) { captureError("PushMorning", e, { userId: p.id }); }
+      try { const result = await runNotificationsForUser(supabaseService, p.id, "morning"); if (result.sent > 0) sent++; } catch(e) { console.error(`[PushMorning] ${p.id}:`, e.message); }
     }
     console.log(`[PushMorning] Sent to ${sent}/${profiles.length} users`);
     // Email fallback — for users with no push token or push disabled
     const emailResult = await runDailyEmailFallback(supabaseService);
     console.log(`[EmailFallback] Sent: ${emailResult.sent}, Skipped: ${emailResult.skipped}`);
     res.json({ ok: true, processed: profiles.length, push_sent: sent, email_sent: emailResult.sent });
-  } catch(e) { captureError("PushMorning", e); res.status(500).json({ error: e.message }); }
+  } catch(e) { console.error("[PushMorning]", e.message); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/cron/push-evening", async (req, res) => {
@@ -3754,11 +3834,11 @@ app.post("/cron/push-evening", async (req, res) => {
     if (!profiles?.length) return res.json({ processed: 0, sent: 0 });
     let sent = 0;
     for (const p of profiles) {
-      try { const result = await runNotificationsForUser(supabaseService, p.id, "evening"); if (result.sent > 0) sent++; } catch(e) { captureError("PushEvening", e, { userId: p.id }); }
+      try { const result = await runNotificationsForUser(supabaseService, p.id, "evening"); if (result.sent > 0) sent++; } catch(e) { console.error(`[PushEvening] ${p.id}:`, e.message); }
     }
     console.log(`[PushEvening] Sent to ${sent}/${profiles.length} users`);
     res.json({ ok: true, processed: profiles.length, sent });
-  } catch(e) { captureError("PushEvening", e); res.status(500).json({ error: e.message }); }
+  } catch(e) { console.error("[PushEvening]", e.message); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/notifications/test", requireAuth, requireAdmin, async (req, res) => {
@@ -3776,7 +3856,7 @@ app.post("/cron/nudge-unactivated", async (req, res) => {
   try {
     const result = await runNudgeUnactivated(supabaseService);
     res.json({ ok: true, ...result });
-  } catch(e) { captureError("NudgeUnactivated", e); res.status(500).json({ error: e.message }); }
+  } catch(e) { console.error("[NudgeUnactivated]", e.message); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/cron/nudge-unconfirmed", async (req, res) => {
@@ -3785,7 +3865,7 @@ app.post("/cron/nudge-unconfirmed", async (req, res) => {
   try {
     const result = await runNudgeUnconfirmed(supabaseService);
     res.json({ ok: true, ...result });
-  } catch(e) { captureError("NudgeUnconfirmed", e); res.status(500).json({ error: e.message }); }
+  } catch(e) { console.error("[NudgeUnconfirmed]", e.message); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/cron/feedback-sequence", async (req, res) => {
@@ -3794,7 +3874,7 @@ app.post("/cron/feedback-sequence", async (req, res) => {
   try {
     const result = await runFeedbackSequence(supabaseService);
     res.json({ ok: true, ...result });
-  } catch(e) { captureError("FeedbackSequence", e); res.status(500).json({ error: e.message }); }
+  } catch(e) { console.error("[FeedbackSequence]", e.message); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/cron/waitlist-invites", async (req, res) => {
@@ -3803,7 +3883,7 @@ app.post("/cron/waitlist-invites", async (req, res) => {
   try {
     const result = await runWaitlistInvites(supabaseService);
     res.json({ ok: true, ...result });
-  } catch(e) { captureError("WaitlistInvites", e); res.status(500).json({ error: e.message }); }
+  } catch(e) { console.error("[WaitlistInvites]", e.message); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/cron/waitlist-nudges", async (req, res) => {
@@ -3812,7 +3892,7 @@ app.post("/cron/waitlist-nudges", async (req, res) => {
   try {
     const result = await runWaitlistNudges(supabaseService);
     res.json({ ok: true, ...result });
-  } catch(e) { captureError("WaitlistNudges", e); res.status(500).json({ error: e.message }); }
+  } catch(e) { console.error("[WaitlistNudges]", e.message); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/cron/waitlist-nudges-2", async (req, res) => {
@@ -3821,7 +3901,7 @@ app.post("/cron/waitlist-nudges-2", async (req, res) => {
   try {
     const result = await runWaitlistNudges2(supabaseService);
     res.json({ ok: true, ...result });
-  } catch(e) { captureError("WaitlistNudges2", e); res.status(500).json({ error: e.message }); }
+  } catch(e) { console.error("[WaitlistNudges2]", e.message); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/cron/waitlist-nudges-3", async (req, res) => {
@@ -3830,7 +3910,7 @@ app.post("/cron/waitlist-nudges-3", async (req, res) => {
   try {
     const result = await runWaitlistNudges3(supabaseService);
     res.json({ ok: true, ...result });
-  } catch(e) { captureError("WaitlistNudges3", e); res.status(500).json({ error: e.message }); }
+  } catch(e) { console.error("[WaitlistNudges3]", e.message); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/cron/reengagement", async (req, res) => {
@@ -3839,7 +3919,7 @@ app.post("/cron/reengagement", async (req, res) => {
   try {
     const result = await runReengagement(supabaseService);
     res.json({ ok: true, ...result });
-  } catch(e) { captureError("Reengagement", e); res.status(500).json({ error: e.message }); }
+  } catch(e) { console.error("[Reengagement]", e.message); res.status(500).json({ error: e.message }); }
 });
 
 // =============================================================================
@@ -3867,18 +3947,8 @@ app.post("/cron/daily", async (req, res) => {
 // ERROR HANDLER + START
 // =============================================================================
 
-// ── Sentry test endpoint — remove after confirming Sentry works ───────────────
-app.get("/sentry-test", (_req, _res) => {
-  throw new Error("Sentry test error — Vercro API staging");
-});
-
-// ── Sentry error handler — must be before any other error middleware ──────────
-Sentry.setupExpressErrorHandler(app);
-
-// ── Fallback error handler ────────────────────────────────────────────────────
 app.use((err, _req, res, _next) => {
   console.error(err.stack);
-  Sentry.captureException(err);
   res.status(500).json({ error: "Internal server error" });
 });
 
