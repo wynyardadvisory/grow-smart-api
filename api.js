@@ -66,7 +66,13 @@ const allowedOrigins = [
   "https://grow-smart-frontend.vercel.app",
   process.env.FRONTEND_URL,
 ].filter(Boolean);
-app.use(cors({ origin: (origin, cb) => cb(null, !origin || allowedOrigins.includes(origin)) }));
+app.use(cors({ origin: (origin, cb) => {
+  // Allow no origin (curl/mobile), exact matches, or any Vercel preview URL for staging
+  const allowed = !origin
+    || allowedOrigins.includes(origin)
+    || /^https:\/\/grow-smart-frontend-staging.*\.vercel\.app$/.test(origin);
+  cb(null, allowed);
+}}));
 app.use(express.json({ limit: "10mb" }));
 app.use(morgan("dev"));
 
