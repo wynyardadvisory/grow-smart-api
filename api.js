@@ -2309,7 +2309,7 @@ app.delete("/harvest-log/:id", requireAuth, async (req, res) => {
 app.get("/harvest-log/summary", requireAuth, async (req, res) => {
   const year = req.query.year || new Date().getFullYear();
   const { data, error } = await req.db.from("harvest_log")
-    .select("id, crop_instance_id, harvested_at, yield_score, quality, quantity_g, notes, photo_url, partial, crop_instances(name, variety)")
+    .select("id, crop_instance_id, crop_name, harvested_at, yield_score, quality, quantity_g, notes, photo_url, partial, crop_instances(name, variety)")
     .gte("harvested_at", `${year}-01-01`)
     .lte("harvested_at", `${year}-12-31`)
     .order("harvested_at", { ascending: false });
