@@ -2316,10 +2316,10 @@ app.get("/harvest-log/summary", requireAuth, async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message });
 
-  // Group by crop_instance_id (or crop name if no instance)
+  // Group by crop_instance_id
   const groups = {};
   for (const entry of data || []) {
-    const cropName = entry.crop_instances?.name || entry.crop_name || "Unknown";
+    const cropName = entry.crop_instances?.name || "Unknown crop";
     const variety  = entry.crop_instances?.variety || null;
     const key      = entry.crop_instance_id || cropName;
 
