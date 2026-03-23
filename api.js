@@ -1833,11 +1833,16 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
     const day28ago = new Date(now - 28 * 86400000).toISOString();
     const day1ago  = new Date(now - 1  * 86400000).toISOString();
 
+    // Get all demo user IDs to exclude from every metric
+    const { data: demoProfiles } = await db.from("profiles").select("id").eq("is_demo", true);
+    const demoUserIds = (demoProfiles || []).map(p => p.id);
+
     // User growth — auth users (everyone) vs profiles (completed onboarding)
     const { data: { users: authUsers } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
-    const totalSignups   = authUsers.length;
-    const newSignupsWeek = authUsers.filter(u => new Date(u.created_at) >= new Date(day7ago)).length;
-    const newSignupsLastWeek = authUsers.filter(u => new Date(u.created_at) >= new Date(day28ago) && new Date(u.created_at) < new Date(day7ago)).length;
+    const realAuthUsers   = authUsers.filter(u => !demoUserIds.includes(u.id));
+    const totalSignups    = realAuthUsers.length;
+    const newSignupsWeek  = realAuthUsers.filter(u => new Date(u.created_at) >= new Date(day7ago)).length;
+    const newSignupsLastWeek = realAuthUsers.filter(u => new Date(u.created_at) >= new Date(day28ago) && new Date(u.created_at) < new Date(day7ago)).length;
 
     const [
       // Activated (completed onboarding = have a profile)
@@ -1886,42 +1891,42 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
       { data: feedbackRatings },
 
     ] = await Promise.all([
-      db.from("profiles").select("*", { count: "exact", head: true }),
+      db.from("profiles").select("*", { count: "exact", head: true }).eq("is_demo", false),
 
-      db.from("crop_instances").select("user_id").gte("updated_at", day7ago),
-      db.from("crop_instances").select("user_id").gte("updated_at", day1ago),
+      db.from("crop_instances").select("user_id").gte("updated_at", day7ago).not("user_id", "in", `(${demoUserIds.join(",")})`),
+      db.from("crop_instances").select("user_id").gte("updated_at", day1ago).not("user_id", "in", `(${demoUserIds.join(",")})`),
 
-      db.from("locations").select("*", { count: "exact", head: true }),
-      db.from("growing_areas").select("*", { count: "exact", head: true }),
-      db.from("crop_instances").select("*", { count: "exact", head: true }),
+      db.from("locations").select("*", { count: "exact", head: true }).not("user_id", "in", `(${demoUserIds.join(",")})`),
+      db.from("growing_areas").select("*", { count: "exact", head: true }).not("user_id", "in", `(${demoUserIds.join(",")})`),
+      db.from("crop_instances").select("*", { count: "exact", head: true }).not("user_id", "in", `(${demoUserIds.join(",")})`),
 
-      db.from("crop_instances").select("*", { count: "exact", head: true }).not("sown_date", "is", null),
-      db.from("crop_instances").select("*", { count: "exact", head: true }).eq("status", "harvested"),
-      db.from("harvest_log").select("*", { count: "exact", head: true }),
+      db.from("crop_instances").select("*", { count: "exact", head: true }).not("sown_date", "is", null).not("user_id", "in", `(${demoUserIds.join(",")})`),
+      db.from("crop_instances").select("*", { count: "exact", head: true }).eq("status", "harvested").not("user_id", "in", `(${demoUserIds.join(",")})`),
+      db.from("harvest_log").select("*", { count: "exact", head: true }).not("user_id", "in", `(${demoUserIds.join(",")})`),
 
-      db.from("tasks").select("*", { count: "exact", head: true }).is("completed_at", null).not("status", "eq", "expired"),
-      db.from("tasks").select("*", { count: "exact", head: true }).not("completed_at", "is", null),
+      db.from("tasks").select("*", { count: "exact", head: true }).is("completed_at", null).not("status", "eq", "expired").not("user_id", "in", `(${demoUserIds.join(",")})`),
+      db.from("tasks").select("*", { count: "exact", head: true }).not("completed_at", "is", null).not("user_id", "in", `(${demoUserIds.join(",")})`),
 
-      db.from("user_feeds").select("*", { count: "exact", head: true }),
+      db.from("user_feeds").select("*", { count: "exact", head: true }).not("user_id", "in", `(${demoUserIds.join(",")})`),
 
-      db.from("crop_photos").select("*", { count: "exact", head: true }),
+      db.from("crop_photos").select("*", { count: "exact", head: true }).not("user_id", "in", `(${demoUserIds.join(",")})`),
 
       db.from("varieties").select("*", { count: "exact", head: true }),
-      db.from("harvest_log").select("*", { count: "exact", head: true }).not("quantity_value", "is", null),
+      db.from("harvest_log").select("*", { count: "exact", head: true }).not("quantity_value", "is", null).not("user_id", "in", `(${demoUserIds.join(",")})`),
 
       // Email sequences
-      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "waitlist_invite"),
-      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "feedback_day3"),
-      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "feedback_day7"),
-      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "reengage_day14"),
-      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "reengage_day30"),
-      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "daily_fallback"),
+      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "waitlist_invite").not("user_id", "in", `(${demoUserIds.join(",")})`),
+      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "feedback_day3").not("user_id", "in", `(${demoUserIds.join(",")})`),
+      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "feedback_day7").not("user_id", "in", `(${demoUserIds.join(",")})`),
+      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "reengage_day14").not("user_id", "in", `(${demoUserIds.join(",")})`),
+      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "reengage_day30").not("user_id", "in", `(${demoUserIds.join(",")})`),
+      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "daily_fallback").not("user_id", "in", `(${demoUserIds.join(",")})`),
 
       // Push tokens
-      db.from("device_push_tokens").select("*", { count: "exact", head: true }).eq("is_active", true),
+      db.from("device_push_tokens").select("*", { count: "exact", head: true }).eq("is_active", true).not("user_id", "in", `(${demoUserIds.join(",")})`),
 
       // Feedback avg rating
-      db.from("feedback").select("rating").not("rating", "is", null),
+      db.from("feedback").select("rating").not("rating", "is", null).not("user_id", "in", `(${demoUserIds.join(",")})`),
     ]);
 
     // Unique active users
@@ -1929,13 +1934,13 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
     const dau = new Set((dauData || []).map(r => r.user_id)).size;
 
     // Retention: users who signed up 7+ days ago and were active in last 7 days
-    const oldUserIds = new Set(authUsers.filter(u => new Date(u.created_at) < new Date(day7ago)).map(u => u.id));
-    const { data: recentActivity } = await db.from("crop_instances").select("user_id").gte("updated_at", day7ago);
+    const oldUserIds = new Set(realAuthUsers.filter(u => new Date(u.created_at) < new Date(day7ago)).map(u => u.id));
+    const { data: recentActivity } = await db.from("crop_instances").select("user_id").gte("updated_at", day7ago).not("user_id", "in", `(${demoUserIds.join(",")})`);
     const retainedWeek1 = (recentActivity || []).filter(r => oldUserIds.has(r.user_id));
     const week1Retention = oldUserIds.size > 0 ? Math.round((new Set(retainedWeek1.map(r => r.user_id)).size / oldUserIds.size) * 100) : null;
 
     // Week 4 retention
-    const users28agoIds = new Set(authUsers.filter(u => new Date(u.created_at) < new Date(day28ago)).map(u => u.id));
+    const users28agoIds = new Set(realAuthUsers.filter(u => new Date(u.created_at) < new Date(day28ago)).map(u => u.id));
     const retained28 = (recentActivity || []).filter(r => users28agoIds.has(r.user_id));
     const week4Retention = users28agoIds.size > 0 ? Math.round((new Set(retained28.map(r => r.user_id)).size / users28agoIds.size) * 100) : null;
 
