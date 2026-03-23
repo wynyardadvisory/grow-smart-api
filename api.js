@@ -2309,17 +2309,17 @@ app.delete("/harvest-log/:id", requireAuth, async (req, res) => {
 app.get("/harvest-log/summary", requireAuth, async (req, res) => {
   const year = req.query.year || new Date().getFullYear();
   const { data, error } = await req.db.from("harvest_log")
-    .select("id, crop_instance_id, crop_name, harvested_at, yield_score, quality, quantity_g, notes, photo_url, partial, crop_instances(name, variety)")
+    .select("id, crop_instance_id, harvested_at, yield_score, quality, quantity_g, notes, photo_url, partial, crop_instances(name, variety)")
     .gte("harvested_at", `${year}-01-01`)
     .lte("harvested_at", `${year}-12-31`)
     .order("harvested_at", { ascending: false });
 
   if (error) return res.status(500).json({ error: error.message });
 
-  // Group by crop_instance_id (or crop name if no instance)
+  // Group by crop_instance_id
   const groups = {};
   for (const entry of data || []) {
-    const cropName = entry.crop_instances?.name || entry.crop_name || "Unknown";
+    const cropName = entry.crop_instances?.name || "Unknown crop";
     const variety  = entry.crop_instances?.variety || null;
     const key      = entry.crop_instance_id || cropName;
 
