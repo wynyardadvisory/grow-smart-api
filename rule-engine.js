@@ -164,6 +164,7 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = []) 
   const transplantDate  = crop.transplanted_date  || crop.transplant_date  || null;
   const plantedOutDate  = crop.planted_out_date   || null;
   const lastFedAt       = crop.last_fed_at        || null;
+  const lastWateredAt   = crop.last_watered_at    || null;
 
   // Stage
   const daysSown = daysSince(sowDate);
@@ -261,7 +262,7 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = []) 
     daysSown, pctGrown,
 
     // Weather
-    frostRisk, frostRisk7day, tempC, rainMm,
+    frostRisk, frostRisk7day, tempC, rainMm, lastWateredAt,
     areaType,
 
     // Feed
@@ -1202,7 +1203,7 @@ class RuleEngine {
     const allCandidates = [];
 
     for (const crop of crops) {
-      const locId   = crop.area?.location_id || crop.location_id;
+      const locId   = crop.location_id || crop.area?.location_id;
       const weather = weatherByLocation[locId] || null;
       const areaType = crop.area?.type;
       const envMods  = envModifiers[areaType] || {};
@@ -1226,7 +1227,106 @@ class RuleEngine {
       }
     }
 
+    // ── Watering tasks — one per area ────────────────────────────────────────
+    // Group active outdoor crops by area, check dry conditions, generate one
+    // watering task per area rather than per crop.
+    const areaMap = new Map(); // areaId -> { crops, areaType, areaName, locId, weather }
+    for (const crop of crops) {
+      if (crop.status === "planned" || crop.status === "sown_indoors" || crop.status === "finished") continue;
+      const areaId = crop.area_id;
+      if (!areaId) continue;
+      const locId = crop.location_id || crop.area?.location_id;
+      const weather = weatherByLocation[locId] || null;
+      const areaType = crop.area?.type || "raised_bed";
+      const areaName = crop.area?.name || "Garden area";
+      console.log(`[Watering] crop=${crop.name} areaId=${areaId} locId=${locId} rainMm=${weather?.rain_mm ?? null} areaType=${areaType}`);
+      if (!areaMap.has(areaId)) {
+        areaMap.set(areaId, { crops: [], areaType, areaName, locId, weather, userId });
+      }
+      areaMap.get(areaId).crops.push(crop);
+    }
 
+    const today = todayISO();
+
+    for (const [areaId, area] of areaMap.entries()) {
+      const { crops: areaCrops, areaType, areaName, weather } = area;
+      const rainMm = weather?.rain_mm ?? null;
+
+      // Suppress if it rained more than 5mm today
+      if (rainMm !== null && rainMm >= 5) continue;
+
+      // Dry day thresholds per area type
+      const BASE_THRESHOLD = areaType === "greenhouse" ? 1
+        : areaType === "container" || areaType === "pot" ? 2
+        : areaType === "raised_bed" ? 4
+        : 6; // ground/border
+
+      // Reduce threshold by 1 for flowering/fruiting crops — more drought sensitive
+      const hasHighRiskCrop = areaCrops.some(c => ["flowering", "fruiting", "harvesting"].includes(c.stage));
+      const DRY_DAY_THRESHOLD = hasHighRiskCrop && BASE_THRESHOLD > 1 ? BASE_THRESHOLD - 1 : BASE_THRESHOLD;
+
+      // Find the most recent watering signal across all crops in this area
+      // (either last_watered_at or today's rain)
+      let lastWateredDate = null;
+      for (const crop of areaCrops) {
+        const lw = crop.last_watered_at ? crop.last_watered_at.split("T")[0] : null;
+        if (lw && (!lastWateredDate || lw > lastWateredDate)) lastWateredDate = lw;
+      }
+
+      // Calculate days since last watered
+      const daysSinceWatered = lastWateredDate
+        ? Math.floor((Date.now() - new Date(lastWateredDate).getTime()) / 86400000)
+        : null;
+
+      // Only fire if overdue
+      if (daysSinceWatered !== null && daysSinceWatered < DRY_DAY_THRESHOLD) continue;
+      if (daysSinceWatered === null) {
+        // Never watered — only fire if no rain recently (rain_mm null = unknown, skip)
+        if (rainMm === null) continue;
+      }
+
+      // Prioritise crops most at risk: flowering/fruiting > seedling > vegetative
+      const STAGE_PRIORITY = { flowering: 0, fruiting: 0, harvesting: 0, seedling: 1, vegetative: 2, seed: 3 };
+      const sortedCrops = [...areaCrops].sort((a, b) =>
+        (STAGE_PRIORITY[a.stage] ?? 3) - (STAGE_PRIORITY[b.stage] ?? 3)
+      );
+      const atRiskCrops = sortedCrops.slice(0, 3).map(c => c.name);
+      const atRiskText = atRiskCrops.length > 0 ?  : "";
+
+      const daysText = daysSinceWatered !== null ?  : "";
+      const urgency = daysSinceWatered !== null && daysSinceWatered >= DRY_DAY_THRESHOLD + 2 ? "high" : "medium";
+
+      // Use first crop in area for context (area_id, user_id)
+      const refCrop = areaCrops[0];
+      const ctx = {
+        userId,
+        cropId:   null, // area-level task
+        cropName: areaName,
+        areaId,
+      };
+
+      allCandidates.push({
+        user_id:          userId,
+        crop_instance_id: null,
+        area_id:          areaId,
+        action:           `Water ${areaName}${daysText}${atRiskText}`,
+        task_type:        "water",
+        urgency,
+        due_date:         today,
+        scheduled_for:    today,
+        visible_from:     today,
+        expires_at:       new Date(addDays(today, 1) + "T23:59:59Z").toISOString(),
+        status:           "due",
+        engine_type:      "risk",
+        record_type:      "task",
+        source:           "rule_engine",
+        rule_id:          "watering_due",
+        source_key:       sourceKey({ u: userId, a: areaId, r: "watering_due", d: today }),
+        date_confidence:  "exact",
+        meta:             JSON.stringify({ dry_days: daysSinceWatered, area_type: areaType }),
+        risk_payload:     null,
+      });
+    }
 
     // Upsert all candidates
     if (!this.dryRun && this.supabase) {
@@ -1406,12 +1506,10 @@ class RuleEngine {
     const result = {};
     for (const loc of locations || []) {
       if (!loc.postcode) continue;
-      // Trim to outward code only (e.g. "M1 1AE" -> "M1") to match weather_cache format
-      const outwardCode = loc.postcode.trim().split(" ")[0].toUpperCase();
       const { data: cached } = await this.supabase
         .from("weather_cache")
         .select("temp_c, frost_risk, frost_risk_7day, rain_mm, condition")
-        .eq("postcode", outwardCode)
+        .eq("postcode", loc.postcode)
         .gt("expires_at", new Date().toISOString())
         .single();
       if (cached) result[loc.id] = cached;
