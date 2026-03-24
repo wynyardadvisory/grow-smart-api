@@ -92,7 +92,20 @@ function weekEndISO() {
   return new Date(Date.now() + 7 * 86400000).toISOString().split("T")[0];
 }
 
-// ── Auth middleware ───────────────────────────────────────────────────────────
+// ── Paginated auth users helper ───────────────────────────────────────────────
+// Supabase listUsers caps at 1000 per page — this fetches all pages
+async function getAllAuthUsers() {
+  let all = [];
+  let page = 1;
+  while (true) {
+    const { data: { users } } = await supabaseService.auth.admin.listUsers({ perPage: 1000, page });
+    if (!users?.length) break;
+    all = all.concat(users);
+    if (users.length < 1000) break;
+    page++;
+  }
+  return all;
+}
 async function requireAuth(req, res, next) {
   const header = req.headers.authorization;
   if (!header?.startsWith("Bearer ")) return res.status(401).json({ error: "Missing auth token" });
@@ -1845,7 +1858,7 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
     const demoUserIds = (demoProfiles || []).map(p => p.id);
 
     // User growth — auth users (everyone) vs profiles (completed onboarding)
-    const { data: { users: authUsers } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
+    const authUsers = await getAllAuthUsers();
     const realAuthUsers   = authUsers.filter(u => !demoUserIds.includes(u.id));
     const totalSignups    = realAuthUsers.length;
     const newSignupsWeek  = realAuthUsers.filter(u => new Date(u.created_at) >= new Date(day7ago)).length;
@@ -2045,7 +2058,7 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
     const { data: demoProfiles } = await db.from("profiles").select("id").eq("is_demo", true);
     const demoUserIds = new Set((demoProfiles || []).map(p => p.id));
 
-    const { data: { users: authUsers } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
+    const authUsers = await getAllAuthUsers();
     const realUsers = authUsers.filter(u => !demoUserIds.has(u.id));
 
     // ── Activation funnel ────────────────────────────────────────────────────
@@ -2176,7 +2189,7 @@ app.get("/admin/feedback", requireAuth, requireAdmin, async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
 
   // Enrich with email from auth.users
-  const { data: { users } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
+  const users = await getAllAuthUsers();
   const emailMap = {};
   (users || []).forEach(u => { emailMap[u.id] = u.email; });
 
@@ -2233,8 +2246,7 @@ app.post("/admin/crop-queue/:id/reject", requireAuth, requireAdmin, async (req, 
 // GET /admin/users — all users with crop counts and last seen
 app.get("/admin/users", requireAuth, requireAdmin, async (req, res) => {
   // Use service role to access auth.users — covers users who never completed onboarding
-  const { data: authUsers } = await supabaseService.auth.admin.listUsers();
-  const users = authUsers?.users || [];
+  const users = await getAllAuthUsers();
 
   // Get profiles for name lookup
   const { data: profiles } = await supabaseService.from("profiles").select("id, name");
@@ -3720,7 +3732,7 @@ app.post("/admin/backfill-badges", requireAuth, requireAdmin, async (req, res) =
     const today       = now.toISOString().split("T")[0];
     const yesterday   = new Date(Date.now()-86400000).toISOString().split("T")[0];
 
-    const { data: { users } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
+    const users = await getAllAuthUsers();
     if (!users?.length) return res.json({ ok: true, processed: 0 });
 
     const [{ data: allTasks }, { data: allCrops }, { data: allLocations }, { data: allAreas }, { data: allHarvests }, { data: allPhotos }, { data: allBadges }] = await Promise.all([
