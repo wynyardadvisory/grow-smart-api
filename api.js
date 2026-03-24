@@ -2165,6 +2165,55 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
     const pushRetention    = withPush.length    > 0 ? Math.round(withPush.filter(id => activeLast7.has(id)).length    / withPush.length    * 100) : null;
     const noPushRetention  = withoutPush.length > 0 ? Math.round(withoutPush.filter(id => activeLast7.has(id)).length / withoutPush.length * 100) : null;
 
+    // ── Health checks — data integrity ───────────────────────────────────────
+    // Users with profiles but 0 crops (broken onboarding)
+    const { data: allCropUsers } = await db.from("crop_instances").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
+    const anyUserWithCrop = new Set((allCropUsers || []).map(r => r.user_id));
+    const usersNoCrops = [...profileIds].filter(id => !anyUserWithCrop.has(id)).length;
+
+    // Users with profiles but 0 tasks ever
+    const { data: allTaskUsers } = await db.from("tasks").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
+    const anyUserWithTask = new Set((allTaskUsers || []).map(r => r.user_id));
+    const usersNoTasks = [...profileIds].filter(id => !anyUserWithTask.has(id)).length;
+
+    const totalOnboarded = profileIds.size;
+    const healthChecks = {
+      usersNoCrops,
+      usersNoTasks,
+      usersNoCropsPct:  totalOnboarded > 0 ? Math.round(usersNoCrops  / totalOnboarded * 100) : 0,
+      usersNoTasksPct:  totalOnboarded > 0 ? Math.round(usersNoTasks  / totalOnboarded * 100) : 0,
+      totalOnboarded,
+    };
+
+    // ── Behaviour → retention correlation ────────────────────────────────────
+    // Split users by tasks completed (0, 1, 2+) and check D1 + D7 retention
+    const day1ago = new Date(now - 1  * 86400000).toISOString();
+
+    // Count tasks completed per user
+    const { data: completedTaskData } = await db.from("tasks")
+      .select("user_id")
+      .not("completed_at", "is", null)
+      .not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
+    const taskCountByUser = {};
+    (completedTaskData || []).forEach(t => {
+      taskCountByUser[t.user_id] = (taskCountByUser[t.user_id] || 0) + 1;
+    });
+
+    const group0    = [...profileIds].filter(id => !taskCountByUser[id]);
+    const group1    = [...profileIds].filter(id => taskCountByUser[id] === 1);
+    const group2plus = [...profileIds].filter(id => taskCountByUser[id] >= 2);
+
+    const retRate = (ids, activeSet) =>
+      ids.length > 0 ? Math.round(ids.filter(id => activeSet.has(id)).length / ids.length * 100) : null;
+
+    const activeLast1 = new Set((recentActivity || []).filter(p => p.last_seen_at && new Date(p.last_seen_at) >= new Date(day1ago)).map(p => p.id));
+
+    const behaviourRetention = [
+      { label: "No tasks completed",   count: group0.length,     d1: retRate(group0, activeLast1),     d7: retRate(group0, activeLast7) },
+      { label: "1 task completed",     count: group1.length,     d1: retRate(group1, activeLast1),     d7: retRate(group1, activeLast7) },
+      { label: "2+ tasks completed",   count: group2plus.length, d1: retRate(group2plus, activeLast1), d7: retRate(group2plus, activeLast7) },
+    ];
+
     res.json({
       funnel,
       cohorts,
@@ -2172,6 +2221,9 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
         withPush:    { users: withPush.length,    retention7day: pushRetention },
         withoutPush: { users: withoutPush.length, retention7day: noPushRetention },
       },
+      healthChecks,
+      behaviourRetention,
+      bugFixDate: "2026-03-24",
     });
 
   } catch (e) {
