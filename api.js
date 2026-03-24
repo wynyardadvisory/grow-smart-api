@@ -48,7 +48,7 @@ function captureError(context, err, extra = {}) {
 const { RuleEngine } = require("./rule-engine");
 const { applyBlockedPeriodAdjustments, reapplyAllBlockedPeriods } = require("./blocked-period-adjustment");
 const { runNotificationsForUser } = require("./notifications");
-const { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement, runDailyEmailFallback } = require("./emails");
+const { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement, runDailyEmailFallback, runOnboardingRecovery } = require("./emails");
 
 // ── Supabase (service role — server only) ─────────────────────────────────────
 const supabaseService = createClient(
@@ -3169,10 +3169,21 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
       };
     });
 
-    await supabaseService.from("crop_instances").insert(cropInserts);
+    const { error: cropErr } = await supabaseService.from("crop_instances").insert(cropInserts);
+    if (cropErr) throw new Error("Crops: " + cropErr.message);
 
     // 6. Run rule engine
     const tasks = await runRuleEngine(userId);
+
+    // ── Safety checks — alert in logs if crops or tasks are missing ───────────
+    const { count: cropCount } = await supabaseService
+      .from("crop_instances").select("*", { count: "exact", head: true }).eq("user_id", userId);
+    if (!cropCount || cropCount === 0) {
+      console.error(`[Onboarding][ALERT] User ${userId} has 0 crops after onboarding — crop insert may have failed`);
+    }
+    if (!tasks?.length) {
+      console.error(`[Onboarding][ALERT] User ${userId} has 0 tasks after onboarding (crops: ${cropCount})`);
+    }
 
     // 7. Fallback — if engine generated nothing, insert starter tasks
     if (!tasks?.length) {
@@ -3201,93 +3212,13 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
 
 // =============================================================================
 // POST /admin/onboarding-recovery-email
-// One-shot: finds last 50 signups with no crops (unactivated due to bug),
-// skips anyone already sent this email, sends recovery email via Resend.
+// Sends recovery email to ALL users with profiles but no crops.
+// Safe to run multiple times — skips anyone already sent.
 // =============================================================================
 app.post("/admin/onboarding-recovery-email", requireAuth, requireAdmin, async (req, res) => {
   try {
-    // Get last 50 auth users by signup date
-    const { data: { users: allUsers } } = await supabaseService.auth.admin.listUsers({ perPage: 50, page: 1 });
-    const recent = (allUsers || [])
-      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-      .slice(0, 50);
-
-    // Find which have no crop_instances (unactivated)
-    const userIds = recent.map(u => u.id);
-    const { data: activatedCrops } = await supabaseService.from("crop_instances")
-      .select("user_id").in("user_id", userIds);
-    const activatedIds = new Set((activatedCrops || []).map(c => c.user_id));
-    const unactivated = recent.filter(u => !activatedIds.has(u.id));
-
-    // Skip anyone already sent this recovery email
-    const { data: alreadySent } = await supabaseService.from("email_log")
-      .select("user_id").eq("email_type", "onboarding_recovery").in("user_id", userIds);
-    const alreadySentIds = new Set((alreadySent || []).map(e => e.user_id));
-    const toEmail = unactivated.filter(u => !alreadySentIds.has(u.id) && u.email);
-
-    const results = [];
-    for (const user of toEmail) {
-      try {
-        const resp = await fetch("https://api.resend.com/emails", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer \${process.env.RESEND_API_KEY}`,
-          },
-          body: JSON.stringify({
-            from: "Vercro <hello@vercro.com>",
-            to: user.email,
-            subject: "Your Vercro garden plan is ready 🌱",
-            html: `
-              <div style="font-family: Georgia, serif; max-width: 520px; margin: 0 auto; padding: 40px 24px; color: #1A2E28;">
-                <div style="font-size: 28px; margin-bottom: 8px;">🌱</div>
-                <h1 style="font-size: 24px; font-weight: 900; margin: 0 0 16px; color: #2F5D50;">
-                  Sorry — we had a setup issue
-                </h1>
-                <p style="font-size: 16px; line-height: 1.6; margin: 0 0 16px; color: #444;">
-                  When you signed up for Vercro, a technical issue meant we couldn't finish setting up your garden plan. That's now fixed.
-                </p>
-                <p style="font-size: 16px; line-height: 1.6; margin: 0 0 24px; color: #444;">
-                  It takes under 60 seconds to complete — and once you do, you'll have a personalised daily task plan waiting for you based on exactly what you're growing.
-                </p>
-                <a href="https://app.vercro.com" style="display: inline-block; background: #2F5D50; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 10px; font-size: 16px; font-weight: 700; margin-bottom: 32px;">
-                  Complete my garden setup →
-                </a>
-                <p style="font-size: 14px; color: #888; line-height: 1.6; margin: 0;">
-                  If you have any questions just reply to this email.<br>
-                  — The Vercro team
-                </p>
-                <hr style="border: none; border-top: 1px solid #eee; margin: 32px 0;" />
-                <p style="font-size: 12px; color: #aaa;">vercro.com · Built for UK growers</p>
-              </div>
-            `,
-          }),
-        });
-
-        if (resp.ok) {
-          // Log so we never send twice
-          await supabaseService.from("email_log").insert({
-            user_id:    user.id,
-            email_type: "onboarding_recovery",
-            sent_at:    new Date().toISOString(),
-          });
-          results.push({ email: user.email, status: "sent" });
-        } else {
-          const err = await resp.json();
-          results.push({ email: user.email, status: "failed", error: err });
-        }
-      } catch (e) {
-        results.push({ email: user.email, status: "error", error: e.message });
-      }
-    }
-
-    res.json({
-      total_recent:    recent.length,
-      unactivated:     unactivated.length,
-      already_sent:    alreadySentIds.size,
-      emails_sent:     results.filter(r => r.status === "sent").length,
-      results,
-    });
+    const result = await runOnboardingRecovery(supabaseService);
+    res.json({ ok: true, ...result });
   } catch (err) {
     console.error("[OnboardingRecovery]", err.message);
     res.status(500).json({ error: err.message });

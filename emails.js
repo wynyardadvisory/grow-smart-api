@@ -1010,6 +1010,97 @@ function templateGardenLapsed(name, cropNames) {
   };
 }
 
+// ── Onboarding recovery email ─────────────────────────────────────────────────
+
+function templateOnboardingRecovery(name) {
+  const firstName = name ? name.split(" ")[0] : "there";
+  return {
+    subject: "Sorry — we found and fixed an issue with your Vercro setup",
+    html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f8f2;font-family:Georgia,serif;">
+  <div style="max-width:560px;margin:40px auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 2px 16px rgba(47,93,80,0.08);">
+    <div style="background:#2F5D50;padding:32px 40px;text-align:center;">
+      <div style="font-size:32px;margin-bottom:8px;">🌱</div>
+      <div style="font-family:Georgia,serif;font-size:24px;font-weight:700;color:#ffffff;">Vercro</div>
+    </div>
+    <div style="padding:40px;">
+      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">Hi ${firstName} — I wanted to email you personally</h1>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
+        We found an issue that may have affected your account when you first set up Vercro. In some cases, the crops you chose during onboarding weren't saved properly — which meant your personalised plan and daily tasks never generated as they should have.
+      </p>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
+        That's now been fixed.
+      </p>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 32px;">
+        If you open Vercro and re-add your crops, your personalised plan will build straight away — daily tasks, harvest forecasts, frost alerts, all based on exactly what you're growing.
+      </p>
+      <div style="text-align:center;margin-bottom:32px;">
+        <a href="${APP_URL}" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">Set up my garden →</a>
+      </div>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
+        I'm really sorry about this — it was entirely on our side. I appreciate your patience and I'm grateful you gave Vercro a try.
+      </p>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0;">
+        If you have any questions just reply to this email — I read everything personally.
+      </p>
+    </div>
+    <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
+      <p style="font-size:12px;color:#888;margin:0;">Mark · Founder of Vercro · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
+    </div>
+  </div>
+</body>
+</html>`,
+  };
+}
+
+async function runOnboardingRecovery(supabase) {
+  const resend = getResend();
+  if (!resend) return { sent: 0, skipped: 0, reason: "resend_not_configured" };
+
+  const { data: { users } } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+  const userMap = {};
+  (users || []).forEach(u => { userMap[u.id] = u; });
+
+  const { data: profiles } = await supabase
+    .from("profiles")
+    .select("id, name")
+    .eq("is_demo", false);
+
+  if (!profiles?.length) return { sent: 0, skipped: 0 };
+
+  // Users with no crops at all
+  const { data: cropUsers } = await supabase.from("crop_instances").select("user_id");
+  const hasCropIds = new Set((cropUsers || []).map(r => r.user_id));
+
+  // Skip anyone already sent this email
+  const { data: alreadySent } = await supabase
+    .from("email_log").select("user_id").eq("email_type", "onboarding_recovery");
+  const alreadySentIds = new Set((alreadySent || []).map(e => e.user_id));
+
+  const affected = profiles.filter(p => !hasCropIds.has(p.id) && !alreadySentIds.has(p.id));
+
+  let sent = 0, skipped = 0;
+  for (const profile of affected) {
+    const user = userMap[profile.id];
+    if (!user?.email) { skipped++; continue; }
+    const template = templateOnboardingRecovery(profile.name);
+    const result = await sendEmail(user.email, template);
+    if (result.sent) {
+      await supabase.from("email_log").insert({
+        user_id: profile.id, email: user.email,
+        email_type: "onboarding_recovery", sent_at: new Date().toISOString(),
+      });
+      sent++;
+    } else { skipped++; }
+  }
+
+  console.log(`[OnboardingRecovery] Sent: ${sent}, Skipped: ${skipped}, Total affected: ${affected.length}`);
+  return { sent, skipped, total: affected.length };
+}
+
 // ── Daily email fallback runner ───────────────────────────────────────────────
 // Fires after the morning push cron for users with no push token or push disabled
 // Suppressed if user opened the app in the last 6 hours
@@ -1137,4 +1228,4 @@ async function runDailyEmailFallback(supabase) {
   return { sent, skipped };
 }
 
-module.exports = { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement, runDailyEmailFallback };
+module.exports = { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement, runDailyEmailFallback, runOnboardingRecovery };
