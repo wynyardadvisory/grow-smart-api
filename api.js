@@ -408,9 +408,19 @@ app.put("/areas/:id", requireAuth, async (req, res) => {
 });
 
 app.delete("/areas/:id", requireAuth, async (req, res) => {
-  const { error } = await req.db.from("growing_areas").delete().eq("id", req.params.id);
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(204).send();
+  const areaId = req.params.id;
+  const userId = req.user.id;
+  try {
+    // Must delete in order: tasks → crop_instances → area
+    // Foreign key constraints prevent deleting area while tasks/crops reference it
+    await req.db.from("tasks").delete().eq("area_id", areaId).eq("user_id", userId);
+    await req.db.from("crop_instances").delete().eq("area_id", areaId).eq("user_id", userId);
+    const { error } = await req.db.from("growing_areas").delete().eq("id", areaId);
+    if (error) return res.status(500).json({ error: error.message });
+    res.status(204).send();
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // =============================================================================
