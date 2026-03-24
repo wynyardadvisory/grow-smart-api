@@ -2056,27 +2056,27 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
     const profileIds = new Set((profiles || []).map(p => p.id));
     const hasProfile = profileIds.size;
 
-    // Has at least one crop
-    const { data: cropUsers } = await db.from("crop_instances").select("user_id").eq("active", true).not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
-    const hasCropIds = new Set((cropUsers || []).map(r => r.user_id));
-    const hasCrop = hasCropIds.size;
-
-    // Has tasks generated
-    const { data: taskUsers } = await db.from("tasks").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})`);
+    // Has tasks generated (ever — crops + rule engine ran during onboarding)
+    const { data: taskUsers } = await db.from("tasks").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
     const hasTaskIds = new Set((taskUsers || []).map(r => r.user_id));
     const hasTasks = hasTaskIds.size;
 
-    // Has completed at least 1 task
-    const { data: completedUsers } = await db.from("tasks").select("user_id").not("completed_at", "is", null).not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})`);
+    // Has completed at least 1 task (ever)
+    const { data: completedUsers } = await db.from("tasks").select("user_id").not("completed_at", "is", null).not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
     const hasCompletedIds = new Set((completedUsers || []).map(r => r.user_id));
     const hasCompleted = hasCompletedIds.size;
 
+    // Still has active crops today (ongoing engagement — separate from onboarding)
+    const { data: activeCropUsers } = await db.from("crop_instances").select("user_id").eq("active", true).not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
+    const hasActiveCropIds = new Set((activeCropUsers || []).map(r => r.user_id));
+    const hasActiveCrops = hasActiveCropIds.size;
+
     const funnel = [
-      { step: "Signed up",           count: totalSignups, pct: 100 },
-      { step: "Completed onboarding", count: hasProfile,  pct: totalSignups > 0 ? Math.round(hasProfile / totalSignups * 100) : 0 },
-      { step: "Added a crop",         count: hasCrop,     pct: totalSignups > 0 ? Math.round(hasCrop / totalSignups * 100) : 0 },
-      { step: "Tasks generated",      count: hasTasks,    pct: totalSignups > 0 ? Math.round(hasTasks / totalSignups * 100) : 0 },
-      { step: "Completed 1+ task",    count: hasCompleted, pct: totalSignups > 0 ? Math.round(hasCompleted / totalSignups * 100) : 0 },
+      { step: "Signed up",            count: totalSignups,   pct: 100 },
+      { step: "Completed onboarding", count: hasProfile,     pct: totalSignups > 0 ? Math.round(hasProfile    / totalSignups * 100) : 0 },
+      { step: "Tasks generated",      count: hasTasks,       pct: totalSignups > 0 ? Math.round(hasTasks      / totalSignups * 100) : 0 },
+      { step: "Completed 1+ task",    count: hasCompleted,   pct: totalSignups > 0 ? Math.round(hasCompleted  / totalSignups * 100) : 0 },
+      { step: "Active crops today",   count: hasActiveCrops, pct: totalSignups > 0 ? Math.round(hasActiveCrops / totalSignups * 100) : 0 },
     ];
 
     // ── Cohort table — last 14 days ──────────────────────────────────────────
