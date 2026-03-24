@@ -241,7 +241,7 @@ async function buildCandidates(supabase, userId, prefs) {
   // ── 5. Upcoming key task ──────────────────────────────────────────────────
   if (prefs.coming_up_enabled) {
     const tomorrow = new Date(Date.now() + 86400000).toISOString().split("T")[0];
-    const in3days  = new Date(Date.now() + 3 * 86400000).toISOString().split("T")[0];
+    const in7days  = new Date(Date.now() + 7 * 86400000).toISOString().split("T")[0];
 
     const { data: upcomingTasks } = await supabase
       .from("tasks")
@@ -250,7 +250,7 @@ async function buildCandidates(supabase, userId, prefs) {
       .is("completed_at", null)
       .eq("status", "upcoming")
       .gte("due_date", tomorrow)
-      .lte("due_date", in3days)
+      .lte("due_date", in7days)
       .in("task_type", ["sow", "transplant", "harden_off", "harvest"])
       .order("due_date", { ascending: true })
       .limit(1)
@@ -259,12 +259,20 @@ async function buildCandidates(supabase, userId, prefs) {
     if (upcomingTasks) {
       const cropName = upcomingTasks.crop?.name;
       const daysAway = Math.ceil((new Date(upcomingTasks.due_date) - Date.now()) / 86400000);
-      const when     = daysAway === 1 ? "tomorrow" : `in ${daysAway} days`;
+      // Urgency copy: today / tomorrow / next 3 days / this week
+      let when, urgencyNote;
+      if (daysAway <= 1) {
+        when = "tomorrow"; urgencyNote = "Don't miss your window";
+      } else if (daysAway <= 3) {
+        when = `in ${daysAway} days`; urgencyNote = "Coming up soon";
+      } else {
+        when = "this week"; urgencyNote = "Plan ahead";
+      }
       candidates.push({
         notification_type: "upcoming",
-        priority:          "medium",
+        priority:          daysAway <= 3 ? "medium" : "low",
         title:             cropName ? `${cropName} — ${upcomingTasks.task_type} ${when}` : `Garden task coming up ${when}`,
-        body:              upcomingTasks.action,
+        body:              `${urgencyNote} · ${upcomingTasks.action}`,
         task_id:           upcomingTasks.id,
         payload: {
           url:     "/?section=upcoming",
@@ -356,7 +364,7 @@ async function buildCandidates(supabase, userId, prefs) {
 // Priority: critical > high > medium > low
 // Apply daily caps and cooldowns
 
-async function selectCandidates(supabase, userId, candidates, window) {
+async function selectCandidates(supabase, userId, candidates, window, isAdmin = false) {
   const today   = new Date().toISOString().split("T")[0];
   const counter = await getDailyCounter(supabase, userId, today);
   const PRIORITY_RANK = { critical: 4, high: 3, medium: 2, low: 1 };
@@ -382,10 +390,12 @@ async function selectCandidates(supabase, userId, candidates, window) {
     if ((counter[capKey] || 0) >= (CAPS[c.priority] || 0)) continue;
     if (counter.total_sent + selected.length >= CAPS.total) break;
 
-    // Check cooldown
-    const cooldownHours = COOLDOWNS[c.notification_type] || 20;
-    const suppressed = await isRecentlySent(supabase, userId, c.notification_type, cooldownHours);
-    if (suppressed && c.priority !== "critical") continue;
+    // Check cooldown — admin accounts bypass this so they always get notified
+    if (!isAdmin) {
+      const cooldownHours = COOLDOWNS[c.notification_type] || 20;
+      const suppressed = await isRecentlySent(supabase, userId, c.notification_type, cooldownHours);
+      if (suppressed && c.priority !== "critical") continue;
+    }
 
     // Window routing
     if (window === "morning" && c.notification_type === "weekly_summary") continue;
@@ -464,9 +474,17 @@ async function sendNotification(supabase, userId, candidate) {
   return { sent: sentCount > 0, sentCount, eventId };
 }
 
+// ── Admin accounts — always receive notifications regardless of activity ──────
+// These users bypass the last_seen_at suppression so they can verify push works
+const ADMIN_USER_IDS = new Set([
+  "c1c730ff-acb2-4969-9c74-32a84041d9b3", // Mark (founder)
+]);
+
 // ── Main notification runner ──────────────────────────────────────────────────
 async function runNotificationsForUser(supabase, userId, window = "morning") {
   if (!setupVapid()) return { sent: 0, reason: "vapid_not_configured" };
+
+  const isAdmin = ADMIN_USER_IDS.has(userId);
 
   // Get preferences
   const { data: prefs } = await supabase
@@ -477,12 +495,32 @@ async function runNotificationsForUser(supabase, userId, window = "morning") {
 
   if (!prefs?.push_enabled) return { sent: 0, reason: "push_disabled" };
 
+  // Suppress if user already opened the app today (skip for admin accounts)
+  if (!isAdmin) {
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("last_seen_at")
+      .eq("id", userId)
+      .single();
+
+    if (profile?.last_seen_at) {
+      const lastSeen = new Date(profile.last_seen_at).getTime();
+      const hoursSinceOpen = (Date.now() - lastSeen) / 3600000;
+      // Morning: skip if opened in last 2 hours. Evening: skip if opened in last 6 hours.
+      const suppressWindow = window === "evening" ? 6 : 2;
+      if (hoursSinceOpen < suppressWindow) {
+        return { sent: 0, reason: "recently_active" };
+      }
+    }
+  }
+
   // Build candidates
   const candidates = await buildCandidates(supabase, userId, prefs);
   if (!candidates.length) return { sent: 0, reason: "no_candidates" };
 
-  // Select best
-  const selected = await selectCandidates(supabase, userId, candidates, window);
+  // Select best — admin accounts bypass cooldown suppression for evening window
+  // so they always get both morning and evening notifications
+  const selected = await selectCandidates(supabase, userId, candidates, window, isAdmin);
   if (!selected.length) return { sent: 0, reason: "all_suppressed" };
 
   // Send

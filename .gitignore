@@ -1,1 +1,3 @@
 .envnode_modules/
+.vercel
+.env*.local
