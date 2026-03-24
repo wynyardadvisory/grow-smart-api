@@ -2810,16 +2810,20 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     else                frostRisk = "low";
   }
 
+  // ── First action — fallback for users with no engine tasks ──────────────────
+  const firstAction = tasks.length === 0 ? getFirstActionForUser(crops) : null;
+
   res.json({
     user:             profile?.name,
     profile_photo:    profile?.photo_url || null,
     plan:             profile?.plan || "free",
     tasks: {
-      tasks:     tasks, // full list including overdue
+      tasks:     tasks,
       today:     tasks.filter(t => t.due_date <= today),
       this_week: tasks.filter(t => t.due_date > today && t.due_date <= weekEnd),
       coming_up: tasks.filter(t => t.due_date > weekEnd),
     },
+    first_action:     firstAction,
     crop_count:       crops.length,
     crops_with_flags: crops.filter(c => c.missed_task_note).map(c => ({ id: c.id, name: c.name, missed_task_note: c.missed_task_note })),
     harvest_forecast: harvestForecast,
@@ -2838,8 +2842,127 @@ app.get("/dashboard", requireAuth, async (req, res) => {
 });
 
 // =============================================================================
-// TASK EXPIRY — expire tasks whose window has passed, flag crop with red dot
+// FIRST ACTION — guarantees new users always have something to do
+// getFirstActionForUser() returns one crop-aware fallback action.
+// Used by /dashboard (injected when engine returns 0 tasks) and /first-action.
 // =============================================================================
+
+function getFirstActionForUser(crops) {
+  if (!crops?.length) {
+    return {
+      id:        "fallback_no_crops",
+      action:    "Check in on your garden — add your first crop to get a personalised plan",
+      task_type: "monitor",
+      urgency:   "low",
+      is_fallback: true,
+      source_key: "first_action_no_crops",
+    };
+  }
+
+  // Pick the most relevant crop — prefer one with a sow date, then first active
+  const crop = crops.find(c => c.sown_date) || crops[0];
+  const cropName = crop.name || "your crop";
+  const stage    = crop.stage || "seed";
+  const sowDate  = crop.sown_date;
+
+  // Days since sown — used to pick the most relevant check
+  const daysSown = sowDate
+    ? Math.floor((Date.now() - new Date(sowDate).getTime()) / 86400000)
+    : null;
+
+  let action, promptType;
+
+  if (stage === "seed" || stage === "seedling" || !sowDate) {
+    if (daysSown !== null && daysSown >= 3 && daysSown <= 21) {
+      action    = `Check ${cropName} — any signs of germination yet?`;
+      promptType = "germination_check";
+    } else {
+      action    = `Check ${cropName} — does the soil feel moist?`;
+      promptType = "moisture_check";
+    }
+  } else if (stage === "vegetative") {
+    action    = `Check ${cropName} — looking healthy? Any pests or yellowing?`;
+    promptType = "health_check";
+  } else if (stage === "flowering" || stage === "fruiting") {
+    action    = `Check ${cropName} — flowers or fruit developing well?`;
+    promptType = "growth_check";
+  } else if (stage === "harvesting") {
+    action    = `Check ${cropName} — is it ready to harvest?`;
+    promptType = "harvest_check";
+  } else {
+    action    = `Check ${cropName} — how is it looking today?`;
+    promptType = "general_check";
+  }
+
+  return {
+    id:           `fallback_${crop.id}_${promptType}`,
+    crop_id:      crop.id,
+    crop_name:    cropName,
+    action,
+    task_type:    "monitor",
+    urgency:      "low",
+    is_fallback:  true,
+    prompt_type:  promptType,
+    source_key:   `first_action_${crop.id}_${promptType}`,
+  };
+}
+
+// GET /first-action — returns the one fallback action for this user
+app.get("/first-action", requireAuth, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    // Check if user has any real incomplete tasks first
+    const { data: realTasks } = await req.db.from("tasks")
+      .select("id").eq("user_id", userId).is("completed_at", null)
+      .not("status", "eq", "expired").limit(1);
+
+    if (realTasks?.length) {
+      return res.json({ has_real_tasks: true, first_action: null });
+    }
+
+    // No real tasks — get crops to build fallback
+    const { data: crops } = await req.db.from("crop_instances")
+      .select("id, name, stage, sown_date, status")
+      .eq("user_id", userId).eq("active", true);
+
+    const firstAction = getFirstActionForUser(crops);
+    res.json({ has_real_tasks: false, first_action: firstAction });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /first-action/complete — logs completion, optionally confirms crop stage
+app.post("/first-action/complete", requireAuth, async (req, res) => {
+  const userId = req.user.id;
+  const { source_key, crop_id, prompt_type } = req.body;
+  try {
+    // Log to funnel_events (best effort — don't fail if table doesn't exist)
+    try {
+      await supabaseService.from("funnel_events").insert({
+        user_id:    userId,
+        event_type: "first_action_completed",
+        meta:       JSON.stringify({ source_key, crop_id, prompt_type }),
+        created_at: new Date().toISOString(),
+      });
+    } catch(e) {
+      console.log("[FirstAction] funnel_events log skipped:", e.message);
+    }
+
+    // If crop_id provided, set stage_confidence = confirmed (lightweight write-back)
+    if (crop_id) {
+      await supabaseService.from("crop_instances")
+        .update({ stage_confidence: "confirmed", updated_at: new Date().toISOString() })
+        .eq("id", crop_id).eq("user_id", userId);
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
 
 async function expireOverdueTasks(userId, db) {
   const today = todayISO();
