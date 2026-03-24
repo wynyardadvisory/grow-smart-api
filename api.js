@@ -2035,6 +2035,138 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
+// GET /admin/metrics/funnel — activation funnel + cohort table + push retention
+app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const db = supabaseService;
+    const now = new Date();
+
+    // Get demo user IDs to exclude
+    const { data: demoProfiles } = await db.from("profiles").select("id").eq("is_demo", true);
+    const demoUserIds = new Set((demoProfiles || []).map(p => p.id));
+
+    const { data: { users: authUsers } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
+    const realUsers = authUsers.filter(u => !demoUserIds.has(u.id));
+
+    // ── Activation funnel ────────────────────────────────────────────────────
+    const totalSignups = realUsers.length;
+
+    // Has profile = completed onboarding
+    const { data: profiles } = await db.from("profiles").select("id").eq("is_demo", false);
+    const profileIds = new Set((profiles || []).map(p => p.id));
+    const hasProfile = profileIds.size;
+
+    // Has at least one crop
+    const { data: cropUsers } = await db.from("crop_instances").select("user_id").eq("active", true).not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
+    const hasCropIds = new Set((cropUsers || []).map(r => r.user_id));
+    const hasCrop = hasCropIds.size;
+
+    // Has tasks generated
+    const { data: taskUsers } = await db.from("tasks").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})`);
+    const hasTaskIds = new Set((taskUsers || []).map(r => r.user_id));
+    const hasTasks = hasTaskIds.size;
+
+    // Has completed at least 1 task
+    const { data: completedUsers } = await db.from("tasks").select("user_id").not("completed_at", "is", null).not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})`);
+    const hasCompletedIds = new Set((completedUsers || []).map(r => r.user_id));
+    const hasCompleted = hasCompletedIds.size;
+
+    const funnel = [
+      { step: "Signed up",           count: totalSignups, pct: 100 },
+      { step: "Completed onboarding", count: hasProfile,  pct: totalSignups > 0 ? Math.round(hasProfile / totalSignups * 100) : 0 },
+      { step: "Added a crop",         count: hasCrop,     pct: totalSignups > 0 ? Math.round(hasCrop / totalSignups * 100) : 0 },
+      { step: "Tasks generated",      count: hasTasks,    pct: totalSignups > 0 ? Math.round(hasTasks / totalSignups * 100) : 0 },
+      { step: "Completed 1+ task",    count: hasCompleted, pct: totalSignups > 0 ? Math.round(hasCompleted / totalSignups * 100) : 0 },
+    ];
+
+    // ── Cohort table — last 14 days ──────────────────────────────────────────
+    const cohorts = [];
+    for (let i = 13; i >= 0; i--) {
+      const dayStart = new Date(now);
+      dayStart.setDate(dayStart.getDate() - i);
+      dayStart.setHours(0, 0, 0, 0);
+      const dayEnd = new Date(dayStart);
+      dayEnd.setDate(dayEnd.getDate() + 1);
+
+      const daySignups = realUsers.filter(u => {
+        const created = new Date(u.created_at);
+        return created >= dayStart && created < dayEnd;
+      });
+
+      if (daySignups.length === 0) {
+        cohorts.push({ date: dayStart.toISOString().split("T")[0], signups: 0, activated: null, completedTask: null, day1: null, day3: null, day7: null });
+        continue;
+      }
+
+      const cohortIds = daySignups.map(u => u.id);
+
+      // Activated
+      const activated = cohortIds.filter(id => profileIds.has(id)).length;
+
+      // Completed at least 1 task
+      const completedTask = cohortIds.filter(id => hasCompletedIds.has(id)).length;
+
+      // Day 1 return (active 1-2 days after signup)
+      let day1 = null, day3 = null, day7 = null;
+      if (i <= 12) { // needs at least 1 day to have passed
+        const d1Start = new Date(dayStart.getTime() + 86400000);
+        const d1End   = new Date(dayStart.getTime() + 2 * 86400000);
+        const { data: d1Activity } = await db.from("profiles").select("id").in("id", cohortIds).gte("last_seen_at", d1Start.toISOString()).lte("last_seen_at", d1End.toISOString());
+        day1 = cohortIds.length > 0 ? Math.round(((d1Activity || []).length / cohortIds.length) * 100) : null;
+      }
+      if (i <= 10) {
+        const d3Start = new Date(dayStart.getTime() + 3 * 86400000);
+        const d3End   = new Date(dayStart.getTime() + 4 * 86400000);
+        const { data: d3Activity } = await db.from("profiles").select("id").in("id", cohortIds).gte("last_seen_at", d3Start.toISOString()).lte("last_seen_at", d3End.toISOString());
+        day3 = cohortIds.length > 0 ? Math.round(((d3Activity || []).length / cohortIds.length) * 100) : null;
+      }
+      if (i <= 6) {
+        const d7Start = new Date(dayStart.getTime() + 7 * 86400000);
+        const d7End   = new Date(dayStart.getTime() + 8 * 86400000);
+        const { data: d7Activity } = await db.from("profiles").select("id").in("id", cohortIds).gte("last_seen_at", d7Start.toISOString()).lte("last_seen_at", d7End.toISOString());
+        day7 = cohortIds.length > 0 ? Math.round(((d7Activity || []).length / cohortIds.length) * 100) : null;
+      }
+
+      cohorts.push({
+        date:          dayStart.toISOString().split("T")[0],
+        signups:       cohortIds.length,
+        activated:     cohortIds.length > 0 ? Math.round(activated / cohortIds.length * 100) : null,
+        completedTask: cohortIds.length > 0 ? Math.round(completedTask / cohortIds.length * 100) : null,
+        day1,
+        day3,
+        day7,
+      });
+    }
+
+    // ── Push vs no-push retention ────────────────────────────────────────────
+    const day7ago = new Date(now - 7 * 86400000).toISOString();
+    const { data: pushUserData } = await db.from("device_push_tokens").select("user_id").eq("is_active", true).not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
+    const pushUserIds = new Set((pushUserData || []).map(r => r.user_id));
+
+    const { data: recentActivity } = await db.from("profiles").select("id, last_seen_at").not("id", "in", `(${[...demoUserIds].join(",") || "''"})` );
+    const activeLast7 = new Set((recentActivity || []).filter(p => p.last_seen_at && new Date(p.last_seen_at) >= new Date(day7ago)).map(p => p.id));
+
+    const withPush    = [...pushUserIds];
+    const withoutPush = [...profileIds].filter(id => !pushUserIds.has(id));
+
+    const pushRetention    = withPush.length    > 0 ? Math.round(withPush.filter(id => activeLast7.has(id)).length    / withPush.length    * 100) : null;
+    const noPushRetention  = withoutPush.length > 0 ? Math.round(withoutPush.filter(id => activeLast7.has(id)).length / withoutPush.length * 100) : null;
+
+    res.json({
+      funnel,
+      cohorts,
+      pushRetention: {
+        withPush:    { users: withPush.length,    retention7day: pushRetention },
+        withoutPush: { users: withoutPush.length, retention7day: noPushRetention },
+      },
+    });
+
+  } catch (e) {
+    console.error("[MetricsFunnel]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /admin/feedback — admin only
 app.get("/admin/feedback", requireAuth, requireAdmin, async (req, res) => {
   const { data, error } = await supabaseService
