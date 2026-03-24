@@ -74,14 +74,13 @@ async function isRecentlySent(supabase, userId, notificationType, cooldownHours)
 
 // Cooldowns by type (hours)
 const COOLDOWNS = {
-  due_today:        20,   // effectively once per day — resets well before next morning cron
+  due_today:        20,
   weather_alert:    6,
   pest_alert:       24,
-  crop_check:       48,   // reduced from 72 — more regular gentle checks
+  crop_check:       48,
   upcoming:         24,
   weekly_summary:   168,
   milestone:        48,
-  engagement_nudge: 20,   // once per day fallback
 };
 
 // ── Candidate builder ─────────────────────────────────────────────────────────
@@ -116,21 +115,21 @@ async function buildCandidates(supabase, userId, prefs) {
       const label    = [cropName, variety].filter(Boolean).join(" ");
 
       const titles = {
-        feed:       cropName ? `Feed ${cropName} today` : "Time to feed your crops",
-        harvest:    cropName ? `${cropName} may be ready to harvest` : "Check your crops for harvest",
-        sow:        cropName ? `Time to sow ${cropName}` : "Sowing task due today",
-        transplant: cropName ? `Transplant ${cropName} today` : "Transplanting task due",
-        protect:    cropName ? `Protect ${cropName} today` : "Protection task due",
-        harden_off: cropName ? `Harden off ${cropName} today` : "Hardening off task due",
-        prune:      cropName ? `Prune ${cropName} today` : "Pruning task due",
-        mulch:      cropName ? `Mulch around ${cropName} today` : "Mulching task due",
+        feed:       cropName ? `🌱 Today: Feed ${cropName}` : "🌱 Today: Feed your crops",
+        harvest:    cropName ? `🌱 Today: Harvest ${cropName}` : "🌱 Today: Check crops for harvest",
+        sow:        cropName ? `🌱 Today: Sow ${cropName}` : "🌱 Today: Sowing task due",
+        transplant: cropName ? `🌱 Today: Transplant ${cropName}` : "🌱 Today: Transplanting task due",
+        protect:    cropName ? `🌱 Today: Protect ${cropName}` : "🌱 Today: Protection task due",
+        harden_off: cropName ? `🌱 Today: Harden off ${cropName}` : "🌱 Today: Hardening off task due",
+        prune:      cropName ? `🌱 Today: Prune ${cropName}` : "🌱 Today: Pruning task due",
+        mulch:      cropName ? `🌱 Today: Mulch ${cropName}` : "🌱 Today: Mulching task due",
       };
 
       candidates.push({
         notification_type: "due_today",
         priority:          t.urgency === "high" ? "high" : "medium",
-        title:             titles[t.task_type] || (cropName ? `${cropName} needs attention today` : "Garden task due today"),
-        body:              t.action,
+        title:             titles[t.task_type] || (cropName ? `🌱 Today: ${cropName} needs attention` : "🌱 Garden task due today"),
+        body:              "Do this today to stay on track",
         task_id:           t.id,
         payload: {
           url:     "/?section=focus",
@@ -164,8 +163,8 @@ async function buildCandidates(supabase, userId, prefs) {
       candidates.push({
         notification_type: "weather_alert",
         priority:          frostAlert.urgency === "high" ? "critical" : "high",
-        title:             "Frost risk tonight",
-        body:              frostAlert.action,
+        title:             "❄️ Frost tonight",
+        body:              "Protect your plants now",
         task_id:           frostAlert.id,
         payload: {
           url:     "/?section=alerts",
@@ -241,7 +240,7 @@ async function buildCandidates(supabase, userId, prefs) {
   // ── 5. Upcoming key task ──────────────────────────────────────────────────
   if (prefs.coming_up_enabled) {
     const tomorrow = new Date(Date.now() + 86400000).toISOString().split("T")[0];
-    const in7days  = new Date(Date.now() + 7 * 86400000).toISOString().split("T")[0];
+    const in3days  = new Date(Date.now() + 3 * 86400000).toISOString().split("T")[0];
 
     const { data: upcomingTasks } = await supabase
       .from("tasks")
@@ -250,7 +249,7 @@ async function buildCandidates(supabase, userId, prefs) {
       .is("completed_at", null)
       .eq("status", "upcoming")
       .gte("due_date", tomorrow)
-      .lte("due_date", in7days)
+      .lte("due_date", in3days)
       .in("task_type", ["sow", "transplant", "harden_off", "harvest"])
       .order("due_date", { ascending: true })
       .limit(1)
@@ -259,20 +258,13 @@ async function buildCandidates(supabase, userId, prefs) {
     if (upcomingTasks) {
       const cropName = upcomingTasks.crop?.name;
       const daysAway = Math.ceil((new Date(upcomingTasks.due_date) - Date.now()) / 86400000);
-      // Urgency copy: today / tomorrow / next 3 days / this week
-      let when, urgencyNote;
-      if (daysAway <= 1) {
-        when = "tomorrow"; urgencyNote = "Don't miss your window";
-      } else if (daysAway <= 3) {
-        when = `in ${daysAway} days`; urgencyNote = "Coming up soon";
-      } else {
-        when = "this week"; urgencyNote = "Plan ahead";
-      }
+      const when = daysAway === 1 ? "tomorrow" : `in ${daysAway} days`;
+      const taskLabel = upcomingTasks.task_type.replace(/_/g, " ");
       candidates.push({
         notification_type: "upcoming",
-        priority:          daysAway <= 3 ? "medium" : "low",
-        title:             cropName ? `${cropName} — ${upcomingTasks.task_type} ${when}` : `Garden task coming up ${when}`,
-        body:              `${urgencyNote} · ${upcomingTasks.action}`,
+        priority:          "medium",
+        title:             cropName ? `⚠️ ${cropName} — ${taskLabel} ${when}` : `⚠️ Garden task due ${when}`,
+        body:              `Miss this and your timing slips`,
         task_id:           upcomingTasks.id,
         payload: {
           url:     "/?section=upcoming",
@@ -320,43 +312,6 @@ async function buildCandidates(supabase, userId, prefs) {
     }
   }
 
-  // ── 7. Engagement nudge — fallback when no action candidates ─────────────
-  // Fires when user has nothing urgent but we still want to keep the habit alive
-  if (prefs.due_today_enabled !== false) {
-    const hasActionCandidate = candidates.some(c =>
-      ["due_today", "upcoming", "weather_alert", "pest_alert"].includes(c.notification_type)
-    );
-
-    if (!hasActionCandidate) {
-      // Get crop count for personalised message
-      const { count: cropCount } = await supabase
-        .from("crop_instances")
-        .select("*", { count: "exact", head: true })
-        .eq("user_id", userId)
-        .eq("active", true);
-
-      const nudgeMessages = [
-        { title: "Garden check-in 🌱",          body: "Nothing urgent today — perfect time for a quick look around." },
-        { title: "Your garden is on track 👌",   body: "No pressing tasks today. Pop in and see how everything's growing." },
-        { title: "Quick garden visit? 🌿",       body: "All quiet today — a 2-minute check keeps things on track." },
-        { title: "Garden looking good 🌱",       body: `${cropCount || "Your"} crop${cropCount !== 1 ? "s are" : " is"} growing — tap to see how they're getting on.` },
-      ];
-
-      const msg = nudgeMessages[new Date().getDay() % nudgeMessages.length];
-
-      candidates.push({
-        notification_type: "engagement_nudge",
-        priority:          "low",
-        title:             msg.title,
-        body:              msg.body,
-        payload: {
-          url:     "/",
-          section: "dashboard",
-        },
-      });
-    }
-  }
-
   return candidates;
 }
 
@@ -381,9 +336,17 @@ async function selectCandidates(supabase, userId, candidates, window, isAdmin = 
     (a, b) => (PRIORITY_RANK[b.priority] || 0) - (PRIORITY_RANK[a.priority] || 0)
   );
 
-  for (const c of sorted) {
-    // Evening window: skip due_today if we already sent something today (use engagement instead)
-    if (window === "evening" && c.notification_type === "due_today" && counter.total_sent > 0) continue;
+  for (let c of sorted) {
+    // Evening window: upgrade due_today to last-chance copy
+    if (window === "evening" && c.notification_type === "due_today") {
+      if (counter.total_sent > 0) continue; // already sent something today
+      // Rewrite to evening last-chance tone
+      c = {
+        ...c,
+        title: c.title.replace("🌱 Today:", "⚠️ Last chance today:"),
+        body:  "Takes 2 mins — keeps you on track",
+      };
+    }
 
     // Check daily cap for this priority
     const capKey = `${c.priority}_sent`;
