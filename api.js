@@ -2511,7 +2511,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       .order("urgency",  { ascending: false })
       .order("due_date", { ascending: true }),
     req.db.from("crop_instances")
-      .select("id, name, variety, variety_id, sown_date, area_id, missed_task_note, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, pest_window_start, pest_window_end, pest_notes)")
+      .select("id, name, variety, variety_id, sown_date, stage, timeline_offset_days, area_id, missed_task_note, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, days_to_maturity_max, pest_window_start, pest_window_end, pest_notes, is_perennial)")
       .eq("user_id", req.user.id).eq("active", true),
     req.db.from("profiles").select("name, plan, postcode, photo_url").eq("id", req.user.id).single(),
     req.db.from("harvest_log")
