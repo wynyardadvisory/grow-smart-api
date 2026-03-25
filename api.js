@@ -58,6 +58,7 @@ const supabaseService = createClient(
 
 // ── App ───────────────────────────────────────────────────────────────────────
 const app = express();
+app.disable("etag"); // Prevent 304 caching — responses must always be fresh
 app.use(helmet());
 const allowedOrigins = [
   "https://vercro.com",
