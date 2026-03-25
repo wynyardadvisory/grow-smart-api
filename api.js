@@ -276,6 +276,7 @@ function buildTimeline(crop) {
     next_stage_label:    nextNode ? LABELS[nextNode.key] : null,
     next_stage_date:     nextNode?.formatted_date || null,
     harvest_date:        harvestDate ? fmt(harvestDate) : null,
+    harvest_date_iso:    harvestDate || null,
     progress_pct:        progressPct,
     confidence:          dtm ? "medium" : "low",
     observation_offset_days: 0,
@@ -2535,14 +2536,31 @@ app.get("/dashboard", requireAuth, async (req, res) => {
 
   // ── Harvest forecast ──────────────────────────────────────────────────────
   const harvestForecast = crops
-    .filter(c => c.crop_def?.harvest_month_start)
-    .map(c => ({
-      crop:             c.name,
-      variety:          c.variety || null,
-      crop_instance_id: c.id,   // required to mark crop as harvested + preserve rotation history
-      window_start:     new Date(year, c.crop_def.harvest_month_start - 1, 1).toISOString().split("T")[0],
-      window_end:       new Date(year, c.crop_def.harvest_month_end   - 1, 28).toISOString().split("T")[0],
-    }));
+    .filter(c => c.crop_def?.harvest_month_start || c.sown_date)
+    .map(c => {
+      const tl = buildTimeline(c);
+      let windowStart, windowEnd;
+      if (tl?.harvest_date_iso) {
+        // Use the timeline harvest date — respects timeline_offset_days
+        const start = new Date(tl.harvest_date_iso); start.setDate(start.getDate() - 7);
+        const end   = new Date(tl.harvest_date_iso); end.setDate(end.getDate() + 7);
+        windowStart = start.toISOString().split("T")[0];
+        windowEnd   = end.toISOString().split("T")[0];
+      } else if (c.crop_def?.harvest_month_start) {
+        windowStart = new Date(year, c.crop_def.harvest_month_start - 1, 1).toISOString().split("T")[0];
+        windowEnd   = new Date(year, c.crop_def.harvest_month_end   - 1, 28).toISOString().split("T")[0];
+      } else {
+        return null;
+      }
+      return {
+        crop:             c.name,
+        variety:          c.variety || null,
+        crop_instance_id: c.id,
+        window_start:     windowStart,
+        window_end:       windowEnd,
+      };
+    })
+    .filter(Boolean);
 
   // ── Missing data prompts ──────────────────────────────────────────────────
   const missingData = crops
