@@ -2219,6 +2219,8 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
     const postFixNoCrops = postFixActivated.filter(id => !anyUserWithCrop.has(id)).length;
     const postFixNoTasks = postFixActivated.filter(id => !anyUserWithTask.has(id)).length;
 
+    console.log(`[HealthCheck] profileIds=${profileIds.size} totalPostFix=${totalPostFix} noCrops=${postFixNoCrops} noTasks=${postFixNoTasks} cropUsersTotal=${anyUserWithCrop.size} taskUsersTotal=${anyUserWithTask.size}`);
+
     const healthChecks = {
       postFixNoCrops,
       postFixNoTasks,
