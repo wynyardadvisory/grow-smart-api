@@ -202,17 +202,18 @@ function buildTimeline(crop) {
   const STAGE_ORDER = ["seed", "seedling", "vegetative", "flowering", "fruiting", "harvesting"];
   const currentIdx  = STAGE_ORDER.indexOf(currentStage);
 
-  // Harvest date
-  // When timeline_offset_days is set, always use sowDate+DTM (already offset-adjusted)
-  // When no offset, use the crop_def calendar harvest month if available (more accurate for seasonal crops)
+  // Harvest date — always derived from sowDate + DTM
+  // sowDate already has offsetDays applied, so harvest moves automatically with stage adjustments
+  // Only use the fixed calendar harvest month when there is no offset (default state)
   const harvestStart = def.harvest_month_start;
   const year         = new Date().getFullYear();
   let harvestDate    = dtm ? addDays(sowDate, dtm) : null;
   if (harvestStart && offsetDays === 0) {
+    // No offset set — use the seasonal calendar date for accuracy
     harvestDate = new Date(year, harvestStart - 1, 15).toISOString().split("T")[0];
   }
-  // When offsetDays !== 0, harvestDate = addDays(sowDate, dtm) is already correct
-  // because sowDate was shifted by -offsetDays, so harvest moves by offsetDays too
+  // If offsetDays !== 0: harvestDate = sowDate + dtm is already correct
+  // sowDate = rawSowDate - offsetDays, so harvestDate moves forward by offsetDays automatically
 
   const LABELS = {
     seed:       "Seed",
@@ -259,6 +260,12 @@ function buildTimeline(crop) {
   // Find next stage node
   const nextNode = nodes.find(n => n.status === "upcoming");
 
+  // Progress percentage — days since effective sow date ÷ DTM
+  // Uses sowDate (already offset-adjusted) so it moves correctly with stage adjustments
+  const progressPct = dtm && dtm > 0
+    ? Math.min(100, Math.max(0, Math.round((daysSown / dtm) * 100)))
+    : Math.round((currentIdx / (STAGE_ORDER.length - 1)) * 100);
+
   return {
     nodes,
     current_stage:       currentStage,
@@ -267,6 +274,7 @@ function buildTimeline(crop) {
     next_stage_label:    nextNode ? LABELS[nextNode.key] : null,
     next_stage_date:     nextNode?.formatted_date || null,
     harvest_date:        harvestDate ? fmt(harvestDate) : null,
+    progress_pct:        progressPct,
     confidence:          dtm ? "medium" : "low",
     observation_offset_days: 0,
   };
