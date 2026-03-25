@@ -4136,9 +4136,14 @@ app.post("/notifications/:id/opened", async (req, res) => {
 app.post("/cron/push-morning", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+
+  // Respond immediately so cron-job.org doesn't timeout
+  // Processing continues in background after response is sent
+  res.json({ ok: true, status: "processing" });
+
   try {
     const { data: profiles } = await supabaseService.from("profiles").select("id");
-    if (!profiles?.length) return res.json({ processed: 0, sent: 0 });
+    if (!profiles?.length) return;
     let sent = 0;
     for (const p of profiles) {
       try { const result = await runNotificationsForUser(supabaseService, p.id, "morning"); if (result.sent > 0) sent++; } catch(e) { captureError("PushMorning", e, { userId: p.id }); }
@@ -4147,23 +4152,25 @@ app.post("/cron/push-morning", async (req, res) => {
     // Email fallback — for users with no push token or push disabled
     const emailResult = await runDailyEmailFallback(supabaseService);
     console.log(`[EmailFallback] Sent: ${emailResult.sent}, Skipped: ${emailResult.skipped}`);
-    res.json({ ok: true, processed: profiles.length, push_sent: sent, email_sent: emailResult.sent });
-  } catch(e) { captureError("PushMorning", e); res.status(500).json({ error: e.message }); }
+  } catch(e) { captureError("PushMorning", e); }
 });
 
 app.post("/cron/push-evening", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+
+  // Respond immediately so cron-job.org doesn't timeout
+  res.json({ ok: true, status: "processing" });
+
   try {
     const { data: profiles } = await supabaseService.from("profiles").select("id");
-    if (!profiles?.length) return res.json({ processed: 0, sent: 0 });
+    if (!profiles?.length) return;
     let sent = 0;
     for (const p of profiles) {
       try { const result = await runNotificationsForUser(supabaseService, p.id, "evening"); if (result.sent > 0) sent++; } catch(e) { captureError("PushEvening", e, { userId: p.id }); }
     }
     console.log(`[PushEvening] Sent to ${sent}/${profiles.length} users`);
-    res.json({ ok: true, processed: profiles.length, sent });
-  } catch(e) { captureError("PushEvening", e); res.status(500).json({ error: e.message }); }
+  } catch(e) { captureError("PushEvening", e); }
 });
 
 app.post("/notifications/test", requireAuth, requireAdmin, async (req, res) => {
