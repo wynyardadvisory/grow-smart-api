@@ -144,11 +144,11 @@ function buildTimeline(crop) {
   const def     = crop.crop_def || {};
   const variety = crop.variety  || {};
 
-  const sowDate  = crop.sown_date || crop.transplanted_date || null;
-  const dtm      = variety.days_to_maturity_max || variety.days_to_maturity_min
-                 || def.days_to_maturity_max    || def.days_to_maturity_min || null;
+  const rawSowDate = crop.sown_date || crop.transplanted_date || null;
+  const dtm        = variety.days_to_maturity_max || variety.days_to_maturity_min
+                   || def.days_to_maturity_max    || def.days_to_maturity_min || null;
 
-  if (!sowDate) return null;
+  if (!rawSowDate) return null;
 
   const addDays = (d, n) => {
     const dt = new Date(d);
@@ -157,6 +157,12 @@ function buildTimeline(crop) {
   };
   const fmt = (d) => d ? new Date(d).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }) : null;
   const today = new Date().toISOString().split("T")[0];
+
+  // Apply timeline_offset_days (signed: positive = behind schedule, negative = ahead)
+  // This shifts the effective sow date without changing the real sow date
+  const offsetDays = crop.timeline_offset_days || 0;
+  const sowDate    = offsetDays !== 0 ? addDays(rawSowDate, -offsetDays) : rawSowDate;
+
   const daysSown = Math.floor((Date.now() - new Date(sowDate).getTime()) / 86400000);
 
   // Stage DTM percentages
@@ -3299,10 +3305,10 @@ app.post("/demo/reset", requireAuth, async (req, res) => {
 });
 // =============================================================================
 app.post("/crops/:id/observe", requireAuth, async (req, res) => {
-  const { observation_type, symptom_code, severity, notes, confirmed_stage } = req.body;
+  const { observation_type, symptom_code, severity, notes, confirmed_stage, timeline_offset_days } = req.body;
   if (!observation_type) return res.status(400).json({ error: "observation_type required" });
   const { data: crop, error: cropErr } = await req.db.from("crop_instances")
-    .select("id, name, status, stage, crop_def_id")
+    .select("id, name, status, stage, crop_def_id, sown_date, stage")
     .eq("id", req.params.id).eq("user_id", req.user.id).single();
   if (cropErr || !crop) return res.status(404).json({ error: "Crop not found" });
   const { data: obs, error: obsErr } = await req.db.from("observation_logs").insert({
@@ -3322,6 +3328,13 @@ app.post("/crops/:id/observe", requireAuth, async (req, res) => {
   if (symptom_code === "transplant_done") { updates.status = "transplanted"; updates.transplant_date = new Date().toISOString().split("T")[0]; engineActions.push("transplant_done"); }
   if (symptom_code === "plant_struggling") { updates.missed_task_note = "Plant reported as struggling — check growing conditions"; engineActions.push("struggling_flagged"); }
   if (symptom_code === "looks_healthy") { updates.missed_task_note = null; engineActions.push("health_confirmed"); }
+
+  // Apply timeline offset if provided (signed integer: positive = behind, negative = ahead)
+  if (typeof timeline_offset_days === "number") {
+    updates.timeline_offset_days = timeline_offset_days;
+    engineActions.push("timeline_offset_applied");
+  }
+
   if (Object.keys(updates).length > 0) { updates.updated_at = new Date().toISOString(); await req.db.from("crop_instances").update(updates).eq("id", req.params.id).eq("user_id", req.user.id); }
   await runRuleEngine(req.user.id);
   res.json({ observation: obs, crop_updated: Object.keys(updates).length > 0, engine_actions: engineActions });
@@ -3333,6 +3346,67 @@ app.get("/crops/:id/observations", requireAuth, async (req, res) => {
     .order("observed_at", { ascending: false }).limit(20);
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
+});
+
+// POST /crops/:id/log-action — log a manual action (watered, fed, pruned, weeded, note)
+// Updates relevant crop fields, writes observation, recalculates schedule
+app.post("/crops/:id/log-action", requireAuth, async (req, res) => {
+  const { action_type, notes } = req.body;
+  // action_type: "watered" | "fed" | "pruned" | "weeded" | "note"
+  if (!action_type) return res.status(400).json({ error: "action_type required" });
+
+  const { data: crop, error: cropErr } = await req.db.from("crop_instances")
+    .select("id, name, area_id, last_watered_at, last_fed_at, crop_def_id")
+    .eq("id", req.params.id).eq("user_id", req.user.id).single();
+  if (cropErr || !crop) return res.status(404).json({ error: "Crop not found" });
+
+  const now = new Date().toISOString();
+  const today = now.split("T")[0];
+
+  // Log the observation
+  await req.db.from("observation_logs").insert({
+    user_id:          req.user.id,
+    crop_id:          req.params.id,
+    observed_at:      today,
+    observation_type: action_type,
+    notes:            notes || null,
+  });
+
+  const updates = { updated_at: now };
+  let nextActionHint = null;
+
+  if (action_type === "watered") {
+    // Update last_watered_at on the crop and all crops in the same area
+    updates.last_watered_at = now;
+    if (crop.area_id) {
+      await supabaseService.from("crop_instances")
+        .update({ last_watered_at: now, updated_at: now })
+        .eq("area_id", crop.area_id).eq("user_id", req.user.id);
+    }
+    nextActionHint = "Next watering check in a few days";
+  } else if (action_type === "fed") {
+    updates.last_fed_at = now;
+    // Get feed interval from crop def to give a useful hint
+    const { data: def } = await supabaseService.from("crop_definitions")
+      .select("feed_interval_days").eq("id", crop.crop_def_id).single();
+    const interval = def?.feed_interval_days || 14;
+    nextActionHint = `Next feed in about ${interval} days`;
+  } else if (action_type === "pruned") {
+    nextActionHint = "Pruning logged — growth should improve over the next few days";
+  } else if (action_type === "weeded") {
+    nextActionHint = "Weeding logged";
+  } else if (action_type === "note") {
+    nextActionHint = "Note saved";
+  }
+
+  await req.db.from("crop_instances").update(updates).eq("id", req.params.id).eq("user_id", req.user.id);
+
+  // Recalculate tasks so watered/fed timings reset from today
+  if (action_type === "watered" || action_type === "fed") {
+    await runRuleEngine(req.user.id);
+  }
+
+  res.json({ ok: true, action_type, next_action_hint: nextActionHint });
 });
 
 
