@@ -202,18 +202,17 @@ function buildTimeline(crop) {
   const STAGE_ORDER = ["seed", "seedling", "vegetative", "flowering", "fruiting", "harvesting"];
   const currentIdx  = STAGE_ORDER.indexOf(currentStage);
 
-  // Harvest date — apply offset so it moves when user adjusts stage
+  // Harvest date
+  // When timeline_offset_days is set, always use sowDate+DTM (already offset-adjusted)
+  // When no offset, use the crop_def calendar harvest month if available (more accurate for seasonal crops)
   const harvestStart = def.harvest_month_start;
   const year         = new Date().getFullYear();
   let harvestDate    = dtm ? addDays(sowDate, dtm) : null;
   if (harvestStart && offsetDays === 0) {
-    // Only use fixed calendar date when no offset — offset means crop is behind/ahead
     harvestDate = new Date(year, harvestStart - 1, 15).toISOString().split("T")[0];
-  } else if (harvestStart && offsetDays !== 0) {
-    // Apply offset to the calendar harvest date
-    const baseHarvest = new Date(year, harvestStart - 1, 15).toISOString().split("T")[0];
-    harvestDate = addDays(baseHarvest, offsetDays);
   }
+  // When offsetDays !== 0, harvestDate = addDays(sowDate, dtm) is already correct
+  // because sowDate was shifted by -offsetDays, so harvest moves by offsetDays too
 
   const LABELS = {
     seed:       "Seed",
