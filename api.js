@@ -2194,7 +2194,15 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
     const noPushRetention  = withoutPush.length > 0 ? Math.round(withoutPush.filter(id => activeLast7.has(id)).length / withoutPush.length * 100) : null;
 
     // ── Health checks — data integrity ───────────────────────────────────────
-    // Split into pre-fix (broken onboarding era) and post-fix (24 Mar 2026 onwards)
+    // Question: of post-fix activated signups (signed up after 24 Mar, completed onboarding),
+    // how many have 0 crops and 0 tasks?
+    // Both should always be 0 — every activated user goes through onboarding which
+    // forces crop selection and runs the rule engine.
+
+    // Build signup date map — used here and by behaviour retention below
+    const signupDateByUser = {};
+    realUsers.forEach(u => { signupDateByUser[u.id] = u.created_at; });
+
     const BUG_FIX_DATE = "2026-03-24T13:00:00.000Z";
 
     const { data: allCropUsers } = await db.from("crop_instances").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
@@ -2203,15 +2211,13 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
     const { data: allTaskUsers } = await db.from("tasks").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
     const anyUserWithTask = new Set((allTaskUsers || []).map(r => r.user_id));
 
-    const postFixProfileIds = [...profileIds].filter(id => {
-      const user = realUsers.find(u => u.id === id);
-      return user && user.created_at >= BUG_FIX_DATE;
-    });
-
-    const totalOnboarded = profileIds.size;
-    const totalPostFix   = postFixProfileIds.length;
-    const postFixNoCrops = postFixProfileIds.filter(id => !anyUserWithCrop.has(id)).length;
-    const postFixNoTasks = postFixProfileIds.filter(id => !anyUserWithTask.has(id)).length;
+    // Post-fix activated = has profile AND signed up after bug fix
+    const postFixActivated = [...profileIds].filter(id =>
+      signupDateByUser[id] && signupDateByUser[id] >= BUG_FIX_DATE
+    );
+    const totalPostFix   = postFixActivated.length;
+    const postFixNoCrops = postFixActivated.filter(id => !anyUserWithCrop.has(id)).length;
+    const postFixNoTasks = postFixActivated.filter(id => !anyUserWithTask.has(id)).length;
 
     const healthChecks = {
       postFixNoCrops,
@@ -2219,18 +2225,12 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
       postFixNoCropsPct: totalPostFix > 0 ? Math.round(postFixNoCrops / totalPostFix * 100) : 0,
       postFixNoTasksPct: totalPostFix > 0 ? Math.round(postFixNoTasks / totalPostFix * 100) : 0,
       totalPostFix,
-      totalNoCrops: [...profileIds].filter(id => !anyUserWithCrop.has(id)).length,
-      totalNoTasks: [...profileIds].filter(id => !anyUserWithTask.has(id)).length,
-      totalOnboarded,
       bugFixDate: BUG_FIX_DATE,
     };
 
     // ── Behaviour → retention correlation ────────────────────────────────────
     // TRUE cohort retention — D1/D7 only counts users signed up 1+/7+ days ago
     const day1ago = new Date(now - 1  * 86400000).toISOString();
-
-    const signupDateByUser = {};
-    realUsers.forEach(u => { signupDateByUser[u.id] = u.created_at; });
 
     const { data: completedTaskData } = await db.from("tasks")
       .select("user_id")
