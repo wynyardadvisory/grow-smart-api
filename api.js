@@ -2467,6 +2467,7 @@ app.get("/weather", requireAuth, async (req, res) => {
 // =============================================================================
 
 app.get("/dashboard", requireAuth, async (req, res) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   const today   = todayISO();
   const weekEnd = weekEndISO();
   // Run expiry only — rule engine runs on cron and crop changes, not every page view
