@@ -1855,6 +1855,24 @@ app.post("/feedback", requireAuth, async (req, res) => {
 });
 
 // GET /admin/metrics — full founder dashboard
+// =============================================================================
+
+// Second admin — view-only, total signups only
+const VIEWER_ADMIN_ID = "448095f2-d379-4232-90f2-6ac7cebe1c70";
+
+app.get("/admin/metrics/viewer", requireAuth, async (req, res) => {
+  if (req.user.id !== VIEWER_ADMIN_ID) return res.status(403).json({ error: "Forbidden" });
+  try {
+    const users = await getAllAuthUsers();
+    const { data: demoProfiles } = await supabaseService.from("profiles").select("id").eq("is_demo", true);
+    const demoIds = new Set((demoProfiles || []).map(p => p.id));
+    const totalSignups = users.filter(u => !demoIds.has(u.id)).length;
+    res.json({ totalSignups });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
   try {
     const db = supabaseService; // service role for cross-table queries
@@ -2176,30 +2194,44 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
     const noPushRetention  = withoutPush.length > 0 ? Math.round(withoutPush.filter(id => activeLast7.has(id)).length / withoutPush.length * 100) : null;
 
     // ── Health checks — data integrity ───────────────────────────────────────
-    // Users with profiles but 0 crops (broken onboarding)
+    // Split into pre-fix (broken onboarding era) and post-fix (24 Mar 2026 onwards)
+    const BUG_FIX_DATE = "2026-03-24T13:00:00.000Z";
+
     const { data: allCropUsers } = await db.from("crop_instances").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
     const anyUserWithCrop = new Set((allCropUsers || []).map(r => r.user_id));
-    const usersNoCrops = [...profileIds].filter(id => !anyUserWithCrop.has(id)).length;
 
-    // Users with profiles but 0 tasks ever
     const { data: allTaskUsers } = await db.from("tasks").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
     const anyUserWithTask = new Set((allTaskUsers || []).map(r => r.user_id));
-    const usersNoTasks = [...profileIds].filter(id => !anyUserWithTask.has(id)).length;
+
+    const postFixProfileIds = [...profileIds].filter(id => {
+      const user = realUsers.find(u => u.id === id);
+      return user && user.created_at >= BUG_FIX_DATE;
+    });
 
     const totalOnboarded = profileIds.size;
+    const totalPostFix   = postFixProfileIds.length;
+    const postFixNoCrops = postFixProfileIds.filter(id => !anyUserWithCrop.has(id)).length;
+    const postFixNoTasks = postFixProfileIds.filter(id => !anyUserWithTask.has(id)).length;
+
     const healthChecks = {
-      usersNoCrops,
-      usersNoTasks,
-      usersNoCropsPct:  totalOnboarded > 0 ? Math.round(usersNoCrops  / totalOnboarded * 100) : 0,
-      usersNoTasksPct:  totalOnboarded > 0 ? Math.round(usersNoTasks  / totalOnboarded * 100) : 0,
+      postFixNoCrops,
+      postFixNoTasks,
+      postFixNoCropsPct: totalPostFix > 0 ? Math.round(postFixNoCrops / totalPostFix * 100) : 0,
+      postFixNoTasksPct: totalPostFix > 0 ? Math.round(postFixNoTasks / totalPostFix * 100) : 0,
+      totalPostFix,
+      totalNoCrops: [...profileIds].filter(id => !anyUserWithCrop.has(id)).length,
+      totalNoTasks: [...profileIds].filter(id => !anyUserWithTask.has(id)).length,
       totalOnboarded,
+      bugFixDate: BUG_FIX_DATE,
     };
 
     // ── Behaviour → retention correlation ────────────────────────────────────
-    // Split users by tasks completed (0, 1, 2+) and check D1 + D7 retention
+    // TRUE cohort retention — D1/D7 only counts users signed up 1+/7+ days ago
     const day1ago = new Date(now - 1  * 86400000).toISOString();
 
-    // Count tasks completed per user
+    const signupDateByUser = {};
+    realUsers.forEach(u => { signupDateByUser[u.id] = u.created_at; });
+
     const { data: completedTaskData } = await db.from("tasks")
       .select("user_id")
       .not("completed_at", "is", null)
@@ -2209,19 +2241,38 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
       taskCountByUser[t.user_id] = (taskCountByUser[t.user_id] || 0) + 1;
     });
 
-    const group0    = [...profileIds].filter(id => !taskCountByUser[id]);
-    const group1    = [...profileIds].filter(id => taskCountByUser[id] === 1);
+    const group0     = [...profileIds].filter(id => !taskCountByUser[id]);
+    const group1     = [...profileIds].filter(id => taskCountByUser[id] === 1);
     const group2plus = [...profileIds].filter(id => taskCountByUser[id] >= 2);
 
-    const retRate = (ids, activeSet) =>
-      ids.length > 0 ? Math.round(ids.filter(id => activeSet.has(id)).length / ids.length * 100) : null;
+    const retRateCohort = (ids, activeSet, minDaysAgo) => {
+      const cutoff = new Date(now - minDaysAgo * 86400000).toISOString();
+      const eligible = ids.filter(id => signupDateByUser[id] && signupDateByUser[id] < cutoff);
+      if (eligible.length === 0) return null;
+      return Math.round(eligible.filter(id => activeSet.has(id)).length / eligible.length * 100);
+    };
 
     const activeLast1 = new Set((recentActivity || []).filter(p => p.last_seen_at && new Date(p.last_seen_at) >= new Date(day1ago)).map(p => p.id));
 
     const behaviourRetention = [
-      { label: "No tasks completed",   count: group0.length,     d1: retRate(group0, activeLast1),     d7: retRate(group0, activeLast7) },
-      { label: "1 task completed",     count: group1.length,     d1: retRate(group1, activeLast1),     d7: retRate(group1, activeLast7) },
-      { label: "2+ tasks completed",   count: group2plus.length, d1: retRate(group2plus, activeLast1), d7: retRate(group2plus, activeLast7) },
+      {
+        label: "No tasks completed", count: group0.length,
+        d1: retRateCohort(group0, activeLast1, 1), d7: retRateCohort(group0, activeLast7, 7),
+        d1_eligible: group0.filter(id => signupDateByUser[id] && signupDateByUser[id] < day1ago).length,
+        d7_eligible: group0.filter(id => signupDateByUser[id] && signupDateByUser[id] < day7ago).length,
+      },
+      {
+        label: "1 task completed", count: group1.length,
+        d1: retRateCohort(group1, activeLast1, 1), d7: retRateCohort(group1, activeLast7, 7),
+        d1_eligible: group1.filter(id => signupDateByUser[id] && signupDateByUser[id] < day1ago).length,
+        d7_eligible: group1.filter(id => signupDateByUser[id] && signupDateByUser[id] < day7ago).length,
+      },
+      {
+        label: "2+ tasks completed", count: group2plus.length,
+        d1: retRateCohort(group2plus, activeLast1, 1), d7: retRateCohort(group2plus, activeLast7, 7),
+        d1_eligible: group2plus.filter(id => signupDateByUser[id] && signupDateByUser[id] < day1ago).length,
+        d7_eligible: group2plus.filter(id => signupDateByUser[id] && signupDateByUser[id] < day7ago).length,
+      },
     ];
 
     res.json({
