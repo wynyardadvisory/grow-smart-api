@@ -160,9 +160,11 @@ function buildTimeline(crop) {
   const today = new Date().toISOString().split("T")[0];
 
   // Apply timeline_offset_days (signed: positive = behind schedule, negative = ahead)
-  // This shifts the effective sow date without changing the real sow date
+  // Behind schedule = crop is growing slower = harvest is later
+  // We shift sowDate FORWARD by offsetDays — this makes sowDate+DTM (harvest) later
+  // and makes daysSown smaller (less progress), so progress bar moves back
   const offsetDays = crop.timeline_offset_days || 0;
-  const sowDate    = offsetDays !== 0 ? addDays(rawSowDate, -offsetDays) : rawSowDate;
+  const sowDate    = offsetDays !== 0 ? addDays(rawSowDate, offsetDays) : rawSowDate;
 
   const daysSown = Math.floor((Date.now() - new Date(sowDate).getTime()) / 86400000);
 

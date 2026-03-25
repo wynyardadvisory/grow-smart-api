@@ -161,8 +161,9 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = []) 
   // stage_adjusted_sow_date is kept for backwards compatibility but timeline_offset_days takes precedence.
   const rawSowDate      = crop.sown_date         || crop.transplanted_date || null;
   const offsetDays      = crop.timeline_offset_days || 0;
+  // Positive offset = behind schedule = shift sowDate forward = harvest later
   const adjustedSowDate = rawSowDate && offsetDays !== 0
-    ? (() => { const d = new Date(rawSowDate); d.setDate(d.getDate() - offsetDays); return d.toISOString().split("T")[0]; })()
+    ? (() => { const d = new Date(rawSowDate); d.setDate(d.getDate() + offsetDays); return d.toISOString().split("T")[0]; })()
     : null;
   const sowDate         = adjustedSowDate || crop.stage_adjusted_sow_date || rawSowDate;
   const transplantDate  = crop.transplanted_date  || crop.transplant_date  || null;
