@@ -2083,7 +2083,7 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
     const now = new Date();
 
     // Get demo user IDs to exclude
-    const { data: demoProfiles } = await db.from("profiles").select("id").eq("is_demo", true);
+    const { data: demoProfiles } = await supabaseService.from("profiles").select("id").eq("is_demo", true);
     const demoUserIds = new Set((demoProfiles || []).map(p => p.id));
 
     const authUsers = await getAllAuthUsers();
@@ -2093,22 +2093,22 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
     const totalSignups = realUsers.length;
 
     // Has profile = completed onboarding
-    const { data: profiles } = await db.from("profiles").select("id").eq("is_demo", false);
+    const { data: profiles } = await supabaseService.from("profiles").select("id").eq("is_demo", false);
     const profileIds = new Set((profiles || []).map(p => p.id));
     const hasProfile = profileIds.size;
 
     // Has tasks generated (ever — crops + rule engine ran during onboarding)
-    const { data: taskUsers } = await db.from("tasks").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
+    const { data: taskUsers } = await supabaseService.from("tasks").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
     const hasTaskIds = new Set((taskUsers || []).map(r => r.user_id));
     const hasTasks = hasTaskIds.size;
 
     // Has completed at least 1 task (ever)
-    const { data: completedUsers } = await db.from("tasks").select("user_id").not("completed_at", "is", null).not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
+    const { data: completedUsers } = await supabaseService.from("tasks").select("user_id").not("completed_at", "is", null).not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
     const hasCompletedIds = new Set((completedUsers || []).map(r => r.user_id));
     const hasCompleted = hasCompletedIds.size;
 
     // Still has active crops today (ongoing engagement — separate from onboarding)
-    const { data: activeCropUsers } = await db.from("crop_instances").select("user_id").eq("active", true).not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
+    const { data: activeCropUsers } = await supabaseService.from("crop_instances").select("user_id").eq("active", true).not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
     const hasActiveCropIds = new Set((activeCropUsers || []).map(r => r.user_id));
     const hasActiveCrops = hasActiveCropIds.size;
 
@@ -2152,19 +2152,19 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
       if (i <= 12) { // needs at least 1 day to have passed
         const d1Start = new Date(dayStart.getTime() + 86400000);
         const d1End   = new Date(dayStart.getTime() + 2 * 86400000);
-        const { data: d1Activity } = await db.from("profiles").select("id").in("id", cohortIds).gte("last_seen_at", d1Start.toISOString()).lte("last_seen_at", d1End.toISOString());
+        const { data: d1Activity } = await supabaseService.from("profiles").select("id").in("id", cohortIds).gte("last_seen_at", d1Start.toISOString()).lte("last_seen_at", d1End.toISOString());
         day1 = cohortIds.length > 0 ? Math.round(((d1Activity || []).length / cohortIds.length) * 100) : null;
       }
       if (i <= 10) {
         const d3Start = new Date(dayStart.getTime() + 3 * 86400000);
         const d3End   = new Date(dayStart.getTime() + 4 * 86400000);
-        const { data: d3Activity } = await db.from("profiles").select("id").in("id", cohortIds).gte("last_seen_at", d3Start.toISOString()).lte("last_seen_at", d3End.toISOString());
+        const { data: d3Activity } = await supabaseService.from("profiles").select("id").in("id", cohortIds).gte("last_seen_at", d3Start.toISOString()).lte("last_seen_at", d3End.toISOString());
         day3 = cohortIds.length > 0 ? Math.round(((d3Activity || []).length / cohortIds.length) * 100) : null;
       }
       if (i <= 6) {
         const d7Start = new Date(dayStart.getTime() + 7 * 86400000);
         const d7End   = new Date(dayStart.getTime() + 8 * 86400000);
-        const { data: d7Activity } = await db.from("profiles").select("id").in("id", cohortIds).gte("last_seen_at", d7Start.toISOString()).lte("last_seen_at", d7End.toISOString());
+        const { data: d7Activity } = await supabaseService.from("profiles").select("id").in("id", cohortIds).gte("last_seen_at", d7Start.toISOString()).lte("last_seen_at", d7End.toISOString());
         day7 = cohortIds.length > 0 ? Math.round(((d7Activity || []).length / cohortIds.length) * 100) : null;
       }
 
@@ -2181,10 +2181,10 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
 
     // ── Push vs no-push retention ────────────────────────────────────────────
     const day7ago = new Date(now - 7 * 86400000).toISOString();
-    const { data: pushUserData } = await db.from("device_push_tokens").select("user_id").eq("is_active", true).not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
+    const { data: pushUserData } = await supabaseService.from("device_push_tokens").select("user_id").eq("is_active", true).not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
     const pushUserIds = new Set((pushUserData || []).map(r => r.user_id));
 
-    const { data: recentActivity } = await db.from("profiles").select("id, last_seen_at").not("id", "in", `(${[...demoUserIds].join(",") || "''"})` );
+    const { data: recentActivity } = await supabaseService.from("profiles").select("id, last_seen_at").not("id", "in", `(${[...demoUserIds].join(",") || "''"})` );
     const activeLast7 = new Set((recentActivity || []).filter(p => p.last_seen_at && new Date(p.last_seen_at) >= new Date(day7ago)).map(p => p.id));
 
     const withPush    = [...pushUserIds];
@@ -2232,7 +2232,7 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
     // TRUE cohort retention — D1/D7 only counts users signed up 1+/7+ days ago
     const day1ago = new Date(now - 1  * 86400000).toISOString();
 
-    const { data: completedTaskData } = await db.from("tasks")
+    const { data: completedTaskData } = await supabaseService.from("tasks")
       .select("user_id")
       .not("completed_at", "is", null)
       .not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
