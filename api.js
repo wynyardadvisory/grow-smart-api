@@ -2081,6 +2081,7 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
   try {
     const db = supabaseService;
     const now = new Date();
+    console.log("[Funnel] Starting funnel endpoint");
 
     // Get demo user IDs to exclude
     const { data: demoProfiles } = await supabaseService.from("profiles").select("id").eq("is_demo", true);
@@ -2205,21 +2206,37 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
 
     const BUG_FIX_DATE = "2026-03-24T13:00:00.000Z";
 
-    const { data: allCropUsers } = await supabaseService.from("crop_instances").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
-    const anyUserWithCrop = new Set((allCropUsers || []).map(r => r.user_id));
-
-    const { data: allTaskUsers } = await supabaseService.from("tasks").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
-    const anyUserWithTask = new Set((allTaskUsers || []).map(r => r.user_id));
-
     // Post-fix activated = has profile AND signed up after bug fix
     const postFixActivated = [...profileIds].filter(id =>
       signupDateByUser[id] && signupDateByUser[id] >= BUG_FIX_DATE
     );
-    const totalPostFix   = postFixActivated.length;
-    const postFixNoCrops = postFixActivated.filter(id => !anyUserWithCrop.has(id)).length;
-    const postFixNoTasks = postFixActivated.filter(id => !anyUserWithTask.has(id)).length;
+    const totalPostFix = postFixActivated.length;
 
-    console.log(`[HealthCheck] profileIds=${profileIds.size} totalPostFix=${totalPostFix} noCrops=${postFixNoCrops} noTasks=${postFixNoTasks} cropUsersTotal=${anyUserWithCrop.size} taskUsersTotal=${anyUserWithTask.size}`);
+    // Check which post-fix profiles have crops and tasks
+    // Query scoped to just these 40 IDs — avoids Supabase 1000-row default limit
+    // on crop_instances (5000+ rows) which was causing incorrect results
+    const postFixIds = postFixActivated;
+    let postFixNoCrops = 0;
+    let postFixNoTasks = 0;
+
+    if (postFixIds.length > 0) {
+      const idList = postFixIds.join(",");
+      const { data: cropsCheck } = await supabaseService
+        .from("crop_instances")
+        .select("user_id")
+        .in("user_id", postFixIds);
+      const usersWithCrop = new Set((cropsCheck || []).map(r => r.user_id));
+      postFixNoCrops = postFixIds.filter(id => !usersWithCrop.has(id)).length;
+
+      const { data: tasksCheck } = await supabaseService
+        .from("tasks")
+        .select("user_id")
+        .in("user_id", postFixIds);
+      const usersWithTask = new Set((tasksCheck || []).map(r => r.user_id));
+      postFixNoTasks = postFixIds.filter(id => !usersWithTask.has(id)).length;
+    }
+
+    console.log(`[HealthCheck] totalPostFix=${totalPostFix} noCrops=${postFixNoCrops} noTasks=${postFixNoTasks}`);
 
     const healthChecks = {
       postFixNoCrops,
