@@ -3,17 +3,15 @@
 /**
  * Vercro Push Notification System
  * ─────────────────────────────────────────────────────────────
- * Candidate generation + Web Push delivery
- * 
- * Install: npm install web-push
- * 
- * Generate VAPID keys once:
- *   node -e "const wp=require('web-push'); const k=wp.generateVAPIDKeys(); console.log(JSON.stringify(k))"
- * 
- * Add to Vercel env:
- *   VAPID_PUBLIC_KEY=...
- *   VAPID_PRIVATE_KEY=...
- *   VAPID_SUBJECT=mailto:hello@vercro.com
+ * Reliable habit loop — every eligible user gets exactly 1 morning
+ * and 1 evening push per day, regardless of recent app activity.
+ *
+ * Design principles:
+ * - Never return no candidate for a valid push-enabled user
+ * - Morning send never blocks evening send
+ * - Activity suppression removed — engaged users still get pushes
+ * - Cooldowns removed from scheduled sends
+ * - Guaranteed fallback if no real task/alert exists
  */
 
 const webpush = require("web-push");
@@ -32,348 +30,257 @@ function setupVapid() {
   return true;
 }
 
-// ── Daily cap check ───────────────────────────────────────────────────────────
-async function getDailyCounter(supabase, userId, dateLocal) {
-  const { data } = await supabase
-    .from("notification_daily_counters")
-    .select("*")
-    .eq("user_id", userId)
-    .eq("date_local", dateLocal)
-    .single();
-  return data || { total_sent: 0, critical_sent: 0, high_sent: 0, medium_sent: 0, low_sent: 0 };
-}
+// ── Admin accounts — always receive notifications ────────────────────────────
+const ADMIN_USER_IDS = new Set([
+  "c1c730ff-acb2-4969-9c74-32a84041d9b3",
+]);
 
-async function incrementCounter(supabase, userId, dateLocal, priority) {
-  const counter = await getDailyCounter(supabase, userId, dateLocal);
-  await supabase.from("notification_daily_counters").upsert({
-    user_id:       userId,
-    date_local:    dateLocal,
-    total_sent:    (counter.total_sent    || 0) + 1,
-    critical_sent: (counter.critical_sent || 0) + (priority === "critical" ? 1 : 0),
-    high_sent:     (counter.high_sent     || 0) + (priority === "high"     ? 1 : 0),
-    medium_sent:   (counter.medium_sent   || 0) + (priority === "medium"   ? 1 : 0),
-    low_sent:      (counter.low_sent      || 0) + (priority === "low"      ? 1 : 0),
-    last_sent_at:  new Date().toISOString(),
-  }, { onConflict: "user_id,date_local" });
-}
-
-// ── Suppression check ─────────────────────────────────────────────────────────
-async function isRecentlySent(supabase, userId, notificationType, cooldownHours) {
-  const since = new Date(Date.now() - cooldownHours * 3600000).toISOString();
+// ── Window tracking — prevent duplicate sends within same window ─────────────
+// We track whether a push was already sent in this specific window (morning/evening)
+// so we don't double-send if the cron fires twice. But morning NEVER blocks evening.
+async function didSendInWindow(supabase, userId, window) {
+  const windowStart = getWindowStart(window);
   const { data } = await supabase
     .from("notification_events")
     .select("id")
     .eq("user_id", userId)
-    .eq("notification_type", notificationType)
-    .in("status", ["sent", "queued"])
-    .gte("created_at", since)
+    .eq("status", "sent")
+    .gte("sent_at", windowStart)
     .limit(1)
     .maybeSingle();
   return !!data;
 }
 
-// Cooldowns by type (hours)
-const COOLDOWNS = {
-  due_today:        20,
-  weather_alert:    6,
-  pest_alert:       24,
-  crop_check:       48,
-  upcoming:         24,
-  weekly_summary:   168,
-  milestone:        48,
-};
+function getWindowStart(window) {
+  const now = new Date();
+  const today = now.toISOString().split("T")[0];
+  // Morning window: 05:00–12:00 UTC. Evening window: 15:00–23:59 UTC.
+  return window === "morning"
+    ? `${today}T05:00:00.000Z`
+    : `${today}T15:00:00.000Z`;
+}
+
+// ── Fallback candidate pools ──────────────────────────────────────────────────
+const MORNING_FALLBACKS = [
+  { title: "Good morning — check your garden today 🌱",    body: "A quick look now keeps your crops on track." },
+  { title: "Step outside and see what's changed 🌿",       body: "Plants move fast — 30 seconds is all it takes." },
+  { title: "Quick crop check this morning",                 body: "Notice anything new? Log it while it's fresh." },
+  { title: "Start your day with a garden check 🌱",        body: "Small daily checks prevent big problems later." },
+  { title: "Your garden is waiting ☀️",                    body: "A quick check now can save a crop later." },
+];
+
+const EVENING_FALLBACKS = [
+  { title: "Evening check — how's the garden looking? 🌿", body: "A quiet moment with your crops before dark." },
+  { title: "Keep your streak going 🌱",                    body: "Don't break the habit — one quick check tonight." },
+  { title: "Anything changed today? Log it in Vercro",     body: "A quick note now helps your future self." },
+  { title: "End of day garden check",                      body: "Stay in the rhythm — your plants change fast." },
+  { title: "One small check tonight 🌿",                   body: "Just 30 seconds with your crops makes a difference." },
+];
+
+function getFallbackCandidate(window, userId) {
+  const pool = window === "morning" ? MORNING_FALLBACKS : EVENING_FALLBACKS;
+  // Pick deterministically by user ID so different users get different copy
+  const idx = userId.charCodeAt(0) % pool.length;
+  const fb = pool[idx];
+  return {
+    notification_type: "habit_nudge",
+    priority:          "low",
+    title:             fb.title,
+    body:              fb.body,
+    task_id:           null,
+    payload: { url: "/", section: "dashboard" },
+  };
+}
 
 // ── Candidate builder ─────────────────────────────────────────────────────────
-
-async function buildCandidates(supabase, userId, prefs) {
+async function buildCandidates(supabase, userId, window) {
   const today   = new Date().toISOString().split("T")[0];
-  const weekEnd = new Date(Date.now() + 7 * 86400000).toISOString().split("T")[0];
+  const tomorrow = new Date(Date.now() + 86400000).toISOString().split("T")[0];
+  const in3days  = new Date(Date.now() + 3 * 86400000).toISOString().split("T")[0];
   const candidates = [];
 
-  // ── 1. Due today tasks ────────────────────────────────────────────────────
-  if (prefs.due_today_enabled) {
-    const { data: todayTasks } = await supabase
+  if (window === "morning") {
+    // ── Morning priority 1: Critical weather/frost alert ─────────────────────
+    const { data: frostTask } = await supabase
       .from("tasks")
-      .select("*, crop:crop_instance_id(name, variety)")
+      .select("*, crop:crop_instance_id(name)")
+      .eq("user_id", userId)
+      .is("completed_at", null)
+      .eq("record_type", "alert")
+      .eq("rule_id", "frost_alert")
+      .not("status", "eq", "expired")
+      .limit(1)
+      .maybeSingle();
+
+    if (frostTask) {
+      candidates.push({
+        notification_type: "weather_alert",
+        priority:          "critical",
+        title:             "❄️ Frost tonight — protect tender plants",
+        body:              "Check your crops now and cover anything frost-sensitive.",
+        task_id:           frostTask.id,
+        payload:           { url: "/?section=alerts", section: "alerts", task_id: frostTask.id },
+      });
+    }
+
+    // ── Morning priority 2: High urgency pest/disease alert ──────────────────
+    if (!candidates.length) {
+      const { data: pestAlert } = await supabase
+        .from("tasks")
+        .select("*, crop:crop_instance_id(name)")
+        .eq("user_id", userId)
+        .is("completed_at", null)
+        .eq("record_type", "alert")
+        .eq("urgency", "high")
+        .not("status", "eq", "expired")
+        .limit(1)
+        .maybeSingle();
+
+      if (pestAlert) {
+        const cropName = pestAlert.crop?.name;
+        candidates.push({
+          notification_type: "pest_alert",
+          priority:          "high",
+          title:             cropName ? `⚠️ Check ${cropName} today` : "⚠️ Garden alert needs attention",
+          body:              pestAlert.action || "Check your crops for signs of pest or disease.",
+          task_id:           pestAlert.id,
+          payload:           { url: "/?section=alerts", section: "alerts", task_id: pestAlert.id },
+        });
+      }
+    }
+
+    // ── Morning priority 3: Task due today ───────────────────────────────────
+    if (!candidates.length) {
+      const URGENCY_RANK = { high: 3, medium: 2, low: 1 };
+      const { data: todayTasks } = await supabase
+        .from("tasks")
+        .select("*, crop:crop_instance_id(name, variety)")
+        .eq("user_id", userId)
+        .is("completed_at", null)
+        .not("status", "eq", "expired")
+        .lte("due_date", today)
+        .order("urgency", { ascending: false })
+        .limit(10);
+
+      const eligible = (todayTasks || [])
+        .filter(t => t.task_type !== "check" && t.record_type !== "alert")
+        .sort((a, b) => (URGENCY_RANK[b.urgency] || 0) - (URGENCY_RANK[a.urgency] || 0));
+
+      if (eligible[0]) {
+        const t = eligible[0];
+        const cropName = t.crop?.name;
+        const TITLES = {
+          feed:       cropName ? `🌱 Today: Feed your ${cropName}` : "🌱 Today: Feeding task due",
+          harvest:    cropName ? `🌱 Today: Harvest ${cropName}` : "🌱 Today: Harvest ready",
+          sow:        cropName ? `🌱 Today: Sow ${cropName}` : "🌱 Today: Sowing task due",
+          transplant: cropName ? `🌱 Today: Transplant ${cropName}` : "🌱 Today: Transplanting due",
+          protect:    cropName ? `🌱 Today: Protect ${cropName}` : "🌱 Today: Protection needed",
+          water:      cropName ? `🌱 Today: Water ${cropName}` : "🌱 Today: Watering due",
+          prune:      cropName ? `🌱 Today: Prune ${cropName}` : "🌱 Today: Pruning due",
+          mulch:      cropName ? `🌱 Today: Mulch ${cropName}` : "🌱 Today: Mulching due",
+        };
+        candidates.push({
+          notification_type: "due_today",
+          priority:          t.urgency === "high" ? "high" : "medium",
+          title:             TITLES[t.task_type] || (cropName ? `🌱 Today: ${cropName} needs attention` : "🌱 Garden task due today"),
+          body:              "Do this today to stay on track.",
+          task_id:           t.id,
+          payload:           { url: "/?section=focus", section: "focus", task_id: t.id },
+        });
+      }
+    }
+
+    // ── Morning priority 4: Upcoming important task ──────────────────────────
+    if (!candidates.length) {
+      const { data: upcoming } = await supabase
+        .from("tasks")
+        .select("*, crop:crop_instance_id(name)")
+        .eq("user_id", userId)
+        .is("completed_at", null)
+        .eq("status", "upcoming")
+        .gte("due_date", tomorrow)
+        .lte("due_date", in3days)
+        .in("task_type", ["sow", "transplant", "harvest", "harden_off"])
+        .order("due_date", { ascending: true })
+        .limit(1)
+        .maybeSingle();
+
+      if (upcoming) {
+        const cropName = upcoming.crop?.name;
+        const daysAway = Math.ceil((new Date(upcoming.due_date) - Date.now()) / 86400000);
+        const when = daysAway === 1 ? "tomorrow" : `in ${daysAway} days`;
+        const label = upcoming.task_type.replace(/_/g, " ");
+        candidates.push({
+          notification_type: "upcoming",
+          priority:          "medium",
+          title:             cropName ? `⚠️ ${cropName} — ${label} ${when}` : `⚠️ Garden task due ${when}`,
+          body:              "Miss this and your timing slips.",
+          task_id:           upcoming.id,
+          payload:           { url: "/?section=upcoming", section: "upcoming", task_id: upcoming.id },
+        });
+      }
+    }
+
+  } else {
+    // ── Evening priority 1: Missed due-today task ────────────────────────────
+    const { data: missedTasks } = await supabase
+      .from("tasks")
+      .select("*, crop:crop_instance_id(name)")
       .eq("user_id", userId)
       .is("completed_at", null)
       .not("status", "eq", "expired")
       .lte("due_date", today)
-      .order("urgency", { ascending: false })
-      .limit(10);
-
-    // Pick the single best task — highest urgency, most specific
-    const URGENCY_RANK = { high: 3, medium: 2, low: 1 };
-    const eligible = (todayTasks || [])
-      .filter(t => t.task_type !== "check" && t.record_type !== "alert")
-      .sort((a, b) => (URGENCY_RANK[b.urgency] || 0) - (URGENCY_RANK[a.urgency] || 0));
-
-    if (eligible[0]) {
-      const t = eligible[0];
-      const cropName = t.crop?.name;
-      const variety  = t.crop?.variety;
-      const label    = [cropName, variety].filter(Boolean).join(" ");
-
-      const titles = {
-        feed:       cropName ? `🌱 Today: Feed ${cropName}` : "🌱 Today: Feed your crops",
-        harvest:    cropName ? `🌱 Today: Harvest ${cropName}` : "🌱 Today: Check crops for harvest",
-        sow:        cropName ? `🌱 Today: Sow ${cropName}` : "🌱 Today: Sowing task due",
-        transplant: cropName ? `🌱 Today: Transplant ${cropName}` : "🌱 Today: Transplanting task due",
-        protect:    cropName ? `🌱 Today: Protect ${cropName}` : "🌱 Today: Protection task due",
-        harden_off: cropName ? `🌱 Today: Harden off ${cropName}` : "🌱 Today: Hardening off task due",
-        prune:      cropName ? `🌱 Today: Prune ${cropName}` : "🌱 Today: Pruning task due",
-        mulch:      cropName ? `🌱 Today: Mulch ${cropName}` : "🌱 Today: Mulching task due",
-      };
-
-      candidates.push({
-        notification_type: "due_today",
-        priority:          t.urgency === "high" ? "high" : "medium",
-        title:             titles[t.task_type] || (cropName ? `🌱 Today: ${cropName} needs attention` : "🌱 Garden task due today"),
-        body:              "Do this today to stay on track",
-        task_id:           t.id,
-        payload: {
-          url:     "/?section=focus",
-          section: "focus",
-          task_id: t.id,
-          actions: [
-            { action: "complete", title: "✓ Done" },
-            { action: "snooze",   title: "Later" },
-          ],
-        },
-      });
-    }
-  }
-
-  // ── 2. Weather/frost alerts ───────────────────────────────────────────────
-  if (prefs.weather_alerts_enabled) {
-    const { data: alerts } = await supabase
-      .from("tasks")
-      .select("*, crop:crop_instance_id(name)")
-      .eq("user_id", userId)
-      .is("completed_at", null)
-      .eq("record_type", "alert")
-      .eq("engine_type", "risk")
-      .not("status", "eq", "expired")
-      .in("task_type", ["protect", "water"])
-      .order("urgency", { ascending: false })
-      .limit(3);
-
-    const frostAlert = (alerts || []).find(a => a.rule_id === "frost_alert");
-    if (frostAlert) {
-      candidates.push({
-        notification_type: "weather_alert",
-        priority:          frostAlert.urgency === "high" ? "critical" : "high",
-        title:             "❄️ Frost tonight",
-        body:              "Protect your plants now",
-        task_id:           frostAlert.id,
-        payload: {
-          url:     "/?section=alerts",
-          section: "alerts",
-          task_id: frostAlert.id,
-        },
-      });
-    }
-  }
-
-  // ── 3. Pest alerts ────────────────────────────────────────────────────────
-  if (prefs.pest_alerts_enabled) {
-    const { data: pestAlerts } = await supabase
-      .from("tasks")
-      .select("*, crop:crop_instance_id(name)")
-      .eq("user_id", userId)
-      .is("completed_at", null)
-      .eq("record_type", "alert")
-      .eq("engine_type", "risk")
-      .not("status", "eq", "expired")
-      .in("task_type", ["inspect_pests", "inspect_disease"])
       .in("urgency", ["high", "medium"])
       .order("urgency", { ascending: false })
       .limit(1)
       .maybeSingle();
 
-    if (pestAlerts) {
-      const cropName = pestAlerts.crop?.name;
+    if (missedTasks) {
+      const cropName = missedTasks.crop?.name;
       candidates.push({
-        notification_type: "pest_alert",
+        notification_type: "due_today",
         priority:          "medium",
-        title:             cropName ? `Check ${cropName} today` : "Pest check needed",
-        body:              pestAlerts.action,
-        task_id:           pestAlerts.id,
-        payload: {
-          url:     "/?section=alerts",
-          section: "alerts",
-          task_id: pestAlerts.id,
-        },
+        title:             cropName ? `⚠️ Last chance today: ${cropName}` : "⚠️ Last chance — garden task still due",
+        body:              "Takes 2 mins — keeps you on track.",
+        task_id:           missedTasks.id,
+        payload:           { url: "/?section=focus", section: "focus", task_id: missedTasks.id },
       });
     }
-  }
 
-  // ── 4. Crop checks ────────────────────────────────────────────────────────
-  if (prefs.crop_checks_enabled) {
-    const { data: checkTasks } = await supabase
-      .from("tasks")
-      .select("*, crop:crop_instance_id(name)")
-      .eq("user_id", userId)
-      .is("completed_at", null)
-      .eq("task_type", "check")
-      .not("status", "eq", "expired")
-      .limit(1)
-      .maybeSingle();
-
-    if (checkTasks) {
-      const cropName = checkTasks.crop?.name;
+    // ── Evening priority 2: End-of-day progress prompt ───────────────────────
+    if (!candidates.length) {
       candidates.push({
-        notification_type: "crop_check",
+        notification_type: "habit_nudge",
         priority:          "low",
-        title:             cropName ? `Quick check on your ${cropName}` : "Quick crop check",
-        body:              checkTasks.action,
-        task_id:           checkTasks.id,
-        payload: {
-          url:     "/?section=checks",
-          section: "checks",
-          task_id: checkTasks.id,
-        },
+        title:             "Evening garden check 🌿",
+        body:              "Anything changed today? Log a quick update.",
+        task_id:           null,
+        payload:           { url: "/", section: "dashboard" },
       });
     }
   }
 
-  // ── 5. Upcoming key task ──────────────────────────────────────────────────
-  if (prefs.coming_up_enabled) {
-    const tomorrow = new Date(Date.now() + 86400000).toISOString().split("T")[0];
-    const in3days  = new Date(Date.now() + 3 * 86400000).toISOString().split("T")[0];
-
-    const { data: upcomingTasks } = await supabase
-      .from("tasks")
-      .select("*, crop:crop_instance_id(name)")
-      .eq("user_id", userId)
-      .is("completed_at", null)
-      .eq("status", "upcoming")
-      .gte("due_date", tomorrow)
-      .lte("due_date", in3days)
-      .in("task_type", ["sow", "transplant", "harden_off", "harvest"])
-      .order("due_date", { ascending: true })
-      .limit(1)
-      .maybeSingle();
-
-    if (upcomingTasks) {
-      const cropName = upcomingTasks.crop?.name;
-      const daysAway = Math.ceil((new Date(upcomingTasks.due_date) - Date.now()) / 86400000);
-      const when = daysAway === 1 ? "tomorrow" : `in ${daysAway} days`;
-      const taskLabel = upcomingTasks.task_type.replace(/_/g, " ");
-      candidates.push({
-        notification_type: "upcoming",
-        priority:          "medium",
-        title:             cropName ? `⚠️ ${cropName} — ${taskLabel} ${when}` : `⚠️ Garden task due ${when}`,
-        body:              `Miss this and your timing slips`,
-        task_id:           upcomingTasks.id,
-        payload: {
-          url:     "/?section=upcoming",
-          section: "upcoming",
-          task_id: upcomingTasks.id,
-        },
-      });
-    }
-  }
-
-  // ── 6. Weekly summary (Sunday evenings) ──────────────────────────────────
-  if (prefs.weekly_summary_enabled) {
-    const dayOfWeek = new Date().getDay(); // 0 = Sunday
-    if (dayOfWeek === 0) {
-      // Count upcoming this week
-      const { count: upcomingCount } = await supabase
-        .from("tasks")
-        .select("*", { count: "exact", head: true })
-        .eq("user_id", userId)
-        .is("completed_at", null)
-        .not("status", "eq", "expired")
-        .lte("due_date", weekEnd);
-
-      const { count: completedCount } = await supabase
-        .from("tasks")
-        .select("*", { count: "exact", head: true })
-        .eq("user_id", userId)
-        .not("completed_at", "is", null)
-        .gte("completed_at", new Date(Date.now() - 7 * 86400000).toISOString());
-
-      candidates.push({
-        notification_type: "weekly_summary",
-        priority:          "low",
-        title:             "Your garden this week",
-        body:              upcomingCount > 0
-          ? `${upcomingCount} task${upcomingCount !== 1 ? "s" : ""} coming up${completedCount > 0 ? ` · ${completedCount} completed last week` : ""}`
-          : completedCount > 0
-            ? `Great week — ${completedCount} task${completedCount !== 1 ? "s" : ""} completed. Your garden is on track.`
-            : "Check in on your garden this week.",
-        payload: {
-          url:     "/",
-          section: "dashboard",
-        },
-      });
-    }
+  // ── Guaranteed fallback — never return empty ─────────────────────────────
+  if (!candidates.length) {
+    candidates.push(getFallbackCandidate(window, userId));
   }
 
   return candidates;
 }
 
 // ── Select best candidate ─────────────────────────────────────────────────────
-// Priority: critical > high > medium > low
-// Apply daily caps and cooldowns
-
-async function selectCandidates(supabase, userId, candidates, window, isAdmin = false) {
-  const today   = new Date().toISOString().split("T")[0];
-  const counter = await getDailyCounter(supabase, userId, today);
+// Simplified — no cooldowns, no caps blocking scheduled sends.
+// Just pick the highest priority candidate.
+function selectCandidate(candidates) {
   const PRIORITY_RANK = { critical: 4, high: 3, medium: 2, low: 1 };
-
-  // Daily caps — low:1 allows engagement nudges, high:2 allows stacking
-  const CAPS = { total: 3, critical: 2, high: 2, medium: 1, low: 1 };
-
-  if (counter.total_sent >= CAPS.total) return [];
-
-  const selected = [];
-
-  // Sort by priority
   const sorted = [...candidates].sort(
     (a, b) => (PRIORITY_RANK[b.priority] || 0) - (PRIORITY_RANK[a.priority] || 0)
   );
-
-  for (let c of sorted) {
-    // Evening window: upgrade due_today to last-chance copy
-    if (window === "evening" && c.notification_type === "due_today") {
-      if (counter.total_sent > 0) continue; // already sent something today
-      // Rewrite to evening last-chance tone
-      c = {
-        ...c,
-        title: c.title.replace("🌱 Today:", "⚠️ Last chance today:"),
-        body:  "Takes 2 mins — keeps you on track",
-      };
-    }
-
-    // Check daily cap for this priority
-    const capKey = `${c.priority}_sent`;
-    if ((counter[capKey] || 0) >= (CAPS[c.priority] || 0)) continue;
-    if (counter.total_sent + selected.length >= CAPS.total) break;
-
-    // Check cooldown — admin accounts bypass this so they always get notified
-    if (!isAdmin) {
-      const cooldownHours = COOLDOWNS[c.notification_type] || 20;
-      const suppressed = await isRecentlySent(supabase, userId, c.notification_type, cooldownHours);
-      if (suppressed && c.priority !== "critical") continue;
-    }
-
-    // Window routing
-    if (window === "morning" && c.notification_type === "weekly_summary") continue;
-    if (window === "evening" && c.notification_type === "due_today" && c.priority !== "high") continue;
-
-    selected.push(c);
-    if (c.priority !== "critical") break; // only batch criticals
-  }
-
-  return selected;
+  return sorted[0] || null;
 }
 
 // ── Send notification ─────────────────────────────────────────────────────────
 async function sendNotification(supabase, userId, candidate) {
-  // Get active push tokens for user
   const { data: tokens } = await supabase
     .from("device_push_tokens")
     .select("push_token, endpoint")
@@ -382,7 +289,6 @@ async function sendNotification(supabase, userId, candidate) {
 
   if (!tokens?.length) return { sent: false, reason: "no_tokens" };
 
-  // Log event
   const { data: event } = await supabase.from("notification_events").insert({
     user_id:           userId,
     task_id:           candidate.task_id || null,
@@ -396,8 +302,8 @@ async function sendNotification(supabase, userId, candidate) {
   }).select("id").single();
 
   const eventId = event?.id;
-
   let sentCount = 0;
+
   for (const token of tokens) {
     try {
       const subscription = JSON.parse(token.push_token);
@@ -413,14 +319,16 @@ async function sendNotification(supabase, userId, candidate) {
 
       await webpush.sendNotification(subscription, payload);
       sentCount++;
+      console.log(`[Push] Sent to ${userId}: ${candidate.notification_type} — "${candidate.title}"`);
     } catch (err) {
-      console.error(`[Push] Send failed for token:`, err.statusCode, err.body);
-      // Deactivate invalid tokens
+      console.error(`[Push] Send failed for ${userId}:`, err.statusCode, err.body);
+      // Clean up invalid/expired subscriptions
       if (err.statusCode === 410 || err.statusCode === 404) {
         await supabase.from("device_push_tokens")
           .update({ is_active: false })
           .eq("user_id", userId)
           .eq("endpoint", token.endpoint);
+        console.log(`[Push] Deactivated expired token for ${userId}`);
       }
     }
   }
@@ -429,71 +337,61 @@ async function sendNotification(supabase, userId, candidate) {
     await supabase.from("notification_events")
       .update({ status: "sent", sent_at: new Date().toISOString() })
       .eq("id", eventId);
-
-    const today = new Date().toISOString().split("T")[0];
-    await incrementCounter(supabase, userId, today, candidate.priority);
   }
 
   return { sent: sentCount > 0, sentCount, eventId };
 }
 
-// ── Admin accounts — always receive notifications regardless of activity ──────
-// These users bypass the last_seen_at suppression so they can verify push works
-const ADMIN_USER_IDS = new Set([
-  "c1c730ff-acb2-4969-9c74-32a84041d9b3", // Mark (founder)
-]);
-
 // ── Main notification runner ──────────────────────────────────────────────────
 async function runNotificationsForUser(supabase, userId, window = "morning") {
   if (!setupVapid()) return { sent: 0, reason: "vapid_not_configured" };
 
-  const isAdmin = ADMIN_USER_IDS.has(userId);
-
-  // Get preferences
+  // Check push preference
   const { data: prefs } = await supabase
     .from("notification_preferences")
-    .select("*")
+    .select("push_enabled")
     .eq("user_id", userId)
     .single();
 
-  if (!prefs?.push_enabled) return { sent: 0, reason: "push_disabled" };
-
-  // Suppress if user already opened the app today (skip for admin accounts)
-  if (!isAdmin) {
-    const { data: profile } = await supabase
-      .from("profiles")
-      .select("last_seen_at")
-      .eq("id", userId)
-      .single();
-
-    if (profile?.last_seen_at) {
-      const lastSeen = new Date(profile.last_seen_at).getTime();
-      const hoursSinceOpen = (Date.now() - lastSeen) / 3600000;
-      // Morning: skip if opened in last 2 hours. Evening: skip if opened in last 6 hours.
-      const suppressWindow = window === "evening" ? 6 : 2;
-      if (hoursSinceOpen < suppressWindow) {
-        return { sent: 0, reason: "recently_active" };
-      }
-    }
+  if (!prefs?.push_enabled) {
+    console.log(`[Push] Skipping ${userId}: push_disabled`);
+    return { sent: 0, reason: "push_disabled" };
   }
 
-  // Build candidates
-  const candidates = await buildCandidates(supabase, userId, prefs);
-  if (!candidates.length) return { sent: 0, reason: "no_candidates" };
+  // Check valid token exists
+  const { data: tokens } = await supabase
+    .from("device_push_tokens")
+    .select("id")
+    .eq("user_id", userId)
+    .eq("is_active", true)
+    .limit(1);
 
-  // Select best — admin accounts bypass cooldown suppression for evening window
-  // so they always get both morning and evening notifications
-  const selected = await selectCandidates(supabase, userId, candidates, window, isAdmin);
-  if (!selected.length) return { sent: 0, reason: "all_suppressed" };
+  if (!tokens?.length) {
+    console.log(`[Push] Skipping ${userId}: no_valid_token`);
+    return { sent: 0, reason: "no_valid_token" };
+  }
+
+  // Prevent duplicate sends within the same window (if cron fires twice)
+  // NOTE: morning window check does NOT block evening — they use different window times
+  const alreadySentThisWindow = await didSendInWindow(supabase, userId, window);
+  if (alreadySentThisWindow) {
+    console.log(`[Push] Skipping ${userId}: already_sent_in_${window}_window`);
+    return { sent: 0, reason: `already_sent_in_${window}_window` };
+  }
+
+  // Build candidates — always returns at least 1 (fallback)
+  const candidates = await buildCandidates(supabase, userId, window);
+
+  // Select best
+  const candidate = selectCandidate(candidates);
+  if (!candidate) {
+    console.log(`[Push] Skipping ${userId}: no_candidate (unexpected)`);
+    return { sent: 0, reason: "no_candidate" };
+  }
 
   // Send
-  let totalSent = 0;
-  for (const candidate of selected) {
-    const result = await sendNotification(supabase, userId, candidate);
-    if (result.sent) totalSent++;
-  }
-
-  return { sent: totalSent, candidates: selected.length };
+  const result = await sendNotification(supabase, userId, candidate);
+  return { sent: result.sent ? 1 : 0, type: candidate.notification_type, ...result };
 }
 
 module.exports = { runNotificationsForUser, buildCandidates, sendNotification };
