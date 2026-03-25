@@ -2541,11 +2541,9 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       const tl = buildTimeline(c);
       let windowStart, windowEnd;
       if (tl?.harvest_date_iso) {
-        // Use the timeline harvest date — respects timeline_offset_days
-        const start = new Date(tl.harvest_date_iso); start.setDate(start.getDate() - 7);
-        const end   = new Date(tl.harvest_date_iso); end.setDate(end.getDate() + 7);
-        windowStart = start.toISOString().split("T")[0];
-        windowEnd   = end.toISOString().split("T")[0];
+        // Use exact timeline harvest date — same as shown on crop card and timeline sheet
+        windowStart = tl.harvest_date_iso;
+        windowEnd   = tl.harvest_date_iso;
       } else if (c.crop_def?.harvest_month_start) {
         windowStart = new Date(year, c.crop_def.harvest_month_start - 1, 1).toISOString().split("T")[0];
         windowEnd   = new Date(year, c.crop_def.harvest_month_end   - 1, 28).toISOString().split("T")[0];
