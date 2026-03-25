@@ -2205,10 +2205,10 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
 
     const BUG_FIX_DATE = "2026-03-24T13:00:00.000Z";
 
-    const { data: allCropUsers } = await db.from("crop_instances").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
+    const { data: allCropUsers } = await supabaseService.from("crop_instances").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
     const anyUserWithCrop = new Set((allCropUsers || []).map(r => r.user_id));
 
-    const { data: allTaskUsers } = await db.from("tasks").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
+    const { data: allTaskUsers } = await supabaseService.from("tasks").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
     const anyUserWithTask = new Set((allTaskUsers || []).map(r => r.user_id));
 
     // Post-fix activated = has profile AND signed up after bug fix
