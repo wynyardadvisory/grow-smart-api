@@ -56,6 +56,20 @@ const supabaseService = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+// ── Paginated auth user fetch — bypasses Supabase 1000-user hard cap ─────────
+async function getAllAuthUsers() {
+  let allUsers = [];
+  let page = 1;
+  while (true) {
+    const { data: { users }, error } = await supabaseService.auth.admin.listUsers({ perPage: 1000, page });
+    if (error || !users || users.length === 0) break;
+    allUsers = allUsers.concat(users);
+    if (users.length < 1000) break;
+    page++;
+  }
+  return allUsers;
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 const app = express();
 app.disable("etag"); // Prevent 304 caching — responses must always be fresh
@@ -1858,8 +1872,8 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
     const demoUserIds = (demoProfiles || []).map(p => p.id);
 
     // User growth — auth users (everyone) vs profiles (completed onboarding)
-    const { data: { users: authUsers } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
-    const realAuthUsers   = authUsers.filter(u => !demoUserIds.includes(u.id));
+    const authUsers     = await getAllAuthUsers();
+    const realAuthUsers = authUsers.filter(u => !demoUserIds.includes(u.id));
     const totalSignups    = realAuthUsers.length;
     const newSignupsWeek  = realAuthUsers.filter(u => new Date(u.created_at) >= new Date(day7ago)).length;
     const newSignupsLastWeek = realAuthUsers.filter(u => new Date(u.created_at) >= new Date(day28ago) && new Date(u.created_at) < new Date(day7ago)).length;
@@ -2048,6 +2062,250 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
+// =============================================================================
+// GET /admin/metrics/funnel — activation funnel, D1/D7 cohort retention,
+// push vs no-push comparison, 14-day cohort table, post-fix health check
+// =============================================================================
+app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const db = supabaseService;
+    const FIX_DATE = "2026-03-24T13:00:00.000Z";
+    const now = new Date();
+
+    const { data: demoProfiles } = await db.from("profiles").select("id").eq("is_demo", true);
+    const demoUserIds = (demoProfiles || []).map(p => p.id);
+
+    const authUsers = await getAllAuthUsers();
+    const realAuthUsers = authUsers.filter(u => !demoUserIds.includes(u.id));
+    const totalSignups = realAuthUsers.length;
+
+    // Activated = have a profile
+    const { data: profiles } = await db.from("profiles").select("id, created_at").eq("is_demo", false);
+    const activatedIds = new Set((profiles || []).map(p => p.id));
+    const totalActivated = activatedIds.size;
+
+    // Tasks generated (at least one task)
+    const { data: usersWithTasks } = await db.from("tasks").select("user_id").not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
+    const usersWithTasksSet = new Set((usersWithTasks || []).map(r => r.user_id));
+
+    // First task completed
+    const { data: usersWithCompleted } = await db.from("tasks").select("user_id").not("completed_at", "is", null).not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
+    const usersWithCompletedSet = new Set((usersWithCompleted || []).map(r => r.user_id));
+
+    // Active crops
+    const { data: usersWithCrops } = await db.from("crop_instances").select("user_id").eq("active", true).not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
+    const usersWithCropsSet = new Set((usersWithCrops || []).map(r => r.user_id));
+
+    // ── D1 / D7 retention by task completion group ────────────────────────────
+    // D1: users signed up 1+ days ago. D7: users signed up 7+ days ago.
+    const day1ago = new Date(now - 1 * 86400000).toISOString();
+    const day7ago = new Date(now - 7 * 86400000).toISOString();
+
+    const eligibleD1 = realAuthUsers.filter(u => new Date(u.created_at) <= new Date(day1ago));
+    const eligibleD7 = realAuthUsers.filter(u => new Date(u.created_at) <= new Date(day7ago));
+
+    // Activity signal: crop_instances updated
+    const { data: d1Active } = await db.from("crop_instances").select("user_id").gte("updated_at", day1ago).not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
+    const { data: d7Active } = await db.from("crop_instances").select("user_id").gte("updated_at", day7ago).not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
+    const d1ActiveSet = new Set((d1Active || []).map(r => r.user_id));
+    const d7ActiveSet = new Set((d7Active || []).map(r => r.user_id));
+
+    // Split by task completion group
+    const withTask    = (arr) => arr.filter(u => usersWithCompletedSet.has(u.id));
+    const withoutTask = (arr) => arr.filter(u => !usersWithCompletedSet.has(u.id));
+
+    const retRate = (users, activeSet) => {
+      if (!users.length) return null;
+      return Math.round((users.filter(u => activeSet.has(u.id)).length / users.length) * 100);
+    };
+
+    const retention = {
+      with_task: {
+        d1_eligible: withTask(eligibleD1).length,
+        d1_rate:     retRate(withTask(eligibleD1), d1ActiveSet),
+        d7_eligible: withTask(eligibleD7).length,
+        d7_rate:     retRate(withTask(eligibleD7), d7ActiveSet),
+      },
+      without_task: {
+        d1_eligible: withoutTask(eligibleD1).length,
+        d1_rate:     retRate(withoutTask(eligibleD1), d1ActiveSet),
+        d7_eligible: withoutTask(eligibleD7).length,
+        d7_rate:     retRate(withoutTask(eligibleD7), d7ActiveSet),
+      },
+    };
+
+    // ── Push vs no-push 7-day retention ──────────────────────────────────────
+    const { data: pushUsers } = await db.from("device_push_tokens").select("user_id").eq("is_active", true).not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
+    const pushUserSet = new Set((pushUsers || []).map(r => r.user_id));
+    const pushEligible    = eligibleD7.filter(u => pushUserSet.has(u.id));
+    const noPushEligible  = eligibleD7.filter(u => !pushUserSet.has(u.id));
+
+    const pushRetention = {
+      push: {
+        eligible: pushEligible.length,
+        rate:     retRate(pushEligible, d7ActiveSet),
+      },
+      no_push: {
+        eligible: noPushEligible.length,
+        rate:     retRate(noPushEligible, d7ActiveSet),
+      },
+    };
+
+    // ── 14-day cohort table ───────────────────────────────────────────────────
+    const cohortDays = [];
+    for (let i = 13; i >= 0; i--) {
+      const dayStart = new Date(now);
+      dayStart.setDate(dayStart.getDate() - i);
+      dayStart.setHours(0, 0, 0, 0);
+      const dayEnd = new Date(dayStart);
+      dayEnd.setHours(23, 59, 59, 999);
+
+      const daySignups = realAuthUsers.filter(u => {
+        const d = new Date(u.created_at);
+        return d >= dayStart && d <= dayEnd;
+      }).length;
+
+      cohortDays.push({
+        date:        dayStart.toISOString().split("T")[0],
+        signups:     daySignups,
+        is_fix_date: dayStart.toISOString().split("T")[0] === "2026-03-24",
+      });
+    }
+
+    // ── Post-fix health check ─────────────────────────────────────────────────
+    const postFixUsers = realAuthUsers
+      .filter(u => new Date(u.created_at) >= new Date(FIX_DATE))
+      .map(u => u.id);
+
+    let noCropsPostFix = 0;
+    let noTasksPostFix = 0;
+
+    if (postFixUsers.length > 0) {
+      // Scope to specific IDs to avoid 1000-row Supabase limit
+      const { data: postFixCrops } = await db.from("crop_instances").select("user_id").in("user_id", postFixUsers);
+      const { data: postFixTasks } = await db.from("tasks").select("user_id").in("user_id", postFixUsers);
+      const postFixCropSet = new Set((postFixCrops || []).map(r => r.user_id));
+      const postFixTaskSet = new Set((postFixTasks || []).map(r => r.user_id));
+      const postFixActivated = postFixUsers.filter(id => activatedIds.has(id));
+      noCropsPostFix = postFixActivated.filter(id => !postFixCropSet.has(id)).length;
+      noTasksPostFix = postFixActivated.filter(id => !postFixTaskSet.has(id)).length;
+    }
+
+    res.json({
+      funnel: {
+        signed_up:       totalSignups,
+        onboarded:       totalActivated,
+        tasks_generated: usersWithTasksSet.size,
+        first_task_done: usersWithCompletedSet.size,
+        active_crops:    usersWithCropsSet.size,
+      },
+      retention,
+      push_retention: pushRetention,
+      cohort_days: cohortDays,
+      health_check: {
+        no_crops_post_fix: noCropsPostFix,
+        no_tasks_post_fix: noTasksPostFix,
+        fix_date: FIX_DATE,
+        post_fix_user_count: postFixUsers.length,
+      },
+    });
+  } catch (e) {
+    console.error("[FunnelMetrics]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// =============================================================================
+// GET /admin/metrics/viewer — second-user viewer admin (signup count only)
+// Auth by user ID (not email) — viewer is not the full admin
+// =============================================================================
+const VIEWER_ADMIN_ID = "448095f2-d379-4232-90f2-6ac7cebe1c70";
+app.get("/admin/metrics/viewer", requireAuth, async (req, res) => {
+  if (req.user.id !== VIEWER_ADMIN_ID) return res.status(403).json({ error: "Forbidden" });
+  try {
+    const authUsers = await getAllAuthUsers();
+    const { data: demoProfiles } = await supabaseService.from("profiles").select("id").eq("is_demo", true);
+    const demoIds = new Set((demoProfiles || []).map(p => p.id));
+    const totalSignups = authUsers.filter(u => !demoIds.has(u.id)).length;
+    res.json({ totalSignups });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// =============================================================================
+// FIRST ACTION — fallback card for users with no tasks today
+// =============================================================================
+app.get("/first-action", requireAuth, async (req, res) => {
+  try {
+    const { data: crops } = await req.db.from("crop_instances")
+      .select("id, name, variety, stage, status, sown_date, crop_def:crop_def_id(name, grower_notes)")
+      .eq("user_id", req.user.id)
+      .eq("active", true)
+      .limit(10);
+
+    if (!crops?.length) return res.json(null);
+
+    // Pick the crop most likely to benefit from a check — prioritise recently sown
+    const sorted = crops
+      .filter(c => c.sown_date)
+      .sort((a, b) => new Date(b.sown_date) - new Date(a.sown_date));
+    const crop = sorted[0] || crops[0];
+
+    const stageMap = {
+      seed:       { action: "Check germination",   detail: "Look for signs of germination — seedlings should appear soon." },
+      seedling:   { action: "Check seedlings",      detail: "Check moisture and look for leggy growth — ensure good light." },
+      vegetative: { action: "Check plant health",   detail: "Inspect leaves for pests or yellowing. Water if top inch is dry." },
+      flowering:  { action: "Check flowers",        detail: "Look for pollination and ensure consistent watering." },
+      fruiting:   { action: "Check fruit set",      detail: "Inspect developing fruit and feed with high potash if due." },
+      harvesting: { action: "Check harvest",        detail: "Your crop may be ready to pick — check size and ripeness." },
+    };
+
+    const stage = crop.stage || "seedling";
+    const { action, detail } = stageMap[stage] || stageMap.vegetative;
+
+    res.json({
+      crop_id:     crop.id,
+      crop_name:   crop.name,
+      variety:     crop.variety || null,
+      stage,
+      action,
+      detail,
+      source_key: `first_action_${crop.id}_${new Date().toISOString().split("T")[0]}`,
+    });
+  } catch (e) {
+    console.error("[FirstAction]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/first-action/complete", requireAuth, async (req, res) => {
+  try {
+    const { crop_id, source_key } = req.body;
+    if (!crop_id) return res.status(400).json({ error: "crop_id required" });
+
+    // Log to funnel_events if table exists — graceful fail if not
+    try {
+      await supabaseService.from("funnel_events").insert({
+        user_id:    req.user.id,
+        event_type: "first_action_completed",
+        meta:       JSON.stringify({ crop_id, source_key }),
+        created_at: new Date().toISOString(),
+      });
+    } catch (_) { /* table may not exist yet */ }
+
+    // Set stage_confidence = confirmed on the crop
+    await req.db.from("crop_instances")
+      .update({ stage_confidence: "confirmed", updated_at: new Date().toISOString() })
+      .eq("id", crop_id)
+      .eq("user_id", req.user.id);
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /admin/feedback — admin only
 app.get("/admin/feedback", requireAuth, requireAdmin, async (req, res) => {
   const { data, error } = await supabaseService
@@ -2057,7 +2315,7 @@ app.get("/admin/feedback", requireAuth, requireAdmin, async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
 
   // Enrich with email from auth.users
-  const { data: { users } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
+  const users = await getAllAuthUsers();
   const emailMap = {};
   (users || []).forEach(u => { emailMap[u.id] = u.email; });
 
@@ -2114,8 +2372,7 @@ app.post("/admin/crop-queue/:id/reject", requireAuth, requireAdmin, async (req, 
 // GET /admin/users — all users with crop counts and last seen
 app.get("/admin/users", requireAuth, requireAdmin, async (req, res) => {
   // Use service role to access auth.users — covers users who never completed onboarding
-  const { data: authUsers } = await supabaseService.auth.admin.listUsers();
-  const users = authUsers?.users || [];
+  const users = await getAllAuthUsers();
 
   // Get profiles for name lookup
   const { data: profiles } = await supabaseService.from("profiles").select("id, name");
@@ -3725,7 +3982,7 @@ app.post("/admin/backfill-badges", requireAuth, requireAdmin, async (req, res) =
     const today       = now.toISOString().split("T")[0];
     const yesterday   = new Date(Date.now()-86400000).toISOString().split("T")[0];
 
-    const { data: { users } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
+    const users = await getAllAuthUsers();
     if (!users?.length) return res.json({ ok: true, processed: 0 });
 
     const [{ data: allTasks }, { data: allCrops }, { data: allLocations }, { data: allAreas }, { data: allHarvests }, { data: allPhotos }, { data: allBadges }] = await Promise.all([
