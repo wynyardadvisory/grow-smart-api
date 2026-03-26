@@ -156,9 +156,9 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = []) 
   const cropGroup      = def.category ?? null;
 
   // Date anchors
-  // timeline_offset_days (signed): positive = behind schedule, negative = ahead
-  // Applied as a shift to the effective sow date without modifying the real sow_date.
-  // stage_adjusted_sow_date is kept for backwards compatibility but timeline_offset_days takes precedence.
+  // If the user has manually confirmed a stage, we use stage_adjusted_sow_date
+  // as the effective sow anchor for harvest date and pct calculations.
+  // The original sown_date is never modified — null out stage_adjusted_sow_date to revert.
   const rawSowDate      = crop.sown_date         || crop.transplanted_date || null;
   const offsetDays      = crop.timeline_offset_days || 0;
   // Positive offset = behind schedule = shift sowDate forward = harvest later
@@ -1237,18 +1237,7 @@ class RuleEngine {
     // watering task per area rather than per crop.
     const areaMap = new Map(); // areaId -> { crops, areaType, areaName, locId, weather }
     for (const crop of crops) {
-      // Skip crops that don't need watering:
-      // - planned/not yet sown
-      // - sown indoors (not in outdoor area yet)
-      // - finished/harvested
-      // - active=false
-      // - no anchor date at all (not in ground via any method)
-      // NOTE: uses same anchor logic as rest of engine: sown_date || transplanted_date || planted_out_date
-      // This means established plants and plug plants with a transplant date are correctly included.
-      if (!crop.active) continue;
-      if (["planned", "sown_indoors", "finished", "harvested"].includes(crop.status)) continue;
-      const hasAnchorDate = !!(crop.sown_date || crop.transplanted_date || crop.transplant_date || crop.planted_out_date);
-      if (!hasAnchorDate) continue; // genuinely not in ground yet via any method
+      if (crop.status === "planned" || crop.status === "sown_indoors" || crop.status === "finished") continue;
       const areaId = crop.area_id;
       if (!areaId) continue;
       const locId = crop.location_id || crop.area?.location_id;
