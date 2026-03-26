@@ -159,10 +159,7 @@ function buildTimeline(crop) {
   const fmt = (d) => d ? new Date(d).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }) : null;
   const today = new Date().toISOString().split("T")[0];
 
-  // Apply timeline_offset_days (signed: positive = behind schedule, negative = ahead)
-  // Behind schedule = crop is growing slower = harvest is later
-  // We shift sowDate FORWARD by offsetDays — this makes sowDate+DTM (harvest) later
-  // and makes daysSown smaller (less progress), so progress bar moves back
+  // Apply timeline_offset_days (positive = behind schedule = harvest later)
   const offsetDays = crop.timeline_offset_days || 0;
   const sowDate    = offsetDays !== 0 ? addDays(rawSowDate, offsetDays) : rawSowDate;
 
@@ -204,17 +201,15 @@ function buildTimeline(crop) {
   const STAGE_ORDER = ["seed", "seedling", "vegetative", "flowering", "fruiting", "harvesting"];
   const currentIdx  = STAGE_ORDER.indexOf(currentStage);
 
-  // Harvest date — always derived from sowDate + DTM
-  // sowDate already has offsetDays applied, so harvest moves automatically with stage adjustments
-  // Only use the fixed calendar harvest month when there is no offset (default state)
+  // Harvest date — use sowDate+DTM (already offset-adjusted)
+  // Only use fixed calendar month when no offset set
   const harvestStart = def.harvest_month_start;
+  const harvestEnd   = def.harvest_month_end;
   const year         = new Date().getFullYear();
   let harvestDate    = dtm ? addDays(sowDate, dtm) : null;
   if (harvestStart && offsetDays === 0) {
-    // No offset set — use the seasonal calendar date for accuracy
     harvestDate = new Date(year, harvestStart - 1, 15).toISOString().split("T")[0];
   }
-  // If offsetDays !== 0: harvestDate = sowDate + dtm is already correct
 
   const LABELS = {
     seed:       "Seed",
@@ -261,7 +256,6 @@ function buildTimeline(crop) {
   // Find next stage node
   const nextNode = nodes.find(n => n.status === "upcoming");
 
-  // Progress percentage — days since effective sow date ÷ DTM
   const progressPct = dtm && dtm > 0
     ? Math.min(100, Math.max(0, Math.round((daysSown / dtm) * 100)))
     : Math.round((currentIdx / (STAGE_ORDER.length - 1)) * 100);
@@ -2055,92 +2049,6 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
 });
 
 // GET /admin/feedback — admin only
-// GET /admin/metrics/funnel — activation funnel + cohort table + push retention
-app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => {
-  try {
-    const now = new Date();
-    const { data: demoProfiles } = await supabaseService.from("profiles").select("id").eq("is_demo", true);
-    const demoUserIds = new Set((demoProfiles || []).map(p => p.id));
-    const { data: { users: authUsers } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
-    const realUsers = authUsers.filter(u => !demoUserIds.has(u.id));
-    const totalSignups = realUsers.length;
-    const { data: profiles } = await supabaseService.from("profiles").select("id").eq("is_demo", false);
-    const profileIds = new Set((profiles || []).map(p => p.id));
-    const hasProfile = profileIds.size;
-    const { data: taskUsers } = await supabaseService.from("tasks").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
-    const hasTaskIds = new Set((taskUsers || []).map(r => r.user_id));
-    const hasTasks = hasTaskIds.size;
-    const { data: completedUsers } = await supabaseService.from("tasks").select("user_id").not("completed_at", "is", null).not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
-    const hasCompletedIds = new Set((completedUsers || []).map(r => r.user_id));
-    const hasCompleted = hasCompletedIds.size;
-    const { data: activeCropUsers } = await supabaseService.from("crop_instances").select("user_id").eq("active", true).not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
-    const hasActiveCropIds = new Set((activeCropUsers || []).map(r => r.user_id));
-    const hasActiveCrops = hasActiveCropIds.size;
-    const funnel = [
-      { step: "Signed up",            count: totalSignups,   pct: 100 },
-      { step: "Completed onboarding", count: hasProfile,     pct: totalSignups > 0 ? Math.round(hasProfile    / totalSignups * 100) : 0 },
-      { step: "Tasks generated",      count: hasTasks,       pct: totalSignups > 0 ? Math.round(hasTasks      / totalSignups * 100) : 0 },
-      { step: "Completed 1+ task",    count: hasCompleted,   pct: totalSignups > 0 ? Math.round(hasCompleted  / totalSignups * 100) : 0 },
-      { step: "Active crops today",   count: hasActiveCrops, pct: totalSignups > 0 ? Math.round(hasActiveCrops / totalSignups * 100) : 0 },
-    ];
-    const cohorts = [];
-    for (let i = 13; i >= 0; i--) {
-      const dayStart = new Date(now); dayStart.setDate(dayStart.getDate() - i); dayStart.setHours(0, 0, 0, 0);
-      const dayEnd = new Date(dayStart); dayEnd.setDate(dayEnd.getDate() + 1);
-      const daySignups = realUsers.filter(u => { const created = new Date(u.created_at); return created >= dayStart && created < dayEnd; });
-      if (daySignups.length === 0) { cohorts.push({ date: dayStart.toISOString().split("T")[0], signups: 0, activated: null, completedTask: null, day1: null, day7: null }); continue; }
-      const cohortIds = daySignups.map(u => u.id);
-      const activated = cohortIds.filter(id => profileIds.has(id)).length;
-      const completedTask = cohortIds.filter(id => hasCompletedIds.has(id)).length;
-      let day1 = null, day7 = null;
-      if (i <= 12) { const d1Start = new Date(dayStart.getTime() + 86400000); const d1End = new Date(dayStart.getTime() + 2 * 86400000); const { data: d1Activity } = await supabaseService.from("profiles").select("id").in("id", cohortIds).gte("last_seen_at", d1Start.toISOString()).lte("last_seen_at", d1End.toISOString()); day1 = cohortIds.length > 0 ? Math.round(((d1Activity || []).length / cohortIds.length) * 100) : null; }
-      if (i <= 6)  { const d7Start = new Date(dayStart.getTime() + 7 * 86400000); const d7End = new Date(dayStart.getTime() + 8 * 86400000); const { data: d7Activity } = await supabaseService.from("profiles").select("id").in("id", cohortIds).gte("last_seen_at", d7Start.toISOString()).lte("last_seen_at", d7End.toISOString()); day7 = cohortIds.length > 0 ? Math.round(((d7Activity || []).length / cohortIds.length) * 100) : null; }
-      cohorts.push({ date: dayStart.toISOString().split("T")[0], signups: cohortIds.length, activated: cohortIds.length > 0 ? Math.round(activated / cohortIds.length * 100) : null, completedTask: cohortIds.length > 0 ? Math.round(completedTask / cohortIds.length * 100) : null, day1, day7 });
-    }
-    const day7ago = new Date(now - 7 * 86400000).toISOString();
-    const day1ago = new Date(now - 1 * 86400000).toISOString();
-    const { data: pushUserData } = await supabaseService.from("device_push_tokens").select("user_id").eq("is_active", true).not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
-    const pushUserIds = new Set((pushUserData || []).map(r => r.user_id));
-    const { data: recentActivity } = await supabaseService.from("profiles").select("id, last_seen_at").not("id", "in", `(${[...demoUserIds].join(",") || "''"})` );
-    const activeLast7 = new Set((recentActivity || []).filter(p => p.last_seen_at && new Date(p.last_seen_at) >= new Date(day7ago)).map(p => p.id));
-    const activeLast1 = new Set((recentActivity || []).filter(p => p.last_seen_at && new Date(p.last_seen_at) >= new Date(day1ago)).map(p => p.id));
-    const withPush = [...pushUserIds];
-    const withoutPush = [...profileIds].filter(id => !pushUserIds.has(id));
-    const pushRetention   = withPush.length    > 0 ? Math.round(withPush.filter(id => activeLast7.has(id)).length    / withPush.length    * 100) : null;
-    const noPushRetention = withoutPush.length > 0 ? Math.round(withoutPush.filter(id => activeLast7.has(id)).length / withoutPush.length * 100) : null;
-    const signupDateByUser = {};
-    realUsers.forEach(u => { signupDateByUser[u.id] = u.created_at; });
-    const BUG_FIX_DATE = "2026-03-24T13:00:00.000Z";
-    const { data: allCropUsers } = await supabaseService.from("crop_instances").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
-    const anyUserWithCrop = new Set((allCropUsers || []).map(r => r.user_id));
-    const { data: allTaskUsers } = await supabaseService.from("tasks").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
-    const anyUserWithTask = new Set((allTaskUsers || []).map(r => r.user_id));
-    const postFixActivated = [...profileIds].filter(id => signupDateByUser[id] && signupDateByUser[id] >= BUG_FIX_DATE);
-    const totalPostFix = postFixActivated.length;
-    const postFixNoCrops = postFixActivated.filter(id => !anyUserWithCrop.has(id)).length;
-    const postFixNoTasks = postFixActivated.filter(id => !anyUserWithTask.has(id)).length;
-    const healthChecks = { postFixNoCrops, postFixNoTasks, postFixNoCropsPct: totalPostFix > 0 ? Math.round(postFixNoCrops / totalPostFix * 100) : 0, postFixNoTasksPct: totalPostFix > 0 ? Math.round(postFixNoTasks / totalPostFix * 100) : 0, totalPostFix, bugFixDate: BUG_FIX_DATE };
-    const { data: completedTaskData } = await supabaseService.from("tasks").select("user_id").not("completed_at", "is", null).not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
-    const taskCountByUser = {};
-    (completedTaskData || []).forEach(t => { taskCountByUser[t.user_id] = (taskCountByUser[t.user_id] || 0) + 1; });
-    const group0     = [...profileIds].filter(id => !taskCountByUser[id]);
-    const group1     = [...profileIds].filter(id => taskCountByUser[id] === 1);
-    const group2plus = [...profileIds].filter(id => taskCountByUser[id] >= 2);
-    const retRateCohort = (ids, activeSet, minDaysAgo) => {
-      const cutoff = new Date(now - minDaysAgo * 86400000).toISOString();
-      const eligible = ids.filter(id => signupDateByUser[id] && signupDateByUser[id] < cutoff);
-      if (eligible.length === 0) return null;
-      return Math.round(eligible.filter(id => activeSet.has(id)).length / eligible.length * 100);
-    };
-    const behaviourRetention = [
-      { label: "No tasks completed",  count: group0.length,     d1: retRateCohort(group0,     activeLast1, 1), d7: retRateCohort(group0,     activeLast7, 7), d1_eligible: group0.filter(id => signupDateByUser[id] && signupDateByUser[id] < day1ago).length,     d7_eligible: group0.filter(id => signupDateByUser[id] && signupDateByUser[id] < day7ago).length },
-      { label: "1 task completed",    count: group1.length,     d1: retRateCohort(group1,     activeLast1, 1), d7: retRateCohort(group1,     activeLast7, 7), d1_eligible: group1.filter(id => signupDateByUser[id] && signupDateByUser[id] < day1ago).length,     d7_eligible: group1.filter(id => signupDateByUser[id] && signupDateByUser[id] < day7ago).length },
-      { label: "2+ tasks completed",  count: group2plus.length, d1: retRateCohort(group2plus, activeLast1, 1), d7: retRateCohort(group2plus, activeLast7, 7), d1_eligible: group2plus.filter(id => signupDateByUser[id] && signupDateByUser[id] < day1ago).length, d7_eligible: group2plus.filter(id => signupDateByUser[id] && signupDateByUser[id] < day7ago).length },
-    ];
-    res.json({ funnel, cohorts, pushRetention: { withPush: { users: withPush.length, retention7day: pushRetention }, withoutPush: { users: withoutPush.length, retention7day: noPushRetention } }, healthChecks, behaviourRetention, bugFixDate: "2026-03-24" });
-  } catch (e) { console.error("[MetricsFunnel]", e.message); res.status(500).json({ error: e.message }); }
-});
-
 app.get("/admin/feedback", requireAuth, requireAdmin, async (req, res) => {
   const { data, error } = await supabaseService
     .from("feedback")
@@ -3436,7 +3344,6 @@ app.post("/crops/:id/observe", requireAuth, async (req, res) => {
   if (symptom_code === "transplant_done") { updates.status = "transplanted"; updates.transplant_date = new Date().toISOString().split("T")[0]; engineActions.push("transplant_done"); }
   if (symptom_code === "plant_struggling") { updates.missed_task_note = "Plant reported as struggling — check growing conditions"; engineActions.push("struggling_flagged"); }
   if (symptom_code === "looks_healthy") { updates.missed_task_note = null; engineActions.push("health_confirmed"); }
-  // Apply timeline offset if provided (signed integer: positive = behind, negative = ahead)
   if (typeof timeline_offset_days === "number") {
     updates.timeline_offset_days = timeline_offset_days;
     engineActions.push("timeline_offset_applied");
@@ -3454,7 +3361,7 @@ app.get("/crops/:id/observations", requireAuth, async (req, res) => {
   res.json(data || []);
 });
 
-// POST /crops/:id/log-action — log a manual action (watered, fed, pruned, weeded, note)
+// POST /crops/:id/log-action
 app.post("/crops/:id/log-action", requireAuth, async (req, res) => {
   const { action_type, notes } = req.body;
   if (!action_type) return res.status(400).json({ error: "action_type required" });
@@ -3492,9 +3399,7 @@ app.post("/crops/:id/log-action", requireAuth, async (req, res) => {
     nextActionHint = "Note saved";
   }
   await req.db.from("crop_instances").update(updates).eq("id", req.params.id).eq("user_id", req.user.id);
-  if (action_type === "watered" || action_type === "fed") {
-    await runRuleEngine(req.user.id);
-  }
+  if (action_type === "watered" || action_type === "fed") await runRuleEngine(req.user.id);
   res.json({ ok: true, action_type, next_action_hint: nextActionHint });
 });
 
