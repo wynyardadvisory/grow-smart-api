@@ -2084,19 +2084,38 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
     const activatedIds = new Set((profiles || []).map(p => p.id));
     const totalActivated = activatedIds.size;
 
-    // Tasks generated (at least one task)
-    const { data: usersWithTasks } = await db.from("tasks").select("user_id").not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
-    const usersWithTasksSet = new Set((usersWithTasks || []).map(r => r.user_id));
+    // ── Fetch all task data once — used for funnel, retention, and cohort ──────
+    // Scope to activated user IDs to avoid the 1000-row Supabase default limit
+    const activatedUserIds = [...activatedIds].filter(id => !demoUserIds.includes(id));
 
-    // First task completed
-    const { data: usersWithCompleted } = await db.from("tasks").select("user_id").not("completed_at", "is", null).not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
-    const usersWithCompletedSet = new Set((usersWithCompleted || []).map(r => r.user_id));
+    // Fetch all tasks for activated users in chunks of 200 to stay under limits
+    let allTasks = [];
+    for (let i = 0; i < activatedUserIds.length; i += 200) {
+      const chunk = activatedUserIds.slice(i, i + 200);
+      const { data } = await db.from("tasks").select("user_id, completed_at").in("user_id", chunk);
+      allTasks = allTasks.concat(data || []);
+    }
 
-    // Active crops
-    const { data: usersWithCrops } = await db.from("crop_instances").select("user_id").eq("active", true).not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
-    const usersWithCropsSet = new Set((usersWithCrops || []).map(r => r.user_id));
+    // Fetch all active crops for activated users
+    let allCrops = [];
+    for (let i = 0; i < activatedUserIds.length; i += 200) {
+      const chunk = activatedUserIds.slice(i, i + 200);
+      const { data } = await db.from("crop_instances").select("user_id").eq("active", true).in("user_id", chunk);
+      allCrops = allCrops.concat(data || []);
+    }
 
-    // ── D1 / D3 / D7 retention by task completion group ─────────────────────
+    // Per-user task completion counts
+    const taskCountMap = {};
+    for (const t of allTasks) {
+      if (t.completed_at) taskCountMap[t.user_id] = (taskCountMap[t.user_id] || 0) + 1;
+    }
+
+    // Funnel sets — scoped correctly
+    const usersWithTasksSet    = new Set(allTasks.map(t => t.user_id));
+    const usersWithCompletedSet = new Set(Object.keys(taskCountMap));
+    const usersWithCropsSet    = new Set(allCrops.map(c => c.user_id));
+
+    // ── D1 / D3 / D7 retention ───────────────────────────────────────────────
     const day1ago = new Date(now - 1 * 86400000).toISOString();
     const day3ago = new Date(now - 3 * 86400000).toISOString();
     const day7ago = new Date(now - 7 * 86400000).toISOString();
@@ -2105,40 +2124,34 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
     const eligibleD3 = realAuthUsers.filter(u => new Date(u.created_at) <= new Date(day3ago));
     const eligibleD7 = realAuthUsers.filter(u => new Date(u.created_at) <= new Date(day7ago));
 
-    // Activity signal: task completed in the window
-    const { data: d1Active } = await db.from("tasks").select("user_id").not("completed_at", "is", null).gte("completed_at", day1ago).not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
-    const { data: d3Active } = await db.from("tasks").select("user_id").not("completed_at", "is", null).gte("completed_at", day3ago).not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
-    const { data: d7Active } = await db.from("tasks").select("user_id").not("completed_at", "is", null).gte("completed_at", day7ago).not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
-    const d1ActiveSet = new Set((d1Active || []).map(r => r.user_id));
-    const d3ActiveSet = new Set((d3Active || []).map(r => r.user_id));
-    const d7ActiveSet = new Set((d7Active || []).map(r => r.user_id));
+    // Activity signal: completed a task in the retention window
+    const d1ActiveSet = new Set(allTasks.filter(t => t.completed_at && t.completed_at >= day1ago).map(t => t.user_id));
+    const d3ActiveSet = new Set(allTasks.filter(t => t.completed_at && t.completed_at >= day3ago).map(t => t.user_id));
+    const d7ActiveSet = new Set(allTasks.filter(t => t.completed_at && t.completed_at >= day7ago).map(t => t.user_id));
 
-    // Split by task completion group
-    const withTask    = (arr) => arr.filter(u => usersWithCompletedSet.has(u.id));
-    const withoutTask = (arr) => arr.filter(u => !usersWithCompletedSet.has(u.id));
+    // Split into three groups: no tasks, exactly 1 task, 2+ tasks
+    const noTask   = (arr) => arr.filter(u => !taskCountMap[u.id] || taskCountMap[u.id] === 0);
+    const oneTask  = (arr) => arr.filter(u =>  taskCountMap[u.id] === 1);
+    const twoPlus  = (arr) => arr.filter(u => (taskCountMap[u.id] || 0) >= 2);
 
     const retRate = (users, activeSet) => {
       if (!users.length) return null;
       return Math.round((users.filter(u => activeSet.has(u.id)).length / users.length) * 100);
     };
 
+    const retGroup = (filterFn) => ({
+      d1_eligible: filterFn(eligibleD1).length,
+      d1_rate:     retRate(filterFn(eligibleD1), d1ActiveSet),
+      d3_eligible: filterFn(eligibleD3).length,
+      d3_rate:     retRate(filterFn(eligibleD3), d3ActiveSet),
+      d7_eligible: filterFn(eligibleD7).length,
+      d7_rate:     retRate(filterFn(eligibleD7), d7ActiveSet),
+    });
+
     const retention = {
-      with_task: {
-        d1_eligible: withTask(eligibleD1).length,
-        d1_rate:     retRate(withTask(eligibleD1), d1ActiveSet),
-        d3_eligible: withTask(eligibleD3).length,
-        d3_rate:     retRate(withTask(eligibleD3), d3ActiveSet),
-        d7_eligible: withTask(eligibleD7).length,
-        d7_rate:     retRate(withTask(eligibleD7), d7ActiveSet),
-      },
-      without_task: {
-        d1_eligible: withoutTask(eligibleD1).length,
-        d1_rate:     retRate(withoutTask(eligibleD1), d1ActiveSet),
-        d3_eligible: withoutTask(eligibleD3).length,
-        d3_rate:     retRate(withoutTask(eligibleD3), d3ActiveSet),
-        d7_eligible: withoutTask(eligibleD7).length,
-        d7_rate:     retRate(withoutTask(eligibleD7), d7ActiveSet),
-      },
+      no_task:  retGroup(noTask),
+      one_task: retGroup(oneTask),
+      two_plus: retGroup(twoPlus),
     };
 
     // ── Push vs no-push 7-day retention ──────────────────────────────────────
@@ -2158,14 +2171,12 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
       },
     };
 
-    // ── 14-day cohort table with per-day activation + D1/D3/D7 retention ─────
-    const { data: allCompletions } = await db.from("tasks")
-      .select("user_id, completed_at")
-      .not("completed_at", "is", null)
-      .not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
+    // ── 14-day cohort table — reuse allTasks, latest date first ────────────────
+    const allCompletions = allTasks.filter(t => t.completed_at);
 
     const cohortDays = [];
-    for (let i = 13; i >= 0; i--) {
+    // i=0 → today, i=13 → 13 days ago — so latest date is first in the array
+    for (let i = 0; i <= 13; i++) {
       const dayStart = new Date(now);
       dayStart.setDate(dayStart.getDate() - i);
       dayStart.setHours(0, 0, 0, 0);
@@ -2178,17 +2189,18 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
       });
       const cohortActivated = cohortUsers.filter(u => activatedIds.has(u.id));
       const cohortIds       = new Set(cohortUsers.map(u => u.id));
-      const cohortCompleted = (allCompletions || []).filter(c => cohortIds.has(c.user_id));
+      const cohortCompleted = allCompletions.filter(c => cohortIds.has(c.user_id));
       const firstTaskSet    = new Set(cohortCompleted.map(c => c.user_id));
 
-      // Per-cohort retention: did this user complete a task in the Nth day window?
+      // Per-cohort D1/D3/D7: i days have elapsed since signup day
+      // i=0 means today's signups — not enough time for any retention yet
       const retForDay = (nDays) => {
         if (i < nDays || !cohortUsers.length) return null;
         const retained = cohortUsers.filter(u => {
-          const signupEnd = new Date(new Date(u.created_at));
+          const signupEnd = new Date(u.created_at);
           signupEnd.setHours(23, 59, 59, 999);
           const windowEnd = new Date(signupEnd.getTime() + nDays * 86400000);
-          return (allCompletions || []).some(c =>
+          return allCompletions.some(c =>
             c.user_id === u.id &&
             new Date(c.completed_at) > signupEnd &&
             new Date(c.completed_at) <= windowEnd
