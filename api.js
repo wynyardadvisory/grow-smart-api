@@ -2064,7 +2064,7 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
     const { data: demoProfiles } = await supabaseService.from("profiles").select("id").eq("is_demo", true);
     const demoUserIds = new Set((demoProfiles || []).map(p => p.id));
 
-    const authUsers = await getAllAuthUsers();
+    const { data: { users: authUsers } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
     const realUsers = authUsers.filter(u => !demoUserIds.has(u.id));
 
     const totalSignups = realUsers.length;
