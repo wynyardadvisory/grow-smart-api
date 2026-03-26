@@ -1358,14 +1358,15 @@ class RuleEngine {
             onConflict:       "source_key",
             ignoreDuplicates: true,   // never overwrite existing tasks — preserves completed_at
           })
-          .select("id, engine_type, status")
-          .single();
+          .select("id, engine_type, status");
 
         if (error) {
           console.error(`[RuleEngine] Upsert error (${task.rule_id}):`, error.message, error.details);
           errors++;
         } else {
-          console.log(`[RuleEngine] Upserted OK: id=${data?.id} engine_type=${data?.engine_type}`);
+          // ignoreDuplicates returns 0 rows when the task already exists — that's fine
+          const row = Array.isArray(data) ? data[0] : data;
+          console.log(`[RuleEngine] Upserted OK: id=${row?.id ?? "duplicate-skipped"} engine_type=${row?.engine_type ?? task.engine_type}`);
           inserted++;
         }
       } catch (err) {
