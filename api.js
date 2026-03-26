@@ -2096,18 +2096,21 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
     const { data: usersWithCrops } = await db.from("crop_instances").select("user_id").eq("active", true).not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
     const usersWithCropsSet = new Set((usersWithCrops || []).map(r => r.user_id));
 
-    // ── D1 / D7 retention by task completion group ────────────────────────────
-    // D1: users signed up 1+ days ago. D7: users signed up 7+ days ago.
+    // ── D1 / D3 / D7 retention by task completion group ─────────────────────
     const day1ago = new Date(now - 1 * 86400000).toISOString();
+    const day3ago = new Date(now - 3 * 86400000).toISOString();
     const day7ago = new Date(now - 7 * 86400000).toISOString();
 
     const eligibleD1 = realAuthUsers.filter(u => new Date(u.created_at) <= new Date(day1ago));
+    const eligibleD3 = realAuthUsers.filter(u => new Date(u.created_at) <= new Date(day3ago));
     const eligibleD7 = realAuthUsers.filter(u => new Date(u.created_at) <= new Date(day7ago));
 
-    // Activity signal: crop_instances updated
-    const { data: d1Active } = await db.from("crop_instances").select("user_id").gte("updated_at", day1ago).not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
-    const { data: d7Active } = await db.from("crop_instances").select("user_id").gte("updated_at", day7ago).not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
+    // Activity signal: task completed in the window
+    const { data: d1Active } = await db.from("tasks").select("user_id").not("completed_at", "is", null).gte("completed_at", day1ago).not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
+    const { data: d3Active } = await db.from("tasks").select("user_id").not("completed_at", "is", null).gte("completed_at", day3ago).not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
+    const { data: d7Active } = await db.from("tasks").select("user_id").not("completed_at", "is", null).gte("completed_at", day7ago).not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
     const d1ActiveSet = new Set((d1Active || []).map(r => r.user_id));
+    const d3ActiveSet = new Set((d3Active || []).map(r => r.user_id));
     const d7ActiveSet = new Set((d7Active || []).map(r => r.user_id));
 
     // Split by task completion group
@@ -2123,12 +2126,16 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
       with_task: {
         d1_eligible: withTask(eligibleD1).length,
         d1_rate:     retRate(withTask(eligibleD1), d1ActiveSet),
+        d3_eligible: withTask(eligibleD3).length,
+        d3_rate:     retRate(withTask(eligibleD3), d3ActiveSet),
         d7_eligible: withTask(eligibleD7).length,
         d7_rate:     retRate(withTask(eligibleD7), d7ActiveSet),
       },
       without_task: {
         d1_eligible: withoutTask(eligibleD1).length,
         d1_rate:     retRate(withoutTask(eligibleD1), d1ActiveSet),
+        d3_eligible: withoutTask(eligibleD3).length,
+        d3_rate:     retRate(withoutTask(eligibleD3), d3ActiveSet),
         d7_eligible: withoutTask(eligibleD7).length,
         d7_rate:     retRate(withoutTask(eligibleD7), d7ActiveSet),
       },
@@ -2136,9 +2143,9 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
 
     // ── Push vs no-push 7-day retention ──────────────────────────────────────
     const { data: pushUsers } = await db.from("device_push_tokens").select("user_id").eq("is_active", true).not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
-    const pushUserSet = new Set((pushUsers || []).map(r => r.user_id));
-    const pushEligible    = eligibleD7.filter(u => pushUserSet.has(u.id));
-    const noPushEligible  = eligibleD7.filter(u => !pushUserSet.has(u.id));
+    const pushUserSet    = new Set((pushUsers || []).map(r => r.user_id));
+    const pushEligible   = eligibleD7.filter(u =>  pushUserSet.has(u.id));
+    const noPushEligible = eligibleD7.filter(u => !pushUserSet.has(u.id));
 
     const pushRetention = {
       push: {
@@ -2151,7 +2158,12 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
       },
     };
 
-    // ── 14-day cohort table ───────────────────────────────────────────────────
+    // ── 14-day cohort table with per-day activation + D1/D3/D7 retention ─────
+    const { data: allCompletions } = await db.from("tasks")
+      .select("user_id, completed_at")
+      .not("completed_at", "is", null)
+      .not("user_id", "in", `(${demoUserIds.join(",") || "null"})`);
+
     const cohortDays = [];
     for (let i = 13; i >= 0; i--) {
       const dayStart = new Date(now);
@@ -2160,15 +2172,42 @@ app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => 
       const dayEnd = new Date(dayStart);
       dayEnd.setHours(23, 59, 59, 999);
 
-      const daySignups = realAuthUsers.filter(u => {
+      const cohortUsers = realAuthUsers.filter(u => {
         const d = new Date(u.created_at);
         return d >= dayStart && d <= dayEnd;
-      }).length;
+      });
+      const cohortActivated = cohortUsers.filter(u => activatedIds.has(u.id));
+      const cohortIds       = new Set(cohortUsers.map(u => u.id));
+      const cohortCompleted = (allCompletions || []).filter(c => cohortIds.has(c.user_id));
+      const firstTaskSet    = new Set(cohortCompleted.map(c => c.user_id));
 
+      // Per-cohort retention: did this user complete a task in the Nth day window?
+      const retForDay = (nDays) => {
+        if (i < nDays || !cohortUsers.length) return null;
+        const retained = cohortUsers.filter(u => {
+          const signupEnd = new Date(new Date(u.created_at));
+          signupEnd.setHours(23, 59, 59, 999);
+          const windowEnd = new Date(signupEnd.getTime() + nDays * 86400000);
+          return (allCompletions || []).some(c =>
+            c.user_id === u.id &&
+            new Date(c.completed_at) > signupEnd &&
+            new Date(c.completed_at) <= windowEnd
+          );
+        }).length;
+        return { rate: Math.round((retained / cohortUsers.length) * 100), eligible: cohortUsers.length };
+      };
+
+      const dateStr = dayStart.toISOString().split("T")[0];
       cohortDays.push({
-        date:        dayStart.toISOString().split("T")[0],
-        signups:     daySignups,
-        is_fix_date: dayStart.toISOString().split("T")[0] === "2026-03-24",
+        date:           dateStr,
+        signups:        cohortUsers.length,
+        activated:      cohortActivated.length,
+        activation_pct: cohortUsers.length > 0 ? Math.round((cohortActivated.length / cohortUsers.length) * 100) : null,
+        first_task_pct: cohortActivated.length > 0 ? Math.round((cohortUsers.filter(u => firstTaskSet.has(u.id)).length / cohortActivated.length) * 100) : null,
+        d1:  retForDay(1),
+        d3:  retForDay(3),
+        d7:  retForDay(7),
+        is_post_fix: new Date(dateStr) >= new Date("2026-03-24"),
       });
     }
 
