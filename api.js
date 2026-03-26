@@ -58,7 +58,6 @@ const supabaseService = createClient(
 
 // ── App ───────────────────────────────────────────────────────────────────────
 const app = express();
-app.disable("etag"); // Prevent 304 caching — responses must always be fresh
 app.use(helmet());
 const allowedOrigins = [
   "https://vercro.com",
@@ -145,11 +144,11 @@ function buildTimeline(crop) {
   const def     = crop.crop_def || {};
   const variety = crop.variety  || {};
 
-  const rawSowDate = crop.sown_date || crop.transplanted_date || null;
-  const dtm        = variety.days_to_maturity_max || variety.days_to_maturity_min
-                   || def.days_to_maturity_max    || def.days_to_maturity_min || null;
+  const sowDate  = crop.sown_date || crop.transplanted_date || null;
+  const dtm      = variety.days_to_maturity_max || variety.days_to_maturity_min
+                 || def.days_to_maturity_max    || def.days_to_maturity_min || null;
 
-  if (!rawSowDate) return null;
+  if (!sowDate) return null;
 
   const addDays = (d, n) => {
     const dt = new Date(d);
@@ -158,14 +157,6 @@ function buildTimeline(crop) {
   };
   const fmt = (d) => d ? new Date(d).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }) : null;
   const today = new Date().toISOString().split("T")[0];
-
-  // Apply timeline_offset_days (signed: positive = behind schedule, negative = ahead)
-  // Behind schedule = crop is growing slower = harvest is later
-  // We shift sowDate FORWARD by offsetDays — this makes sowDate+DTM (harvest) later
-  // and makes daysSown smaller (less progress), so progress bar moves back
-  const offsetDays = crop.timeline_offset_days || 0;
-  const sowDate    = offsetDays !== 0 ? addDays(rawSowDate, offsetDays) : rawSowDate;
-
   const daysSown = Math.floor((Date.now() - new Date(sowDate).getTime()) / 86400000);
 
   // Stage DTM percentages
@@ -204,18 +195,14 @@ function buildTimeline(crop) {
   const STAGE_ORDER = ["seed", "seedling", "vegetative", "flowering", "fruiting", "harvesting"];
   const currentIdx  = STAGE_ORDER.indexOf(currentStage);
 
-  // Harvest date — always derived from sowDate + DTM
-  // sowDate already has offsetDays applied, so harvest moves automatically with stage adjustments
-  // Only use the fixed calendar harvest month when there is no offset (default state)
+  // Harvest window from crop_def
   const harvestStart = def.harvest_month_start;
+  const harvestEnd   = def.harvest_month_end;
   const year         = new Date().getFullYear();
   let harvestDate    = dtm ? addDays(sowDate, dtm) : null;
-  if (harvestStart && offsetDays === 0) {
-    // No offset set — use the seasonal calendar date for accuracy
+  if (harvestStart) {
     harvestDate = new Date(year, harvestStart - 1, 15).toISOString().split("T")[0];
   }
-  // If offsetDays !== 0: harvestDate = sowDate + dtm is already correct
-  // sowDate = rawSowDate - offsetDays, so harvestDate moves forward by offsetDays automatically
 
   const LABELS = {
     seed:       "Seed",
@@ -262,12 +249,6 @@ function buildTimeline(crop) {
   // Find next stage node
   const nextNode = nodes.find(n => n.status === "upcoming");
 
-  // Progress percentage — days since effective sow date ÷ DTM
-  // Uses sowDate (already offset-adjusted) so it moves correctly with stage adjustments
-  const progressPct = dtm && dtm > 0
-    ? Math.min(100, Math.max(0, Math.round((daysSown / dtm) * 100)))
-    : Math.round((currentIdx / (STAGE_ORDER.length - 1)) * 100);
-
   return {
     nodes,
     current_stage:       currentStage,
@@ -276,8 +257,6 @@ function buildTimeline(crop) {
     next_stage_label:    nextNode ? LABELS[nextNode.key] : null,
     next_stage_date:     nextNode?.formatted_date || null,
     harvest_date:        harvestDate ? fmt(harvestDate) : null,
-    harvest_date_iso:    harvestDate || null,
-    progress_pct:        progressPct,
     confidence:          dtm ? "medium" : "low",
     observation_offset_days: 0,
   };
@@ -2482,7 +2461,6 @@ app.get("/weather", requireAuth, async (req, res) => {
 // =============================================================================
 
 app.get("/dashboard", requireAuth, async (req, res) => {
-  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   const today   = todayISO();
   const weekEnd = weekEndISO();
   // Run expiry only — rule engine runs on cron and crop changes, not every page view
@@ -2511,7 +2489,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       .order("urgency",  { ascending: false })
       .order("due_date", { ascending: true }),
     req.db.from("crop_instances")
-      .select("id, name, variety, variety_id, sown_date, stage, timeline_offset_days, area_id, missed_task_note, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, days_to_maturity_max, pest_window_start, pest_window_end, pest_notes, is_perennial)")
+      .select("id, name, variety, variety_id, sown_date, area_id, missed_task_note, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, pest_window_start, pest_window_end, pest_notes)")
       .eq("user_id", req.user.id).eq("active", true),
     req.db.from("profiles").select("name, plan, postcode, photo_url").eq("id", req.user.id).single(),
     req.db.from("harvest_log")
@@ -2536,29 +2514,14 @@ app.get("/dashboard", requireAuth, async (req, res) => {
 
   // ── Harvest forecast ──────────────────────────────────────────────────────
   const harvestForecast = crops
-    .filter(c => c.crop_def?.harvest_month_start || c.sown_date)
-    .map(c => {
-      const tl = buildTimeline(c);
-      let windowStart, windowEnd;
-      if (tl?.harvest_date_iso) {
-        // Use exact timeline harvest date — same as shown on crop card and timeline sheet
-        windowStart = tl.harvest_date_iso;
-        windowEnd   = tl.harvest_date_iso;
-      } else if (c.crop_def?.harvest_month_start) {
-        windowStart = new Date(year, c.crop_def.harvest_month_start - 1, 1).toISOString().split("T")[0];
-        windowEnd   = new Date(year, c.crop_def.harvest_month_end   - 1, 28).toISOString().split("T")[0];
-      } else {
-        return null;
-      }
-      return {
-        crop:             c.name,
-        variety:          c.variety || null,
-        crop_instance_id: c.id,
-        window_start:     windowStart,
-        window_end:       windowEnd,
-      };
-    })
-    .filter(Boolean);
+    .filter(c => c.crop_def?.harvest_month_start)
+    .map(c => ({
+      crop:             c.name,
+      variety:          c.variety || null,
+      crop_instance_id: c.id,   // required to mark crop as harvested + preserve rotation history
+      window_start:     new Date(year, c.crop_def.harvest_month_start - 1, 1).toISOString().split("T")[0],
+      window_end:       new Date(year, c.crop_def.harvest_month_end   - 1, 28).toISOString().split("T")[0],
+    }));
 
   // ── Missing data prompts ──────────────────────────────────────────────────
   const missingData = crops
@@ -3336,10 +3299,10 @@ app.post("/demo/reset", requireAuth, async (req, res) => {
 });
 // =============================================================================
 app.post("/crops/:id/observe", requireAuth, async (req, res) => {
-  const { observation_type, symptom_code, severity, notes, confirmed_stage, timeline_offset_days } = req.body;
+  const { observation_type, symptom_code, severity, notes, confirmed_stage } = req.body;
   if (!observation_type) return res.status(400).json({ error: "observation_type required" });
   const { data: crop, error: cropErr } = await req.db.from("crop_instances")
-    .select("id, name, status, stage, crop_def_id, sown_date, stage")
+    .select("id, name, status, stage, crop_def_id")
     .eq("id", req.params.id).eq("user_id", req.user.id).single();
   if (cropErr || !crop) return res.status(404).json({ error: "Crop not found" });
   const { data: obs, error: obsErr } = await req.db.from("observation_logs").insert({
@@ -3359,13 +3322,6 @@ app.post("/crops/:id/observe", requireAuth, async (req, res) => {
   if (symptom_code === "transplant_done") { updates.status = "transplanted"; updates.transplant_date = new Date().toISOString().split("T")[0]; engineActions.push("transplant_done"); }
   if (symptom_code === "plant_struggling") { updates.missed_task_note = "Plant reported as struggling — check growing conditions"; engineActions.push("struggling_flagged"); }
   if (symptom_code === "looks_healthy") { updates.missed_task_note = null; engineActions.push("health_confirmed"); }
-
-  // Apply timeline offset if provided (signed integer: positive = behind, negative = ahead)
-  if (typeof timeline_offset_days === "number") {
-    updates.timeline_offset_days = timeline_offset_days;
-    engineActions.push("timeline_offset_applied");
-  }
-
   if (Object.keys(updates).length > 0) { updates.updated_at = new Date().toISOString(); await req.db.from("crop_instances").update(updates).eq("id", req.params.id).eq("user_id", req.user.id); }
   await runRuleEngine(req.user.id);
   res.json({ observation: obs, crop_updated: Object.keys(updates).length > 0, engine_actions: engineActions });
@@ -3377,67 +3333,6 @@ app.get("/crops/:id/observations", requireAuth, async (req, res) => {
     .order("observed_at", { ascending: false }).limit(20);
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
-});
-
-// POST /crops/:id/log-action — log a manual action (watered, fed, pruned, weeded, note)
-// Updates relevant crop fields, writes observation, recalculates schedule
-app.post("/crops/:id/log-action", requireAuth, async (req, res) => {
-  const { action_type, notes } = req.body;
-  // action_type: "watered" | "fed" | "pruned" | "weeded" | "note"
-  if (!action_type) return res.status(400).json({ error: "action_type required" });
-
-  const { data: crop, error: cropErr } = await req.db.from("crop_instances")
-    .select("id, name, area_id, last_watered_at, last_fed_at, crop_def_id")
-    .eq("id", req.params.id).eq("user_id", req.user.id).single();
-  if (cropErr || !crop) return res.status(404).json({ error: "Crop not found" });
-
-  const now = new Date().toISOString();
-  const today = now.split("T")[0];
-
-  // Log the observation
-  await req.db.from("observation_logs").insert({
-    user_id:          req.user.id,
-    crop_id:          req.params.id,
-    observed_at:      today,
-    observation_type: action_type,
-    notes:            notes || null,
-  });
-
-  const updates = { updated_at: now };
-  let nextActionHint = null;
-
-  if (action_type === "watered") {
-    // Update last_watered_at on the crop and all crops in the same area
-    updates.last_watered_at = now;
-    if (crop.area_id) {
-      await supabaseService.from("crop_instances")
-        .update({ last_watered_at: now, updated_at: now })
-        .eq("area_id", crop.area_id).eq("user_id", req.user.id);
-    }
-    nextActionHint = "Next watering check in a few days";
-  } else if (action_type === "fed") {
-    updates.last_fed_at = now;
-    // Get feed interval from crop def to give a useful hint
-    const { data: def } = await supabaseService.from("crop_definitions")
-      .select("feed_interval_days").eq("id", crop.crop_def_id).single();
-    const interval = def?.feed_interval_days || 14;
-    nextActionHint = `Next feed in about ${interval} days`;
-  } else if (action_type === "pruned") {
-    nextActionHint = "Pruning logged — growth should improve over the next few days";
-  } else if (action_type === "weeded") {
-    nextActionHint = "Weeding logged";
-  } else if (action_type === "note") {
-    nextActionHint = "Note saved";
-  }
-
-  await req.db.from("crop_instances").update(updates).eq("id", req.params.id).eq("user_id", req.user.id);
-
-  // Recalculate tasks so watered/fed timings reset from today
-  if (action_type === "watered" || action_type === "fed") {
-    await runRuleEngine(req.user.id);
-  }
-
-  res.json({ ok: true, action_type, next_action_hint: nextActionHint });
 });
 
 
