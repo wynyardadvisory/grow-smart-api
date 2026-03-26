@@ -434,6 +434,7 @@ app.delete("/areas/:id", requireAuth, async (req, res) => {
 app.get("/crop-definitions", async (_req, res) => {
   const { data, error } = await supabaseService.from("crop_definitions")
     .select("id, name, category, default_establishment, is_perennial, sow_indoors_start, sow_indoors_end, sow_direct_start, sow_direct_end, plant_out_start, plant_out_end, harvest_month_start, harvest_month_end, days_to_maturity_min, days_to_maturity_max, frost_sensitive, preferred_position, feed_type, feed_interval_days, companions, avoid, pest_notes, grower_notes")
+    .eq("hidden", false)
     .order("name");
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
@@ -610,10 +611,27 @@ Use null for any fields you don't have reliable data for. All month values are i
     const cropData = parsed.crop;
     const varietyData = parsed.variety;
 
-    // ── Check if crop already exists (case-insensitive) ──────────────────────
+    // ── Check if crop already exists — fuzzy match to prevent duplicates ────────
+    // Normalise: lowercase, strip trailing 's', strip leading/trailing spaces
+    const normaliseName = (n) => n.toLowerCase().trim().replace(/s$/i, '');
     let cropDefId;
-    const { data: existing } = await db.from("crop_definitions")
-      .select("id").ilike("name", cropData.name).maybeSingle();
+
+    // First try exact case-insensitive match
+    const { data: exactMatch } = await db.from("crop_definitions")
+      .select("id, name").ilike("name", cropData.name).eq("hidden", false).maybeSingle();
+
+    // Then try fuzzy: fetch all non-hidden definitions and compare normalised names
+    let existing = exactMatch;
+    if (!existing) {
+      const { data: allDefs } = await db.from("crop_definitions")
+        .select("id, name").eq("hidden", false);
+      const normNew = normaliseName(cropData.name);
+      const fuzzyMatch = (allDefs || []).find(d => normaliseName(d.name) === normNew);
+      if (fuzzyMatch) {
+        existing = fuzzyMatch;
+        console.log(`[Enrich] Fuzzy match "${cropData.name}" → "${fuzzyMatch.name}" — using existing`);
+      }
+    }
 
     if (existing) {
       cropDefId = existing.id;
