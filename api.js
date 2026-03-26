@@ -4182,34 +4182,34 @@ app.post("/notifications/:id/opened", async (req, res) => {
 app.post("/cron/push-morning", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  // Respond immediately so cron-job.org doesn't timeout — process in background
+  res.json({ ok: true, status: "processing" });
   try {
     const { data: profiles } = await supabaseService.from("profiles").select("id");
-    if (!profiles?.length) return res.json({ processed: 0, sent: 0 });
+    if (!profiles?.length) return;
     let sent = 0;
     for (const p of profiles) {
       try { const result = await runNotificationsForUser(supabaseService, p.id, "morning"); if (result.sent > 0) sent++; } catch(e) { captureError("PushMorning", e, { userId: p.id }); }
     }
     console.log(`[PushMorning] Sent to ${sent}/${profiles.length} users`);
-    // Email fallback — for users with no push token or push disabled
     const emailResult = await runDailyEmailFallback(supabaseService);
     console.log(`[EmailFallback] Sent: ${emailResult.sent}, Skipped: ${emailResult.skipped}`);
-    res.json({ ok: true, processed: profiles.length, push_sent: sent, email_sent: emailResult.sent });
-  } catch(e) { captureError("PushMorning", e); res.status(500).json({ error: e.message }); }
+  } catch(e) { captureError("PushMorning", e); }
 });
 
 app.post("/cron/push-evening", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  res.json({ ok: true, status: "processing" });
   try {
     const { data: profiles } = await supabaseService.from("profiles").select("id");
-    if (!profiles?.length) return res.json({ processed: 0, sent: 0 });
+    if (!profiles?.length) return;
     let sent = 0;
     for (const p of profiles) {
       try { const result = await runNotificationsForUser(supabaseService, p.id, "evening"); if (result.sent > 0) sent++; } catch(e) { captureError("PushEvening", e, { userId: p.id }); }
     }
     console.log(`[PushEvening] Sent to ${sent}/${profiles.length} users`);
-    res.json({ ok: true, processed: profiles.length, sent });
-  } catch(e) { captureError("PushEvening", e); res.status(500).json({ error: e.message }); }
+  } catch(e) { captureError("PushEvening", e); }
 });
 
 app.post("/notifications/test", requireAuth, requireAdmin, async (req, res) => {
@@ -4224,37 +4224,41 @@ app.post("/notifications/test", requireAuth, requireAdmin, async (req, res) => {
 app.post("/cron/nudge-unactivated", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  res.json({ ok: true, status: "processing" });
   try {
     const result = await runNudgeUnactivated(supabaseService);
-    res.json({ ok: true, ...result });
-  } catch(e) { captureError("NudgeUnactivated", e); res.status(500).json({ error: e.message }); }
+    console.log("[NudgeUnactivated]", result);
+  } catch(e) { captureError("NudgeUnactivated", e); }
 });
 
 app.post("/cron/nudge-unconfirmed", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  res.json({ ok: true, status: "processing" });
   try {
     const result = await runNudgeUnconfirmed(supabaseService);
-    res.json({ ok: true, ...result });
-  } catch(e) { captureError("NudgeUnconfirmed", e); res.status(500).json({ error: e.message }); }
+    console.log("[NudgeUnconfirmed]", result);
+  } catch(e) { captureError("NudgeUnconfirmed", e); }
 });
 
 app.post("/cron/feedback-sequence", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  res.json({ ok: true, status: "processing" });
   try {
     const result = await runFeedbackSequence(supabaseService);
-    res.json({ ok: true, ...result });
-  } catch(e) { captureError("FeedbackSequence", e); res.status(500).json({ error: e.message }); }
+    console.log("[FeedbackSequence]", result);
+  } catch(e) { captureError("FeedbackSequence", e); }
 });
 
 app.post("/cron/waitlist-invites", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  res.json({ ok: true, status: "processing" });
   try {
     const result = await runWaitlistInvites(supabaseService);
-    res.json({ ok: true, ...result });
-  } catch(e) { captureError("WaitlistInvites", e); res.status(500).json({ error: e.message }); }
+    console.log("[WaitlistInvites]", result);
+  } catch(e) { captureError("WaitlistInvites", e); }
 });
 
 app.post("/cron/waitlist-nudges", async (req, res) => {
@@ -4287,10 +4291,11 @@ app.post("/cron/waitlist-nudges-3", async (req, res) => {
 app.post("/cron/reengagement", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  res.json({ ok: true, status: "processing" });
   try {
     const result = await runReengagement(supabaseService);
-    res.json({ ok: true, ...result });
-  } catch(e) { captureError("Reengagement", e); res.status(500).json({ error: e.message }); }
+    console.log("[Reengagement]", result);
+  } catch(e) { captureError("Reengagement", e); }
 });
 
 // =============================================================================
