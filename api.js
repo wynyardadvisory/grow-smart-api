@@ -48,7 +48,7 @@ function captureError(context, err, extra = {}) {
 const { RuleEngine } = require("./rule-engine");
 const { applyBlockedPeriodAdjustments, reapplyAllBlockedPeriods } = require("./blocked-period-adjustment");
 const { runNotificationsForUser } = require("./notifications");
-const { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement, runDailyEmailFallback, runOnboardingRecovery } = require("./emails");
+const { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement, runDailyEmailFallback } = require("./emails");
 
 // ── Supabase (service role — server only) ─────────────────────────────────────
 const supabaseService = createClient(
@@ -58,6 +58,7 @@ const supabaseService = createClient(
 
 // ── App ───────────────────────────────────────────────────────────────────────
 const app = express();
+app.disable("etag"); // Prevent 304 caching — responses must always be fresh
 app.use(helmet());
 const allowedOrigins = [
   "https://vercro.com",
@@ -92,20 +93,7 @@ function weekEndISO() {
   return new Date(Date.now() + 7 * 86400000).toISOString().split("T")[0];
 }
 
-// ── Paginated auth users helper ───────────────────────────────────────────────
-// Supabase listUsers caps at 1000 per page — this fetches all pages
-async function getAllAuthUsers() {
-  let all = [];
-  let page = 1;
-  while (true) {
-    const { data: { users } } = await supabaseService.auth.admin.listUsers({ perPage: 1000, page });
-    if (!users?.length) break;
-    all = all.concat(users);
-    if (users.length < 1000) break;
-    page++;
-  }
-  return all;
-}
+// ── Auth middleware ───────────────────────────────────────────────────────────
 async function requireAuth(req, res, next) {
   const header = req.headers.authorization;
   if (!header?.startsWith("Bearer ")) return res.status(401).json({ error: "Missing auth token" });
@@ -157,11 +145,11 @@ function buildTimeline(crop) {
   const def     = crop.crop_def || {};
   const variety = crop.variety  || {};
 
-  const sowDate  = crop.sown_date || crop.transplanted_date || null;
-  const dtm      = variety.days_to_maturity_max || variety.days_to_maturity_min
-                 || def.days_to_maturity_max    || def.days_to_maturity_min || null;
+  const rawSowDate = crop.sown_date || crop.transplanted_date || null;
+  const dtm        = variety.days_to_maturity_max || variety.days_to_maturity_min
+                   || def.days_to_maturity_max    || def.days_to_maturity_min || null;
 
-  if (!sowDate) return null;
+  if (!rawSowDate) return null;
 
   const addDays = (d, n) => {
     const dt = new Date(d);
@@ -170,6 +158,14 @@ function buildTimeline(crop) {
   };
   const fmt = (d) => d ? new Date(d).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }) : null;
   const today = new Date().toISOString().split("T")[0];
+
+  // Apply timeline_offset_days (signed: positive = behind schedule, negative = ahead)
+  // Behind schedule = crop is growing slower = harvest is later
+  // We shift sowDate FORWARD by offsetDays — this makes sowDate+DTM (harvest) later
+  // and makes daysSown smaller (less progress), so progress bar moves back
+  const offsetDays = crop.timeline_offset_days || 0;
+  const sowDate    = offsetDays !== 0 ? addDays(rawSowDate, offsetDays) : rawSowDate;
+
   const daysSown = Math.floor((Date.now() - new Date(sowDate).getTime()) / 86400000);
 
   // Stage DTM percentages
@@ -208,14 +204,18 @@ function buildTimeline(crop) {
   const STAGE_ORDER = ["seed", "seedling", "vegetative", "flowering", "fruiting", "harvesting"];
   const currentIdx  = STAGE_ORDER.indexOf(currentStage);
 
-  // Harvest window from crop_def
+  // Harvest date — always derived from sowDate + DTM
+  // sowDate already has offsetDays applied, so harvest moves automatically with stage adjustments
+  // Only use the fixed calendar harvest month when there is no offset (default state)
   const harvestStart = def.harvest_month_start;
-  const harvestEnd   = def.harvest_month_end;
   const year         = new Date().getFullYear();
   let harvestDate    = dtm ? addDays(sowDate, dtm) : null;
-  if (harvestStart) {
+  if (harvestStart && offsetDays === 0) {
+    // No offset set — use the seasonal calendar date for accuracy
     harvestDate = new Date(year, harvestStart - 1, 15).toISOString().split("T")[0];
   }
+  // If offsetDays !== 0: harvestDate = sowDate + dtm is already correct
+  // sowDate = rawSowDate - offsetDays, so harvestDate moves forward by offsetDays automatically
 
   const LABELS = {
     seed:       "Seed",
@@ -262,6 +262,12 @@ function buildTimeline(crop) {
   // Find next stage node
   const nextNode = nodes.find(n => n.status === "upcoming");
 
+  // Progress percentage — days since effective sow date ÷ DTM
+  // Uses sowDate (already offset-adjusted) so it moves correctly with stage adjustments
+  const progressPct = dtm && dtm > 0
+    ? Math.min(100, Math.max(0, Math.round((daysSown / dtm) * 100)))
+    : Math.round((currentIdx / (STAGE_ORDER.length - 1)) * 100);
+
   return {
     nodes,
     current_stage:       currentStage,
@@ -270,6 +276,8 @@ function buildTimeline(crop) {
     next_stage_label:    nextNode ? LABELS[nextNode.key] : null,
     next_stage_date:     nextNode?.formatted_date || null,
     harvest_date:        harvestDate ? fmt(harvestDate) : null,
+    harvest_date_iso:    harvestDate || null,
+    progress_pct:        progressPct,
     confidence:          dtm ? "medium" : "low",
     observation_offset_days: 0,
   };
@@ -408,19 +416,9 @@ app.put("/areas/:id", requireAuth, async (req, res) => {
 });
 
 app.delete("/areas/:id", requireAuth, async (req, res) => {
-  const areaId = req.params.id;
-  const userId = req.user.id;
-  try {
-    // Must delete in order: tasks → crop_instances → area
-    // Foreign key constraints prevent deleting area while tasks/crops reference it
-    await req.db.from("tasks").delete().eq("area_id", areaId).eq("user_id", userId);
-    await req.db.from("crop_instances").delete().eq("area_id", areaId).eq("user_id", userId);
-    const { error } = await req.db.from("growing_areas").delete().eq("id", areaId);
-    if (error) return res.status(500).json({ error: error.message });
-    res.status(204).send();
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  const { error } = await req.db.from("growing_areas").delete().eq("id", req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(204).send();
 });
 
 // =============================================================================
@@ -1855,24 +1853,6 @@ app.post("/feedback", requireAuth, async (req, res) => {
 });
 
 // GET /admin/metrics — full founder dashboard
-// =============================================================================
-
-// Second admin — view-only, total signups only
-const VIEWER_ADMIN_ID = "448095f2-d379-4232-90f2-6ac7cebe1c70";
-
-app.get("/admin/metrics/viewer", requireAuth, async (req, res) => {
-  if (req.user.id !== VIEWER_ADMIN_ID) return res.status(403).json({ error: "Forbidden" });
-  try {
-    const users = await getAllAuthUsers();
-    const { data: demoProfiles } = await supabaseService.from("profiles").select("id").eq("is_demo", true);
-    const demoIds = new Set((demoProfiles || []).map(p => p.id));
-    const totalSignups = users.filter(u => !demoIds.has(u.id)).length;
-    res.json({ totalSignups });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
   try {
     const db = supabaseService; // service role for cross-table queries
@@ -1886,7 +1866,7 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
     const demoUserIds = (demoProfiles || []).map(p => p.id);
 
     // User growth — auth users (everyone) vs profiles (completed onboarding)
-    const authUsers = await getAllAuthUsers();
+    const { data: { users: authUsers } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
     const realAuthUsers   = authUsers.filter(u => !demoUserIds.includes(u.id));
     const totalSignups    = realAuthUsers.length;
     const newSignupsWeek  = realAuthUsers.filter(u => new Date(u.created_at) >= new Date(day7ago)).length;
@@ -2076,242 +2056,6 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-// GET /admin/metrics/funnel — activation funnel + cohort table + push retention
-app.get("/admin/metrics/funnel", requireAuth, requireAdmin, async (req, res) => {
-  try {
-    const db = supabaseService;
-    const now = new Date();
-    console.log("[Funnel] Starting funnel endpoint");
-
-    // Get demo user IDs to exclude
-    const { data: demoProfiles } = await supabaseService.from("profiles").select("id").eq("is_demo", true);
-    const demoUserIds = new Set((demoProfiles || []).map(p => p.id));
-
-    const authUsers = await getAllAuthUsers();
-    const realUsers = authUsers.filter(u => !demoUserIds.has(u.id));
-
-    // ── Activation funnel ────────────────────────────────────────────────────
-    const totalSignups = realUsers.length;
-
-    // Has profile = completed onboarding
-    const { data: profiles } = await supabaseService.from("profiles").select("id").eq("is_demo", false);
-    const profileIds = new Set((profiles || []).map(p => p.id));
-    const hasProfile = profileIds.size;
-
-    // Has tasks generated (ever — crops + rule engine ran during onboarding)
-    const { data: taskUsers } = await supabaseService.from("tasks").select("user_id").not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
-    const hasTaskIds = new Set((taskUsers || []).map(r => r.user_id));
-    const hasTasks = hasTaskIds.size;
-
-    // Has completed at least 1 task (ever)
-    const { data: completedUsers } = await supabaseService.from("tasks").select("user_id").not("completed_at", "is", null).not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
-    const hasCompletedIds = new Set((completedUsers || []).map(r => r.user_id));
-    const hasCompleted = hasCompletedIds.size;
-
-    // Still has active crops today (ongoing engagement — separate from onboarding)
-    const { data: activeCropUsers } = await supabaseService.from("crop_instances").select("user_id").eq("active", true).not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
-    const hasActiveCropIds = new Set((activeCropUsers || []).map(r => r.user_id));
-    const hasActiveCrops = hasActiveCropIds.size;
-
-    const funnel = [
-      { step: "Signed up",            count: totalSignups,   pct: 100 },
-      { step: "Completed onboarding", count: hasProfile,     pct: totalSignups > 0 ? Math.round(hasProfile    / totalSignups * 100) : 0 },
-      { step: "Tasks generated",      count: hasTasks,       pct: totalSignups > 0 ? Math.round(hasTasks      / totalSignups * 100) : 0 },
-      { step: "Completed 1+ task",    count: hasCompleted,   pct: totalSignups > 0 ? Math.round(hasCompleted  / totalSignups * 100) : 0 },
-      { step: "Active crops today",   count: hasActiveCrops, pct: totalSignups > 0 ? Math.round(hasActiveCrops / totalSignups * 100) : 0 },
-    ];
-
-    // ── Cohort table — last 14 days ──────────────────────────────────────────
-    const cohorts = [];
-    for (let i = 13; i >= 0; i--) {
-      const dayStart = new Date(now);
-      dayStart.setDate(dayStart.getDate() - i);
-      dayStart.setHours(0, 0, 0, 0);
-      const dayEnd = new Date(dayStart);
-      dayEnd.setDate(dayEnd.getDate() + 1);
-
-      const daySignups = realUsers.filter(u => {
-        const created = new Date(u.created_at);
-        return created >= dayStart && created < dayEnd;
-      });
-
-      if (daySignups.length === 0) {
-        cohorts.push({ date: dayStart.toISOString().split("T")[0], signups: 0, activated: null, completedTask: null, day1: null, day3: null, day7: null });
-        continue;
-      }
-
-      const cohortIds = daySignups.map(u => u.id);
-
-      // Activated
-      const activated = cohortIds.filter(id => profileIds.has(id)).length;
-
-      // Completed at least 1 task
-      const completedTask = cohortIds.filter(id => hasCompletedIds.has(id)).length;
-
-      // Day 1 return (active 1-2 days after signup)
-      let day1 = null, day3 = null, day7 = null;
-      if (i <= 12) { // needs at least 1 day to have passed
-        const d1Start = new Date(dayStart.getTime() + 86400000);
-        const d1End   = new Date(dayStart.getTime() + 2 * 86400000);
-        const { data: d1Activity } = await supabaseService.from("profiles").select("id").in("id", cohortIds).gte("last_seen_at", d1Start.toISOString()).lte("last_seen_at", d1End.toISOString());
-        day1 = cohortIds.length > 0 ? Math.round(((d1Activity || []).length / cohortIds.length) * 100) : null;
-      }
-      if (i <= 10) {
-        const d3Start = new Date(dayStart.getTime() + 3 * 86400000);
-        const d3End   = new Date(dayStart.getTime() + 4 * 86400000);
-        const { data: d3Activity } = await supabaseService.from("profiles").select("id").in("id", cohortIds).gte("last_seen_at", d3Start.toISOString()).lte("last_seen_at", d3End.toISOString());
-        day3 = cohortIds.length > 0 ? Math.round(((d3Activity || []).length / cohortIds.length) * 100) : null;
-      }
-      if (i <= 6) {
-        const d7Start = new Date(dayStart.getTime() + 7 * 86400000);
-        const d7End   = new Date(dayStart.getTime() + 8 * 86400000);
-        const { data: d7Activity } = await supabaseService.from("profiles").select("id").in("id", cohortIds).gte("last_seen_at", d7Start.toISOString()).lte("last_seen_at", d7End.toISOString());
-        day7 = cohortIds.length > 0 ? Math.round(((d7Activity || []).length / cohortIds.length) * 100) : null;
-      }
-
-      cohorts.push({
-        date:          dayStart.toISOString().split("T")[0],
-        signups:       cohortIds.length,
-        activated:     cohortIds.length > 0 ? Math.round(activated / cohortIds.length * 100) : null,
-        completedTask: cohortIds.length > 0 ? Math.round(completedTask / cohortIds.length * 100) : null,
-        day1,
-        day3,
-        day7,
-      });
-    }
-
-    // ── Push vs no-push retention ────────────────────────────────────────────
-    const day7ago = new Date(now - 7 * 86400000).toISOString();
-    const { data: pushUserData } = await supabaseService.from("device_push_tokens").select("user_id").eq("is_active", true).not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
-    const pushUserIds = new Set((pushUserData || []).map(r => r.user_id));
-
-    const { data: recentActivity } = await supabaseService.from("profiles").select("id, last_seen_at").not("id", "in", `(${[...demoUserIds].join(",") || "''"})` );
-    const activeLast7 = new Set((recentActivity || []).filter(p => p.last_seen_at && new Date(p.last_seen_at) >= new Date(day7ago)).map(p => p.id));
-
-    const withPush    = [...pushUserIds];
-    const withoutPush = [...profileIds].filter(id => !pushUserIds.has(id));
-
-    const pushRetention    = withPush.length    > 0 ? Math.round(withPush.filter(id => activeLast7.has(id)).length    / withPush.length    * 100) : null;
-    const noPushRetention  = withoutPush.length > 0 ? Math.round(withoutPush.filter(id => activeLast7.has(id)).length / withoutPush.length * 100) : null;
-
-    // ── Health checks — data integrity ───────────────────────────────────────
-    // Question: of post-fix activated signups (signed up after 24 Mar, completed onboarding),
-    // how many have 0 crops and 0 tasks?
-    // Both should always be 0 — every activated user goes through onboarding which
-    // forces crop selection and runs the rule engine.
-
-    // Build signup date map — used here and by behaviour retention below
-    const signupDateByUser = {};
-    realUsers.forEach(u => { signupDateByUser[u.id] = u.created_at; });
-
-    const BUG_FIX_DATE = "2026-03-24T13:00:00.000Z";
-
-    // Post-fix activated = has profile AND signed up after bug fix
-    const postFixActivated = [...profileIds].filter(id =>
-      signupDateByUser[id] && signupDateByUser[id] >= BUG_FIX_DATE
-    );
-    const totalPostFix = postFixActivated.length;
-
-    // Check which post-fix profiles have crops and tasks
-    // Query scoped to just these 40 IDs — avoids Supabase 1000-row default limit
-    // on crop_instances (5000+ rows) which was causing incorrect results
-    const postFixIds = postFixActivated;
-    let postFixNoCrops = 0;
-    let postFixNoTasks = 0;
-
-    if (postFixIds.length > 0) {
-      const idList = postFixIds.join(",");
-      const { data: cropsCheck } = await supabaseService
-        .from("crop_instances")
-        .select("user_id")
-        .in("user_id", postFixIds);
-      const usersWithCrop = new Set((cropsCheck || []).map(r => r.user_id));
-      postFixNoCrops = postFixIds.filter(id => !usersWithCrop.has(id)).length;
-
-      const { data: tasksCheck } = await supabaseService
-        .from("tasks")
-        .select("user_id")
-        .in("user_id", postFixIds);
-      const usersWithTask = new Set((tasksCheck || []).map(r => r.user_id));
-      postFixNoTasks = postFixIds.filter(id => !usersWithTask.has(id)).length;
-    }
-
-    console.log(`[HealthCheck] totalPostFix=${totalPostFix} noCrops=${postFixNoCrops} noTasks=${postFixNoTasks}`);
-
-    const healthChecks = {
-      postFixNoCrops,
-      postFixNoTasks,
-      postFixNoCropsPct: totalPostFix > 0 ? Math.round(postFixNoCrops / totalPostFix * 100) : 0,
-      postFixNoTasksPct: totalPostFix > 0 ? Math.round(postFixNoTasks / totalPostFix * 100) : 0,
-      totalPostFix,
-      bugFixDate: BUG_FIX_DATE,
-    };
-
-    // ── Behaviour → retention correlation ────────────────────────────────────
-    // TRUE cohort retention — D1/D7 only counts users signed up 1+/7+ days ago
-    const day1ago = new Date(now - 1  * 86400000).toISOString();
-
-    const { data: completedTaskData } = await supabaseService.from("tasks")
-      .select("user_id")
-      .not("completed_at", "is", null)
-      .not("user_id", "in", `(${[...demoUserIds].join(",") || "''"})` );
-    const taskCountByUser = {};
-    (completedTaskData || []).forEach(t => {
-      taskCountByUser[t.user_id] = (taskCountByUser[t.user_id] || 0) + 1;
-    });
-
-    const group0     = [...profileIds].filter(id => !taskCountByUser[id]);
-    const group1     = [...profileIds].filter(id => taskCountByUser[id] === 1);
-    const group2plus = [...profileIds].filter(id => taskCountByUser[id] >= 2);
-
-    const retRateCohort = (ids, activeSet, minDaysAgo) => {
-      const cutoff = new Date(now - minDaysAgo * 86400000).toISOString();
-      const eligible = ids.filter(id => signupDateByUser[id] && signupDateByUser[id] < cutoff);
-      if (eligible.length === 0) return null;
-      return Math.round(eligible.filter(id => activeSet.has(id)).length / eligible.length * 100);
-    };
-
-    const activeLast1 = new Set((recentActivity || []).filter(p => p.last_seen_at && new Date(p.last_seen_at) >= new Date(day1ago)).map(p => p.id));
-
-    const behaviourRetention = [
-      {
-        label: "No tasks completed", count: group0.length,
-        d1: retRateCohort(group0, activeLast1, 1), d7: retRateCohort(group0, activeLast7, 7),
-        d1_eligible: group0.filter(id => signupDateByUser[id] && signupDateByUser[id] < day1ago).length,
-        d7_eligible: group0.filter(id => signupDateByUser[id] && signupDateByUser[id] < day7ago).length,
-      },
-      {
-        label: "1 task completed", count: group1.length,
-        d1: retRateCohort(group1, activeLast1, 1), d7: retRateCohort(group1, activeLast7, 7),
-        d1_eligible: group1.filter(id => signupDateByUser[id] && signupDateByUser[id] < day1ago).length,
-        d7_eligible: group1.filter(id => signupDateByUser[id] && signupDateByUser[id] < day7ago).length,
-      },
-      {
-        label: "2+ tasks completed", count: group2plus.length,
-        d1: retRateCohort(group2plus, activeLast1, 1), d7: retRateCohort(group2plus, activeLast7, 7),
-        d1_eligible: group2plus.filter(id => signupDateByUser[id] && signupDateByUser[id] < day1ago).length,
-        d7_eligible: group2plus.filter(id => signupDateByUser[id] && signupDateByUser[id] < day7ago).length,
-      },
-    ];
-
-    res.json({
-      funnel,
-      cohorts,
-      pushRetention: {
-        withPush:    { users: withPush.length,    retention7day: pushRetention },
-        withoutPush: { users: withoutPush.length, retention7day: noPushRetention },
-      },
-      healthChecks,
-      behaviourRetention,
-      bugFixDate: "2026-03-24",
-    });
-
-  } catch (e) {
-    console.error("[MetricsFunnel]", e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
 // GET /admin/feedback — admin only
 app.get("/admin/feedback", requireAuth, requireAdmin, async (req, res) => {
   const { data, error } = await supabaseService
@@ -2321,7 +2065,7 @@ app.get("/admin/feedback", requireAuth, requireAdmin, async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
 
   // Enrich with email from auth.users
-  const users = await getAllAuthUsers();
+  const { data: { users } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
   const emailMap = {};
   (users || []).forEach(u => { emailMap[u.id] = u.email; });
 
@@ -2378,7 +2122,8 @@ app.post("/admin/crop-queue/:id/reject", requireAuth, requireAdmin, async (req, 
 // GET /admin/users — all users with crop counts and last seen
 app.get("/admin/users", requireAuth, requireAdmin, async (req, res) => {
   // Use service role to access auth.users — covers users who never completed onboarding
-  const users = await getAllAuthUsers();
+  const { data: authUsers } = await supabaseService.auth.admin.listUsers();
+  const users = authUsers?.users || [];
 
   // Get profiles for name lookup
   const { data: profiles } = await supabaseService.from("profiles").select("id, name");
@@ -2737,6 +2482,7 @@ app.get("/weather", requireAuth, async (req, res) => {
 // =============================================================================
 
 app.get("/dashboard", requireAuth, async (req, res) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   const today   = todayISO();
   const weekEnd = weekEndISO();
   // Run expiry only — rule engine runs on cron and crop changes, not every page view
@@ -2765,7 +2511,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       .order("urgency",  { ascending: false })
       .order("due_date", { ascending: true }),
     req.db.from("crop_instances")
-      .select("id, name, variety, variety_id, sown_date, area_id, missed_task_note, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, pest_window_start, pest_window_end, pest_notes)")
+      .select("id, name, variety, variety_id, sown_date, stage, timeline_offset_days, area_id, missed_task_note, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, days_to_maturity_max, pest_window_start, pest_window_end, pest_notes, is_perennial)")
       .eq("user_id", req.user.id).eq("active", true),
     req.db.from("profiles").select("name, plan, postcode, photo_url").eq("id", req.user.id).single(),
     req.db.from("harvest_log")
@@ -2790,14 +2536,29 @@ app.get("/dashboard", requireAuth, async (req, res) => {
 
   // ── Harvest forecast ──────────────────────────────────────────────────────
   const harvestForecast = crops
-    .filter(c => c.crop_def?.harvest_month_start)
-    .map(c => ({
-      crop:             c.name,
-      variety:          c.variety || null,
-      crop_instance_id: c.id,   // required to mark crop as harvested + preserve rotation history
-      window_start:     new Date(year, c.crop_def.harvest_month_start - 1, 1).toISOString().split("T")[0],
-      window_end:       new Date(year, c.crop_def.harvest_month_end   - 1, 28).toISOString().split("T")[0],
-    }));
+    .filter(c => c.crop_def?.harvest_month_start || c.sown_date)
+    .map(c => {
+      const tl = buildTimeline(c);
+      let windowStart, windowEnd;
+      if (tl?.harvest_date_iso) {
+        // Use exact timeline harvest date — same as shown on crop card and timeline sheet
+        windowStart = tl.harvest_date_iso;
+        windowEnd   = tl.harvest_date_iso;
+      } else if (c.crop_def?.harvest_month_start) {
+        windowStart = new Date(year, c.crop_def.harvest_month_start - 1, 1).toISOString().split("T")[0];
+        windowEnd   = new Date(year, c.crop_def.harvest_month_end   - 1, 28).toISOString().split("T")[0];
+      } else {
+        return null;
+      }
+      return {
+        crop:             c.name,
+        variety:          c.variety || null,
+        crop_instance_id: c.id,
+        window_start:     windowStart,
+        window_end:       windowEnd,
+      };
+    })
+    .filter(Boolean);
 
   // ── Missing data prompts ──────────────────────────────────────────────────
   const missingData = crops
@@ -2880,20 +2641,16 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     else                frostRisk = "low";
   }
 
-  // ── First action — fallback for users with no engine tasks ──────────────────
-  const firstAction = tasks.length === 0 ? getFirstActionForUser(crops) : null;
-
   res.json({
     user:             profile?.name,
     profile_photo:    profile?.photo_url || null,
     plan:             profile?.plan || "free",
     tasks: {
-      tasks:     tasks,
+      tasks:     tasks, // full list including overdue
       today:     tasks.filter(t => t.due_date <= today),
       this_week: tasks.filter(t => t.due_date > today && t.due_date <= weekEnd),
       coming_up: tasks.filter(t => t.due_date > weekEnd),
     },
-    first_action:     firstAction,
     crop_count:       crops.length,
     crops_with_flags: crops.filter(c => c.missed_task_note).map(c => ({ id: c.id, name: c.name, missed_task_note: c.missed_task_note })),
     harvest_forecast: harvestForecast,
@@ -2912,127 +2669,8 @@ app.get("/dashboard", requireAuth, async (req, res) => {
 });
 
 // =============================================================================
-// FIRST ACTION — guarantees new users always have something to do
-// getFirstActionForUser() returns one crop-aware fallback action.
-// Used by /dashboard (injected when engine returns 0 tasks) and /first-action.
+// TASK EXPIRY — expire tasks whose window has passed, flag crop with red dot
 // =============================================================================
-
-function getFirstActionForUser(crops) {
-  if (!crops?.length) {
-    return {
-      id:        "fallback_no_crops",
-      action:    "Check in on your garden — add your first crop to get a personalised plan",
-      task_type: "monitor",
-      urgency:   "low",
-      is_fallback: true,
-      source_key: "first_action_no_crops",
-    };
-  }
-
-  // Pick the most relevant crop — prefer one with a sow date, then first active
-  const crop = crops.find(c => c.sown_date) || crops[0];
-  const cropName = crop.name || "your crop";
-  const stage    = crop.stage || "seed";
-  const sowDate  = crop.sown_date;
-
-  // Days since sown — used to pick the most relevant check
-  const daysSown = sowDate
-    ? Math.floor((Date.now() - new Date(sowDate).getTime()) / 86400000)
-    : null;
-
-  let action, promptType;
-
-  if (stage === "seed" || stage === "seedling" || !sowDate) {
-    if (daysSown !== null && daysSown >= 3 && daysSown <= 21) {
-      action    = `Check ${cropName} — any signs of germination yet?`;
-      promptType = "germination_check";
-    } else {
-      action    = `Check ${cropName} — does the soil feel moist?`;
-      promptType = "moisture_check";
-    }
-  } else if (stage === "vegetative") {
-    action    = `Check ${cropName} — looking healthy? Any pests or yellowing?`;
-    promptType = "health_check";
-  } else if (stage === "flowering" || stage === "fruiting") {
-    action    = `Check ${cropName} — flowers or fruit developing well?`;
-    promptType = "growth_check";
-  } else if (stage === "harvesting") {
-    action    = `Check ${cropName} — is it ready to harvest?`;
-    promptType = "harvest_check";
-  } else {
-    action    = `Check ${cropName} — how is it looking today?`;
-    promptType = "general_check";
-  }
-
-  return {
-    id:           `fallback_${crop.id}_${promptType}`,
-    crop_id:      crop.id,
-    crop_name:    cropName,
-    action,
-    task_type:    "monitor",
-    urgency:      "low",
-    is_fallback:  true,
-    prompt_type:  promptType,
-    source_key:   `first_action_${crop.id}_${promptType}`,
-  };
-}
-
-// GET /first-action — returns the one fallback action for this user
-app.get("/first-action", requireAuth, async (req, res) => {
-  const userId = req.user.id;
-  try {
-    // Check if user has any real incomplete tasks first
-    const { data: realTasks } = await req.db.from("tasks")
-      .select("id").eq("user_id", userId).is("completed_at", null)
-      .not("status", "eq", "expired").limit(1);
-
-    if (realTasks?.length) {
-      return res.json({ has_real_tasks: true, first_action: null });
-    }
-
-    // No real tasks — get crops to build fallback
-    const { data: crops } = await req.db.from("crop_instances")
-      .select("id, name, stage, sown_date, status")
-      .eq("user_id", userId).eq("active", true);
-
-    const firstAction = getFirstActionForUser(crops);
-    res.json({ has_real_tasks: false, first_action: firstAction });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// POST /first-action/complete — logs completion, optionally confirms crop stage
-app.post("/first-action/complete", requireAuth, async (req, res) => {
-  const userId = req.user.id;
-  const { source_key, crop_id, prompt_type } = req.body;
-  try {
-    // Log to funnel_events (best effort — don't fail if table doesn't exist)
-    try {
-      await supabaseService.from("funnel_events").insert({
-        user_id:    userId,
-        event_type: "first_action_completed",
-        meta:       JSON.stringify({ source_key, crop_id, prompt_type }),
-        created_at: new Date().toISOString(),
-      });
-    } catch(e) {
-      console.log("[FirstAction] funnel_events log skipped:", e.message);
-    }
-
-    // If crop_id provided, set stage_confidence = confirmed (lightweight write-back)
-    if (crop_id) {
-      await supabaseService.from("crop_instances")
-        .update({ stage_confidence: "confirmed", updated_at: new Date().toISOString() })
-        .eq("id", crop_id).eq("user_id", userId);
-    }
-
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-
 
 async function expireOverdueTasks(userId, db) {
   const today = todayISO();
@@ -3436,21 +3074,10 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
       };
     });
 
-    const { error: cropErr } = await supabaseService.from("crop_instances").insert(cropInserts);
-    if (cropErr) throw new Error("Crops: " + cropErr.message);
+    await supabaseService.from("crop_instances").insert(cropInserts);
 
     // 6. Run rule engine
     const tasks = await runRuleEngine(userId);
-
-    // ── Safety checks — alert in logs if crops or tasks are missing ───────────
-    const { count: cropCount } = await supabaseService
-      .from("crop_instances").select("*", { count: "exact", head: true }).eq("user_id", userId);
-    if (!cropCount || cropCount === 0) {
-      console.error(`[Onboarding][ALERT] User ${userId} has 0 crops after onboarding — crop insert may have failed`);
-    }
-    if (!tasks?.length) {
-      console.error(`[Onboarding][ALERT] User ${userId} has 0 tasks after onboarding (crops: ${cropCount})`);
-    }
 
     // 7. Fallback — if engine generated nothing, insert starter tasks
     if (!tasks?.length) {
@@ -3479,13 +3106,93 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
 
 // =============================================================================
 // POST /admin/onboarding-recovery-email
-// Sends recovery email to ALL users with profiles but no crops.
-// Safe to run multiple times — skips anyone already sent.
+// One-shot: finds last 50 signups with no crops (unactivated due to bug),
+// skips anyone already sent this email, sends recovery email via Resend.
 // =============================================================================
 app.post("/admin/onboarding-recovery-email", requireAuth, requireAdmin, async (req, res) => {
   try {
-    const result = await runOnboardingRecovery(supabaseService);
-    res.json({ ok: true, ...result });
+    // Get last 50 auth users by signup date
+    const { data: { users: allUsers } } = await supabaseService.auth.admin.listUsers({ perPage: 50, page: 1 });
+    const recent = (allUsers || [])
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+      .slice(0, 50);
+
+    // Find which have no crop_instances (unactivated)
+    const userIds = recent.map(u => u.id);
+    const { data: activatedCrops } = await supabaseService.from("crop_instances")
+      .select("user_id").in("user_id", userIds);
+    const activatedIds = new Set((activatedCrops || []).map(c => c.user_id));
+    const unactivated = recent.filter(u => !activatedIds.has(u.id));
+
+    // Skip anyone already sent this recovery email
+    const { data: alreadySent } = await supabaseService.from("email_log")
+      .select("user_id").eq("email_type", "onboarding_recovery").in("user_id", userIds);
+    const alreadySentIds = new Set((alreadySent || []).map(e => e.user_id));
+    const toEmail = unactivated.filter(u => !alreadySentIds.has(u.id) && u.email);
+
+    const results = [];
+    for (const user of toEmail) {
+      try {
+        const resp = await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer \${process.env.RESEND_API_KEY}`,
+          },
+          body: JSON.stringify({
+            from: "Vercro <hello@vercro.com>",
+            to: user.email,
+            subject: "Your Vercro garden plan is ready 🌱",
+            html: `
+              <div style="font-family: Georgia, serif; max-width: 520px; margin: 0 auto; padding: 40px 24px; color: #1A2E28;">
+                <div style="font-size: 28px; margin-bottom: 8px;">🌱</div>
+                <h1 style="font-size: 24px; font-weight: 900; margin: 0 0 16px; color: #2F5D50;">
+                  Sorry — we had a setup issue
+                </h1>
+                <p style="font-size: 16px; line-height: 1.6; margin: 0 0 16px; color: #444;">
+                  When you signed up for Vercro, a technical issue meant we couldn't finish setting up your garden plan. That's now fixed.
+                </p>
+                <p style="font-size: 16px; line-height: 1.6; margin: 0 0 24px; color: #444;">
+                  It takes under 60 seconds to complete — and once you do, you'll have a personalised daily task plan waiting for you based on exactly what you're growing.
+                </p>
+                <a href="https://app.vercro.com" style="display: inline-block; background: #2F5D50; color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 10px; font-size: 16px; font-weight: 700; margin-bottom: 32px;">
+                  Complete my garden setup →
+                </a>
+                <p style="font-size: 14px; color: #888; line-height: 1.6; margin: 0;">
+                  If you have any questions just reply to this email.<br>
+                  — The Vercro team
+                </p>
+                <hr style="border: none; border-top: 1px solid #eee; margin: 32px 0;" />
+                <p style="font-size: 12px; color: #aaa;">vercro.com · Built for UK growers</p>
+              </div>
+            `,
+          }),
+        });
+
+        if (resp.ok) {
+          // Log so we never send twice
+          await supabaseService.from("email_log").insert({
+            user_id:    user.id,
+            email_type: "onboarding_recovery",
+            sent_at:    new Date().toISOString(),
+          });
+          results.push({ email: user.email, status: "sent" });
+        } else {
+          const err = await resp.json();
+          results.push({ email: user.email, status: "failed", error: err });
+        }
+      } catch (e) {
+        results.push({ email: user.email, status: "error", error: e.message });
+      }
+    }
+
+    res.json({
+      total_recent:    recent.length,
+      unactivated:     unactivated.length,
+      already_sent:    alreadySentIds.size,
+      emails_sent:     results.filter(r => r.status === "sent").length,
+      results,
+    });
   } catch (err) {
     console.error("[OnboardingRecovery]", err.message);
     res.status(500).json({ error: err.message });
@@ -3629,10 +3336,10 @@ app.post("/demo/reset", requireAuth, async (req, res) => {
 });
 // =============================================================================
 app.post("/crops/:id/observe", requireAuth, async (req, res) => {
-  const { observation_type, symptom_code, severity, notes, confirmed_stage } = req.body;
+  const { observation_type, symptom_code, severity, notes, confirmed_stage, timeline_offset_days } = req.body;
   if (!observation_type) return res.status(400).json({ error: "observation_type required" });
   const { data: crop, error: cropErr } = await req.db.from("crop_instances")
-    .select("id, name, status, stage, crop_def_id")
+    .select("id, name, status, stage, crop_def_id, sown_date, stage")
     .eq("id", req.params.id).eq("user_id", req.user.id).single();
   if (cropErr || !crop) return res.status(404).json({ error: "Crop not found" });
   const { data: obs, error: obsErr } = await req.db.from("observation_logs").insert({
@@ -3652,6 +3359,13 @@ app.post("/crops/:id/observe", requireAuth, async (req, res) => {
   if (symptom_code === "transplant_done") { updates.status = "transplanted"; updates.transplant_date = new Date().toISOString().split("T")[0]; engineActions.push("transplant_done"); }
   if (symptom_code === "plant_struggling") { updates.missed_task_note = "Plant reported as struggling — check growing conditions"; engineActions.push("struggling_flagged"); }
   if (symptom_code === "looks_healthy") { updates.missed_task_note = null; engineActions.push("health_confirmed"); }
+
+  // Apply timeline offset if provided (signed integer: positive = behind, negative = ahead)
+  if (typeof timeline_offset_days === "number") {
+    updates.timeline_offset_days = timeline_offset_days;
+    engineActions.push("timeline_offset_applied");
+  }
+
   if (Object.keys(updates).length > 0) { updates.updated_at = new Date().toISOString(); await req.db.from("crop_instances").update(updates).eq("id", req.params.id).eq("user_id", req.user.id); }
   await runRuleEngine(req.user.id);
   res.json({ observation: obs, crop_updated: Object.keys(updates).length > 0, engine_actions: engineActions });
@@ -3663,6 +3377,67 @@ app.get("/crops/:id/observations", requireAuth, async (req, res) => {
     .order("observed_at", { ascending: false }).limit(20);
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
+});
+
+// POST /crops/:id/log-action — log a manual action (watered, fed, pruned, weeded, note)
+// Updates relevant crop fields, writes observation, recalculates schedule
+app.post("/crops/:id/log-action", requireAuth, async (req, res) => {
+  const { action_type, notes } = req.body;
+  // action_type: "watered" | "fed" | "pruned" | "weeded" | "note"
+  if (!action_type) return res.status(400).json({ error: "action_type required" });
+
+  const { data: crop, error: cropErr } = await req.db.from("crop_instances")
+    .select("id, name, area_id, last_watered_at, last_fed_at, crop_def_id")
+    .eq("id", req.params.id).eq("user_id", req.user.id).single();
+  if (cropErr || !crop) return res.status(404).json({ error: "Crop not found" });
+
+  const now = new Date().toISOString();
+  const today = now.split("T")[0];
+
+  // Log the observation
+  await req.db.from("observation_logs").insert({
+    user_id:          req.user.id,
+    crop_id:          req.params.id,
+    observed_at:      today,
+    observation_type: action_type,
+    notes:            notes || null,
+  });
+
+  const updates = { updated_at: now };
+  let nextActionHint = null;
+
+  if (action_type === "watered") {
+    // Update last_watered_at on the crop and all crops in the same area
+    updates.last_watered_at = now;
+    if (crop.area_id) {
+      await supabaseService.from("crop_instances")
+        .update({ last_watered_at: now, updated_at: now })
+        .eq("area_id", crop.area_id).eq("user_id", req.user.id);
+    }
+    nextActionHint = "Next watering check in a few days";
+  } else if (action_type === "fed") {
+    updates.last_fed_at = now;
+    // Get feed interval from crop def to give a useful hint
+    const { data: def } = await supabaseService.from("crop_definitions")
+      .select("feed_interval_days").eq("id", crop.crop_def_id).single();
+    const interval = def?.feed_interval_days || 14;
+    nextActionHint = `Next feed in about ${interval} days`;
+  } else if (action_type === "pruned") {
+    nextActionHint = "Pruning logged — growth should improve over the next few days";
+  } else if (action_type === "weeded") {
+    nextActionHint = "Weeding logged";
+  } else if (action_type === "note") {
+    nextActionHint = "Note saved";
+  }
+
+  await req.db.from("crop_instances").update(updates).eq("id", req.params.id).eq("user_id", req.user.id);
+
+  // Recalculate tasks so watered/fed timings reset from today
+  if (action_type === "watered" || action_type === "fed") {
+    await runRuleEngine(req.user.id);
+  }
+
+  res.json({ ok: true, action_type, next_action_hint: nextActionHint });
 });
 
 
@@ -3987,7 +3762,7 @@ app.post("/admin/backfill-badges", requireAuth, requireAdmin, async (req, res) =
     const today       = now.toISOString().split("T")[0];
     const yesterday   = new Date(Date.now()-86400000).toISOString().split("T")[0];
 
-    const users = await getAllAuthUsers();
+    const { data: { users } } = await supabaseService.auth.admin.listUsers({ perPage: 1000 });
     if (!users?.length) return res.json({ ok: true, processed: 0 });
 
     const [{ data: allTasks }, { data: allCrops }, { data: allLocations }, { data: allAreas }, { data: allHarvests }, { data: allPhotos }, { data: allBadges }] = await Promise.all([
@@ -4136,14 +3911,9 @@ app.post("/notifications/:id/opened", async (req, res) => {
 app.post("/cron/push-morning", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-
-  // Respond immediately so cron-job.org doesn't timeout
-  // Processing continues in background after response is sent
-  res.json({ ok: true, status: "processing" });
-
   try {
     const { data: profiles } = await supabaseService.from("profiles").select("id");
-    if (!profiles?.length) return;
+    if (!profiles?.length) return res.json({ processed: 0, sent: 0 });
     let sent = 0;
     for (const p of profiles) {
       try { const result = await runNotificationsForUser(supabaseService, p.id, "morning"); if (result.sent > 0) sent++; } catch(e) { captureError("PushMorning", e, { userId: p.id }); }
@@ -4152,25 +3922,23 @@ app.post("/cron/push-morning", async (req, res) => {
     // Email fallback — for users with no push token or push disabled
     const emailResult = await runDailyEmailFallback(supabaseService);
     console.log(`[EmailFallback] Sent: ${emailResult.sent}, Skipped: ${emailResult.skipped}`);
-  } catch(e) { captureError("PushMorning", e); }
+    res.json({ ok: true, processed: profiles.length, push_sent: sent, email_sent: emailResult.sent });
+  } catch(e) { captureError("PushMorning", e); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/cron/push-evening", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-
-  // Respond immediately so cron-job.org doesn't timeout
-  res.json({ ok: true, status: "processing" });
-
   try {
     const { data: profiles } = await supabaseService.from("profiles").select("id");
-    if (!profiles?.length) return;
+    if (!profiles?.length) return res.json({ processed: 0, sent: 0 });
     let sent = 0;
     for (const p of profiles) {
       try { const result = await runNotificationsForUser(supabaseService, p.id, "evening"); if (result.sent > 0) sent++; } catch(e) { captureError("PushEvening", e, { userId: p.id }); }
     }
     console.log(`[PushEvening] Sent to ${sent}/${profiles.length} users`);
-  } catch(e) { captureError("PushEvening", e); }
+    res.json({ ok: true, processed: profiles.length, sent });
+  } catch(e) { captureError("PushEvening", e); res.status(500).json({ error: e.message }); }
 });
 
 app.post("/notifications/test", requireAuth, requireAdmin, async (req, res) => {

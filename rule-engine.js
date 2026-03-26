@@ -156,11 +156,16 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = []) 
   const cropGroup      = def.category ?? null;
 
   // Date anchors
-  // If the user has manually confirmed a stage, we use stage_adjusted_sow_date
-  // as the effective sow anchor for harvest date and pct calculations.
-  // The original sown_date is never modified — null out stage_adjusted_sow_date to revert.
+  // timeline_offset_days (signed): positive = behind schedule, negative = ahead
+  // Applied as a shift to the effective sow date without modifying the real sow_date.
+  // stage_adjusted_sow_date is kept for backwards compatibility but timeline_offset_days takes precedence.
   const rawSowDate      = crop.sown_date         || crop.transplanted_date || null;
-  const sowDate         = crop.stage_adjusted_sow_date || rawSowDate;
+  const offsetDays      = crop.timeline_offset_days || 0;
+  // Positive offset = behind schedule = shift sowDate forward = harvest later
+  const adjustedSowDate = rawSowDate && offsetDays !== 0
+    ? (() => { const d = new Date(rawSowDate); d.setDate(d.getDate() + offsetDays); return d.toISOString().split("T")[0]; })()
+    : null;
+  const sowDate         = adjustedSowDate || crop.stage_adjusted_sow_date || rawSowDate;
   const transplantDate  = crop.transplanted_date  || crop.transplant_date  || null;
   const plantedOutDate  = crop.planted_out_date   || null;
   const lastFedAt       = crop.last_fed_at        || null;
