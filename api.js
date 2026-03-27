@@ -4205,11 +4205,19 @@ app.post("/cron/push-morning", async (req, res) => {
   try {
     const { data: profiles } = await supabaseService.from("profiles").select("id");
     if (!profiles?.length) return;
-    let sent = 0;
+    const counts = { sent: 0, push_disabled: 0, no_valid_token: 0, already_sent: 0, failed: 0, other: 0 };
     for (const p of profiles) {
-      try { const result = await runNotificationsForUser(supabaseService, p.id, "morning"); if (result.sent > 0) sent++; } catch(e) { captureError("PushMorning", e, { userId: p.id }); }
+      try {
+        const result = await runNotificationsForUser(supabaseService, p.id, "morning");
+        if (result.sent > 0) counts.sent++;
+        else if (result.reason === "push_disabled")   counts.push_disabled++;
+        else if (result.reason === "no_valid_token")  counts.no_valid_token++;
+        else if (result.reason?.includes("already_sent")) counts.already_sent++;
+        else if (result.reason === "vapid_not_configured") counts.other++;
+        else counts.other++;
+      } catch(e) { captureError("PushMorning", e, { userId: p.id }); counts.failed++; }
     }
-    console.log(`[PushMorning] Sent to ${sent}/${profiles.length} users`);
+    console.log(`[PushMorning] Total=${profiles.length} Sent=${counts.sent} Disabled=${counts.push_disabled} NoToken=${counts.no_valid_token} AlreadySent=${counts.already_sent} Failed=${counts.failed} Other=${counts.other}`);
     const emailResult = await runDailyEmailFallback(supabaseService);
     console.log(`[EmailFallback] Sent: ${emailResult.sent}, Skipped: ${emailResult.skipped}`);
   } catch(e) { captureError("PushMorning", e); }
@@ -4222,11 +4230,18 @@ app.post("/cron/push-evening", async (req, res) => {
   try {
     const { data: profiles } = await supabaseService.from("profiles").select("id");
     if (!profiles?.length) return;
-    let sent = 0;
+    const counts = { sent: 0, push_disabled: 0, no_valid_token: 0, already_sent: 0, failed: 0, other: 0 };
     for (const p of profiles) {
-      try { const result = await runNotificationsForUser(supabaseService, p.id, "evening"); if (result.sent > 0) sent++; } catch(e) { captureError("PushEvening", e, { userId: p.id }); }
+      try {
+        const result = await runNotificationsForUser(supabaseService, p.id, "evening");
+        if (result.sent > 0) counts.sent++;
+        else if (result.reason === "push_disabled")   counts.push_disabled++;
+        else if (result.reason === "no_valid_token")  counts.no_valid_token++;
+        else if (result.reason?.includes("already_sent")) counts.already_sent++;
+        else counts.other++;
+      } catch(e) { captureError("PushEvening", e, { userId: p.id }); counts.failed++; }
     }
-    console.log(`[PushEvening] Sent to ${sent}/${profiles.length} users`);
+    console.log(`[PushEvening] Total=${profiles.length} Sent=${counts.sent} Disabled=${counts.push_disabled} NoToken=${counts.no_valid_token} AlreadySent=${counts.already_sent} Failed=${counts.failed} Other=${counts.other}`);
   } catch(e) { captureError("PushEvening", e); }
 });
 

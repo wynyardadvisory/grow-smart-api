@@ -44,8 +44,8 @@ async function didSendInWindow(supabase, userId, window) {
     .from("notification_events")
     .select("id")
     .eq("user_id", userId)
-    .eq("status", "sent")
-    .gte("sent_at", windowStart)
+    .in("status", ["sent", "queued"]) // queued = send attempted, counts as sent for dedup
+    .gte("created_at", windowStart)
     .limit(1)
     .maybeSingle();
   return !!data;
@@ -333,10 +333,17 @@ async function sendNotification(supabase, userId, candidate) {
     }
   }
 
-  if (sentCount > 0 && eventId) {
-    await supabase.from("notification_events")
-      .update({ status: "sent", sent_at: new Date().toISOString() })
-      .eq("id", eventId);
+  if (eventId) {
+    if (sentCount > 0) {
+      await supabase.from("notification_events")
+        .update({ status: "sent", sent_at: new Date().toISOString() })
+        .eq("id", eventId);
+    } else {
+      // Mark as failed so dedup still fires and we don't retry endlessly
+      await supabase.from("notification_events")
+        .update({ status: "failed" })
+        .eq("id", eventId);
+    }
   }
 
   return { sent: sentCount > 0, sentCount, eventId };
@@ -346,19 +353,24 @@ async function sendNotification(supabase, userId, candidate) {
 async function runNotificationsForUser(supabase, userId, window = "morning") {
   if (!setupVapid()) return { sent: 0, reason: "vapid_not_configured" };
 
-  // Check push preference
-  const { data: prefs } = await supabase
-    .from("notification_preferences")
-    .select("push_enabled")
-    .eq("user_id", userId)
-    .single();
+  const isAdmin = ADMIN_USER_IDS.has(userId);
 
-  if (!prefs?.push_enabled) {
-    console.log(`[Push] Skipping ${userId}: push_disabled`);
-    return { sent: 0, reason: "push_disabled" };
+  // Check push preference
+  // Admins bypass this — useful when testing with push_enabled toggled off
+  if (!isAdmin) {
+    const { data: prefs } = await supabase
+      .from("notification_preferences")
+      .select("push_enabled")
+      .eq("user_id", userId)
+      .single();
+
+    if (!prefs?.push_enabled) {
+      return { sent: 0, reason: "push_disabled" };
+    }
   }
 
-  // Check valid token exists
+  // Check valid token exists — admins must still have a token
+  // (no point sending if there's nothing to send to)
   const { data: tokens } = await supabase
     .from("device_push_tokens")
     .select("id")
@@ -367,16 +379,17 @@ async function runNotificationsForUser(supabase, userId, window = "morning") {
     .limit(1);
 
   if (!tokens?.length) {
-    console.log(`[Push] Skipping ${userId}: no_valid_token`);
     return { sent: 0, reason: "no_valid_token" };
   }
 
-  // Prevent duplicate sends within the same window (if cron fires twice)
-  // NOTE: morning window check does NOT block evening — they use different window times
-  const alreadySentThisWindow = await didSendInWindow(supabase, userId, window);
-  if (alreadySentThisWindow) {
-    console.log(`[Push] Skipping ${userId}: already_sent_in_${window}_window`);
-    return { sent: 0, reason: `already_sent_in_${window}_window` };
+  // Window dedup — prevent double sends if cron fires twice in same window
+  // Admins bypass this deliberately so both morning + evening are always testable
+  // If the cron fires twice admins may get duplicates — that's acceptable for testing
+  if (!isAdmin) {
+    const alreadySentThisWindow = await didSendInWindow(supabase, userId, window);
+    if (alreadySentThisWindow) {
+      return { sent: 0, reason: `already_sent_in_${window}_window` };
+    }
   }
 
   // Build candidates — always returns at least 1 (fallback)
@@ -391,6 +404,9 @@ async function runNotificationsForUser(supabase, userId, window = "morning") {
 
   // Send
   const result = await sendNotification(supabase, userId, candidate);
+  if (isAdmin) {
+    console.log(`[Push] Admin send (${window}): ${candidate.notification_type} — "${candidate.title}" — sent=${result.sent}`);
+  }
   return { sent: result.sent ? 1 : 0, type: candidate.notification_type, ...result };
 }
 
