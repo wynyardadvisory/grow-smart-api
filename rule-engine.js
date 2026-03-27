@@ -168,7 +168,11 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = []) 
   const transplantDate  = crop.transplanted_date  || crop.transplant_date  || null;
   const plantedOutDate  = crop.planted_out_date   || null;
   const lastFedAt       = crop.last_fed_at        || null;
-  const lastWateredAt   = crop.last_watered_at    || null;
+  // Tiered watering: use most specific available timestamp (crop → area → location)
+  const lastWateredAt   = crop.last_watered_at
+    || crop.area?.last_watered_at
+    || crop.area?.location?.last_watered_at
+    || null;
 
   // Stage
   const daysSown = daysSince(sowDate);
@@ -1269,9 +1273,14 @@ class RuleEngine {
       const hasHighRiskCrop = areaCrops.some(c => ["flowering", "fruiting", "harvesting"].includes(c.stage));
       const DRY_DAY_THRESHOLD = hasHighRiskCrop && BASE_THRESHOLD > 1 ? BASE_THRESHOLD - 1 : BASE_THRESHOLD;
 
-      // Find the most recent watering signal across all crops in this area
-      // (either last_watered_at or today's rain)
+      // Find the most recent watering signal across all crops in this area,
+      // plus the area-level last_watered_at (from manual area-scope logs)
+      // Tiered: crop-level beats area-level beats location-level
       let lastWateredDate = null;
+      // Check area-level timestamp first as a baseline
+      const areaWateredAt = areaCrops[0]?.area?.last_watered_at;
+      if (areaWateredAt) lastWateredDate = areaWateredAt.split("T")[0];
+      // Any crop-level timestamp overrides if more recent
       for (const crop of areaCrops) {
         const lw = crop.last_watered_at ? crop.last_watered_at.split("T")[0] : null;
         if (lw && (!lastWateredDate || lw > lastWateredDate)) lastWateredDate = lw;
@@ -1462,7 +1471,9 @@ class RuleEngine {
       .from("crop_instances")
       .select(`
         *,
-        area:area_id ( type, location_id, name ),
+        area:area_id ( type, location_id, name, last_watered_at,
+          location:location_id ( last_watered_at )
+        ),
         crop_def:crop_def_id (
           id, is_perennial, frost_sensitive, sow_method, category,
           days_to_maturity_min, days_to_maturity_max,
