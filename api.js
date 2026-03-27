@@ -2002,10 +2002,10 @@ app.get("/barcode/:code", requireAuth, async (req, res) => {
 });
 
 async function enrichBarcodeWithClaude(productName, brand, mode, barcode) {
+  const brandStr = brand || "";
   const prompt = mode === "crop"
-    ? `A UK gardener scanned a barcode. Product: "${productName}"${brand ? ` by ${brand}` : ""}. \nIs this a seed packet? If yes, identify the crop and variety. If it is NOT a seed packet, say so.\nIMPORTANT: Return only the canonical crop name — do not include planting method in the name (e.g. return "Onion" not "Onion Sets", return "Potato" not "Potato Tubers").\nRespond ONLY with JSON: {"is_seed":true,"name":"Carrot","variety":"Nantes 2","description":"Brief growing note","sow_window":"Mar - Jun","brand":"${brand||""}"}`
-    : `A UK gardener scanned a barcode. Product: "${productName}"${brand ? ` by ${brand}` : ""}.\nIs this a garden feed or fertiliser? If yes, identify it. If NOT, say so.\nRespond ONLY with JSON: {"is_feed":true,"name":"Product name","brand":"${brand||}","product_name":"${productName}","form":"liquid","feed_type":"tomato","npk":"4-3-8","description":"Brief description"}`;
-
+    ? `A UK gardener scanned a barcode. Product: "${productName}"${brand ? ` by ${brand}` : ""}. \nIs this a seed packet? If yes, identify the crop and variety. If it is NOT a seed packet, say so.\nIMPORTANT: Return only the canonical crop name — do not include planting method in the name (e.g. return "Onion" not "Onion Sets", return "Potato" not "Potato Tubers").\nRespond ONLY with JSON: {"is_seed":true,"name":"Carrot","variety":"Nantes 2","description":"Brief growing note","sow_window":"Mar - Jun","brand":"${brandStr}"}`
+    : `A UK gardener scanned a barcode. Product: "${productName}"${brand ? ` by ${brand}` : ""}.\nIs this a garden feed or fertiliser? If yes, identify it. If NOT, say so.\nRespond ONLY with JSON: {"is_feed":true,"name":"Product name","brand":"${brandStr}","product_name":"${productName}","form":"liquid","feed_type":"tomato","npk":"4-3-8","description":"Brief description"}`;
   const r = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
