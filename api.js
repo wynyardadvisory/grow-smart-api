@@ -47,7 +47,7 @@ function captureError(context, err, extra = {}) {
 
 const { RuleEngine } = require("./rule-engine");
 const { applyBlockedPeriodAdjustments, reapplyAllBlockedPeriods } = require("./blocked-period-adjustment");
-const { runNotificationsForUser } = require("./notifications");
+const { runNotificationsForUser, sendBulkNotifications } = require("./notifications");
 const { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement, runDailyEmailFallback } = require("./emails");
 
 // ── Supabase (service role — server only) ─────────────────────────────────────
@@ -4345,21 +4345,21 @@ app.post("/notifications/:id/opened", async (req, res) => {
 });
 
 // ── Shared bulk pre-fetch — used by both push cron handlers ──────────────────
-// Instead of hitting the DB per user (1,100 users × 3+ queries = 3,300+ queries),
-// we fetch everything we need in 3 bulk queries upfront, then filter in memory.
-// This drops execution from 60+ seconds to ~3 seconds regardless of user count.
+// 3 bulk queries upfront replace thousands of per-user queries.
+// Returns eligible user IDs, their tokens, and all their relevant tasks.
 async function buildEligibleUserSet(window) {
-  const db = supabaseService;
+  const db  = supabaseService;
+  const today   = new Date().toISOString().split("T")[0];
+  const in3days = new Date(Date.now() + 3 * 86400000).toISOString().split("T")[0];
 
-  // 1. All users with an active push token (one query, all users)
+  // Query 1: all active push tokens
   const { data: tokenRows } = await db
     .from("device_push_tokens")
     .select("user_id, push_token, endpoint")
     .eq("is_active", true);
 
-  if (!tokenRows?.length) return { eligible: [], counts: { no_valid_token: 0 }, tokenMap: {} };
+  if (!tokenRows?.length) return { eligible: [], counts: { total_with_token: 0 }, tokenMap: {}, tasksByUser: new Map() };
 
-  // Build map: user_id → [tokens]
   const tokenMap = {};
   for (const row of tokenRows) {
     if (!tokenMap[row.user_id]) tokenMap[row.user_id] = [];
@@ -4367,75 +4367,82 @@ async function buildEligibleUserSet(window) {
   }
   const usersWithTokens = Object.keys(tokenMap);
 
-  // 2. All push preferences for users with tokens (one query)
+  // Query 2: push preferences for all token holders
   const { data: prefRows } = await db
     .from("notification_preferences")
     .select("user_id, push_enabled")
     .in("user_id", usersWithTokens);
-
   const prefMap = {};
   for (const row of prefRows || []) prefMap[row.user_id] = row.push_enabled;
 
-  // 3. All users who already received a push in this window today (one query)
-  const { buildCandidates: _bc, ...notifModule } = require("./notifications");
+  // Query 3: already-sent-today dedup
   const windowStart = window === "morning"
     ? new Date().toISOString().split("T")[0] + "T05:00:00.000Z"
     : new Date().toISOString().split("T")[0] + "T15:00:00.000Z";
-
   const { data: sentRows } = await db
     .from("notification_events")
     .select("user_id")
     .in("status", ["sent", "queued"])
     .gte("created_at", windowStart)
     .in("user_id", usersWithTokens);
-
   const alreadySentSet = new Set((sentRows || []).map(r => r.user_id));
 
-  // Admin IDs always bypass dedup and preference checks
   const ADMIN_IDS = new Set(["c1c730ff-acb2-4969-9c74-32a84041d9b3"]);
 
-  // Filter down to eligible users
+  // Filter to eligible users
   const counts = { total_with_token: usersWithTokens.length, push_disabled: 0, already_sent: 0, eligible: 0 };
   const eligible = [];
-
   for (const userId of usersWithTokens) {
     const isAdmin = ADMIN_IDS.has(userId);
-    if (!isAdmin && !prefMap[userId]) { counts.push_disabled++; continue; }
-    if (!isAdmin && alreadySentSet.has(userId)) { counts.already_sent++; continue; }
+    if (!isAdmin && !prefMap[userId])          { counts.push_disabled++; continue; }
+    if (!isAdmin && alreadySentSet.has(userId)) { counts.already_sent++;  continue; }
     eligible.push(userId);
     counts.eligible++;
   }
 
-  return { eligible, counts, tokenMap };
+  if (!eligible.length) return { eligible: [], counts, tokenMap, tasksByUser: new Map() };
+
+  // Query 4: all relevant tasks for eligible users in one go
+  // Fetch enough to cover all priority levels for both morning and evening.
+  // Supabase default row limit is 1000 — use range to get all rows.
+  const tasksByUser = new Map();
+  let taskOffset = 0;
+  const TASK_BATCH = 1000;
+  while (true) {
+    const { data: taskBatch } = await db
+      .from("tasks")
+      .select("id, user_id, task_type, record_type, rule_id, urgency, status, due_date, completed_at, action, crop:crop_instance_id(name)")
+      .in("user_id", eligible)
+      .is("completed_at", null)
+      .not("status", "eq", "expired")
+      .lte("due_date", in3days)
+      .range(taskOffset, taskOffset + TASK_BATCH - 1);
+
+    for (const task of taskBatch || []) {
+      if (!tasksByUser.has(task.user_id)) tasksByUser.set(task.user_id, []);
+      tasksByUser.get(task.user_id).push(task);
+    }
+
+    if (!taskBatch || taskBatch.length < TASK_BATCH) break;
+    taskOffset += TASK_BATCH;
+  }
+
+  return { eligible, counts, tokenMap, tasksByUser };
 }
 
 app.post("/cron/push-morning", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-  // Respond immediately — Vercel kills background work after response on some plans.
-  // All heavy lifting happens before this response via the bulk pre-fetch below.
   res.json({ ok: true, status: "processing" });
   try {
-    const { eligible, counts: preCounts, tokenMap } = await buildEligibleUserSet("morning");
+    const { eligible, counts: preCounts, tokenMap, tasksByUser } = await buildEligibleUserSet("morning");
     console.log(`[PushMorning] Pre-filter: ${JSON.stringify(preCounts)}`);
-
     if (!eligible.length) {
       console.log("[PushMorning] No eligible users — done.");
-      const emailResult = await runDailyEmailFallback(supabaseService);
-      console.log(`[EmailFallback] Sent: ${emailResult.sent}, Skipped: ${emailResult.skipped}`);
-      return;
+    } else {
+      const counts = await sendBulkNotifications(supabaseService, eligible, "morning", tokenMap, tasksByUser);
+      console.log(`[PushMorning] Eligible=${eligible.length} Sent=${counts.sent} Failed=${counts.failed} Other=${counts.no_candidate}`);
     }
-
-    const counts = { sent: 0, failed: 0, other: 0 };
-    for (const userId of eligible) {
-      try {
-        const result = await runNotificationsForUser(supabaseService, userId, "morning");
-        if (result.sent > 0) counts.sent++;
-        else counts.other++;
-      } catch(e) { captureError("PushMorning", e, { userId }); counts.failed++; }
-    }
-    console.log(`[PushMorning] Eligible=${eligible.length} Sent=${counts.sent} Failed=${counts.failed} Other=${counts.other}`);
-
     const emailResult = await runDailyEmailFallback(supabaseService);
     console.log(`[EmailFallback] Sent: ${emailResult.sent}, Skipped: ${emailResult.skipped}`);
   } catch(e) { captureError("PushMorning", e); }
@@ -4446,36 +4453,27 @@ app.post("/cron/push-evening", async (req, res) => {
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
   res.json({ ok: true, status: "processing" });
   try {
-    const { eligible, counts: preCounts } = await buildEligibleUserSet("evening");
+    const { eligible, counts: preCounts, tokenMap, tasksByUser } = await buildEligibleUserSet("evening");
     console.log(`[PushEvening] Pre-filter: ${JSON.stringify(preCounts)}`);
-
     if (!eligible.length) {
       console.log("[PushEvening] No eligible users — done.");
-      return;
+    } else {
+      const counts = await sendBulkNotifications(supabaseService, eligible, "evening", tokenMap, tasksByUser);
+      console.log(`[PushEvening] Eligible=${eligible.length} Sent=${counts.sent} Failed=${counts.failed} Other=${counts.no_candidate}`);
     }
-
-    const counts = { sent: 0, failed: 0, other: 0 };
-    for (const userId of eligible) {
-      try {
-        const result = await runNotificationsForUser(supabaseService, userId, "evening");
-        if (result.sent > 0) counts.sent++;
-        else counts.other++;
-      } catch(e) { captureError("PushEvening", e, { userId }); counts.failed++; }
-    }
-    console.log(`[PushEvening] Eligible=${eligible.length} Sent=${counts.sent} Failed=${counts.failed} Other=${counts.other}`);
   } catch(e) { captureError("PushEvening", e); }
 });
 
-// POST /cron/push-dry-run — run pre-filter logic without sending anything.
-// Use this to verify the fix is working before relying on the real cron.
-// Returns how many users would receive a push and why others are excluded.
+// POST /cron/push-dry-run — verify eligibility without sending anything
 app.post("/cron/push-dry-run", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
   try {
     const window = req.body?.window || "morning";
-    const { eligible, counts } = await buildEligibleUserSet(window);
-    res.json({ ok: true, window, would_send_to: eligible.length, breakdown: counts });
+    const { eligible, counts, tasksByUser } = await buildEligibleUserSet(window);
+    const usersWithTasks = [...tasksByUser.keys()].length;
+    const totalTasks = [...tasksByUser.values()].reduce((n, arr) => n + arr.length, 0);
+    res.json({ ok: true, window, would_send_to: eligible.length, breakdown: counts, tasks_fetched: totalTasks, users_with_tasks: usersWithTasks });
   } catch(e) {
     captureError("PushDryRun", e);
     res.status(500).json({ error: e.message });
