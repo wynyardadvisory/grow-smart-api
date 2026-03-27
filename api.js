@@ -435,6 +435,7 @@ app.get("/crop-definitions", async (_req, res) => {
   const { data, error } = await supabaseService.from("crop_definitions")
     .select("id, name, category, default_establishment, is_perennial, sow_indoors_start, sow_indoors_end, sow_direct_start, sow_direct_end, plant_out_start, plant_out_end, harvest_month_start, harvest_month_end, days_to_maturity_min, days_to_maturity_max, frost_sensitive, preferred_position, feed_type, feed_interval_days, companions, avoid, pest_notes, grower_notes")
     .eq("hidden", false)
+    .eq("is_legacy", false)
     .order("name");
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
@@ -473,6 +474,111 @@ app.get("/crop-definitions/:id/sow-advice", async (req, res) => {
 });
 
 // =============================================================================
+// CROP CANONICALISATION — shared naming layer
+// All entry points (manual add, scan, barcode, AI enrichment) must call these
+// before doing any crop lookup or creation. Stops messy duplicate definitions.
+// =============================================================================
+
+// Splits a raw crop label into a clean canonical name and an optional starting
+// form (seed / sets / plug / tuber etc). The starting form is NOT a variety —
+// it gets stored separately on crop_instances.starting_form.
+//
+// Examples:
+//   "Onion (sets)"   → { canonicalName: "Onion",  startingForm: "sets" }
+//   "Onion sets"     → { canonicalName: "Onion",  startingForm: "sets" }
+//   "Potato tubers"  → { canonicalName: "Potato", startingForm: "tuber" }
+//   "Carrot"         → { canonicalName: "Carrot", startingForm: null }
+function canonicaliseCropName(rawName) {
+  if (!rawName) return { canonicalName: rawName, startingForm: null };
+
+  const METHODS = [
+    { pattern: /\(sets?\)/i,          form: "sets" },
+    { pattern: /\bsets?\b/i,           form: "sets" },
+    { pattern: /\(seed[s]?\)/i,        form: "seed" },
+    { pattern: /\bseed[s]?\b/i,        form: "seed" },
+    { pattern: /\(plug[s]?\)/i,        form: "plug" },
+    { pattern: /\bplug[s]?\b/i,        form: "plug" },
+    { pattern: /\(tubers?\)/i,         form: "tuber" },
+    { pattern: /\btubers?\b/i,         form: "tuber" },
+    { pattern: /\(crowns?\)/i,         form: "crown" },
+    { pattern: /\bcrowns?\b/i,         form: "crown" },
+    { pattern: /\(runners?\)/i,        form: "runner" },
+    { pattern: /\brunners?\b/i,        form: "runner" },
+    { pattern: /\(canes?\)/i,          form: "cane" },
+    { pattern: /\bcanes?\b/i,          form: "cane" },
+    { pattern: /\byoung\s*plants?\b/i, form: "young_plant" },
+  ];
+
+  let name = rawName.trim();
+  let startingForm = null;
+
+  for (const { pattern, form } of METHODS) {
+    if (pattern.test(name)) {
+      startingForm = form;
+      name = name.replace(pattern, "").replace(/[-–,]+$/, "").replace(/\s+/g, " ").trim();
+      break;
+    }
+  }
+
+  // Title-case the result
+  name = name
+    .split(" ")
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(" ");
+
+  return { canonicalName: name, startingForm };
+}
+
+// Looks up the canonical crop_definition for a given name.
+// Handles three cases:
+//   1. Exact match on a canonical (non-legacy) crop — return it
+//   2. Match on a legacy/alias crop — follow canonical_crop_def_id pointer
+//   3. Fuzzy match (strip trailing s, lowercase) — same logic as above
+// Returns null if genuinely new (caller should create via AI enrichment).
+async function resolveToCanonicalDef(name) {
+  if (!name) return null;
+  const db = supabaseService;
+
+  // 1. Exact case-insensitive match
+  const { data: exact } = await db.from("crop_definitions")
+    .select("id, name, canonical_crop_def_id, is_legacy")
+    .ilike("name", name)
+    .maybeSingle();
+
+  if (exact) {
+    if (exact.canonical_crop_def_id) {
+      // This is a legacy alias — follow pointer to canonical
+      const { data: canonical } = await db.from("crop_definitions")
+        .select("id, name").eq("id", exact.canonical_crop_def_id).single();
+      console.log(`[Canonical] "${name}" is legacy alias → resolved to "${canonical?.name}"`);
+      return canonical || null;
+    }
+    return exact;
+  }
+
+  // 2. Fuzzy match — strip trailing s, lowercase
+  const norm = (n) => n.toLowerCase().trim().replace(/s$/i, "");
+  const { data: allDefs } = await db.from("crop_definitions")
+    .select("id, name, canonical_crop_def_id, is_legacy");
+
+  const normTarget = norm(name);
+  const fuzzy = (allDefs || []).find(d => norm(d.name) === normTarget);
+
+  if (fuzzy) {
+    if (fuzzy.canonical_crop_def_id) {
+      const { data: canonical } = await db.from("crop_definitions")
+        .select("id, name").eq("id", fuzzy.canonical_crop_def_id).single();
+      console.log(`[Canonical] "${name}" fuzzy-matched legacy "${fuzzy.name}" → resolved to "${canonical?.name}"`);
+      return canonical || null;
+    }
+    console.log(`[Canonical] "${name}" fuzzy-matched "${fuzzy.name}" — using existing`);
+    return fuzzy;
+  }
+
+  return null; // Genuinely new crop
+}
+
+// =============================================================================
 // CROP ENRICHMENT — AI-powered background worker
 // Fires when a user submits an "other" crop or variety name.
 // Calls Claude to validate, correct spelling, and build full crop data.
@@ -482,12 +588,56 @@ app.get("/crop-definitions/:id/sow-advice", async (req, res) => {
 async function enrichCrop(cropInstanceId, submittedName, submittedVariety) {
   const db = supabaseService;
 
-  // Create a pending record immediately
+  // ── Step 1: canonicalise the submitted name ──────────────────────────────
+  const { canonicalName, startingForm } = canonicaliseCropName(submittedName);
+  console.log(`[Enrich] "${submittedName}" → canonical: "${canonicalName}", startingForm: ${startingForm}`);
+
+  // ── Step 2: save raw label immediately so it is never lost ───────────────
+  const rawLabelToSave = submittedName !== canonicalName ? submittedName : null;
+  if (rawLabelToSave || startingForm) {
+    await db.from("crop_instances").update({
+      ...(rawLabelToSave ? { raw_crop_label: rawLabelToSave } : {}),
+      ...(startingForm   ? { starting_form: startingForm }   : {}),
+    }).eq("id", cropInstanceId);
+  }
+
+  // ── Step 3: try to resolve to an existing canonical def before calling Claude
+  const existingDef = await resolveToCanonicalDef(canonicalName);
+  if (existingDef) {
+    console.log(`[Enrich] "${canonicalName}" resolved to existing def "${existingDef.name}" — skipping AI`);
+
+    // Still check if we need to handle the variety
+    if (submittedVariety) {
+      const { data: existingVar } = await db.from("varieties")
+        .select("id").eq("crop_def_id", existingDef.id).ilike("name", submittedVariety).maybeSingle();
+      const varietyId = existingVar?.id || null;
+
+      await db.from("crop_instances").update({
+        crop_def_id: existingDef.id,
+        name:        existingDef.name,
+        variety_id:  varietyId,
+        updated_at:  new Date().toISOString(),
+      }).eq("id", cropInstanceId);
+    } else {
+      await db.from("crop_instances").update({
+        crop_def_id: existingDef.id,
+        name:        existingDef.name,
+        updated_at:  new Date().toISOString(),
+      }).eq("id", cropInstanceId);
+    }
+
+    // Log as completed immediately (no pending_crops record needed)
+    console.log(`[Enrich] ✓ Fast-resolved "${submittedName}" → "${existingDef.name}" (no AI needed)`);
+    return;
+  }
+
+  // ── Step 4: genuinely unknown — call Claude ───────────────────────────────
+  // Create a pending record
   const { data: pending, error: pendingErr } = await db
     .from("pending_crops")
     .insert({
       crop_instance_id:  cropInstanceId,
-      submitted_name:    submittedName,
+      submitted_name:    canonicalName,   // use canonical name for the AI prompt
       submitted_variety: submittedVariety || null,
       status:            "processing",
     })
@@ -501,8 +651,10 @@ async function enrichCrop(cropInstanceId, submittedName, submittedVariety) {
   try {
     const prompt = `You are a horticultural expert for UK home growers and allotment holders.
 A user has added a crop to their garden with the following details:
-- Crop name: "${submittedName}"
+- Crop name: "${canonicalName}"
 - Variety: "${submittedVariety || "not specified"}"
+
+IMPORTANT NAMING RULE: If the crop name contains a planting method in brackets or as a suffix (e.g. "Onion (sets)", "Onion sets", "Potato tubers"), strip the method and return only the canonical crop name (e.g. "Onion", "Potato"). The method is NOT part of the crop name.
 
 Your task:
 1. Determine if this is a real, growable crop in the UK (vegetables, fruit, herbs). If it is nonsense, misspelled beyond recognition, or not a real crop, reject it.
@@ -604,38 +756,22 @@ Use null for any fields you don't have reliable data for. All month values are i
         rejection_reason: parsed.rejection_reason,
         resolved_at:      new Date().toISOString(),
       }).eq("id", pending.id);
-      console.log(`[Enrich] Rejected "${submittedName}": ${parsed.rejection_reason}`);
+      console.log(`[Enrich] Rejected "${canonicalName}": ${parsed.rejection_reason}`);
       return;
     }
 
     const cropData = parsed.crop;
     const varietyData = parsed.variety;
 
-    // ── Check if crop already exists — fuzzy match to prevent duplicates ────────
-    // Normalise: lowercase, strip trailing 's', strip leading/trailing spaces
-    const normaliseName = (n) => n.toLowerCase().trim().replace(/s$/i, '');
+    // ── Check if crop already exists — use canonical resolver ────────────────
+    // resolveToCanonicalDef handles exact match, legacy alias, and fuzzy match.
+    // Only create a new def if it returns null (genuinely new crop).
     let cropDefId;
+    const resolvedDef = await resolveToCanonicalDef(cropData.name);
+    if (resolvedDef) {
+      cropDefId = resolvedDef.id;
+      console.log(`[Enrich] Crop "${cropData.name}" resolved to existing def "${resolvedDef.name}"`);
 
-    // First try exact case-insensitive match
-    const { data: exactMatch } = await db.from("crop_definitions")
-      .select("id, name").ilike("name", cropData.name).eq("hidden", false).maybeSingle();
-
-    // Then try fuzzy: fetch all non-hidden definitions and compare normalised names
-    let existing = exactMatch;
-    if (!existing) {
-      const { data: allDefs } = await db.from("crop_definitions")
-        .select("id, name").eq("hidden", false);
-      const normNew = normaliseName(cropData.name);
-      const fuzzyMatch = (allDefs || []).find(d => normaliseName(d.name) === normNew);
-      if (fuzzyMatch) {
-        existing = fuzzyMatch;
-        console.log(`[Enrich] Fuzzy match "${cropData.name}" → "${fuzzyMatch.name}" — using existing`);
-      }
-    }
-
-    if (existing) {
-      cropDefId = existing.id;
-      console.log(`[Enrich] Crop "${cropData.name}" already exists — using existing`);
     } else {
       // Insert new crop definition
       const { data: newCrop, error: cropErr } = await db.from("crop_definitions").insert({
@@ -722,11 +858,13 @@ Use null for any fields you don't have reliable data for. All month values are i
 
     // ── Update the crop instance with the real linked records ─────────────────
     await db.from("crop_instances").update({
-      name:        cropData.name,   // corrected spelling
-      crop_def_id: cropDefId,
-      variety_id:  varietyId,
-      variety:     varietyData?.name || null,
-      updated_at:  new Date().toISOString(),
+      name:          cropData.name,   // corrected spelling
+      crop_def_id:   cropDefId,
+      variety_id:    varietyId,
+      variety:       varietyData?.name || null,
+      // starting_form was already written at the top; only set it here if not already present
+      ...(startingForm ? { starting_form: startingForm } : {}),
+      updated_at:    new Date().toISOString(),
     }).eq("id", cropInstanceId);
 
     // ── Mark pending as complete ──────────────────────────────────────────────
@@ -806,13 +944,30 @@ app.post("/crops", requireAuth,
   async (req, res) => {
     if (!validate(req, res)) return;
     const {
-      area_id, name, variety, variety_id, crop_def_id,
+      area_id, name: rawName, variety, variety_id, crop_def_id: submittedCropDefId,
       sown_date, transplanted_date, planted_out_date, transplant_date,
       establishment_method, quantity, notes,
       start_date_confidence, source, status,
       is_other_crop, is_other_variety,
       barcode,
+      starting_form: submittedStartingForm,
     } = req.body;
+
+    // ── Canonicalise the crop name before anything else ──────────────────────
+    const { canonicalName, startingForm: derivedStartingForm } = canonicaliseCropName(rawName);
+    const startingFormToSave = submittedStartingForm || derivedStartingForm || null;
+    const rawLabelToSave     = rawName !== canonicalName ? rawName : null;
+
+    // If no crop_def_id was supplied, try to pre-resolve to a canonical def.
+    // This prevents unnecessary enrichment calls for crops we already know.
+    let resolvedCropDefId = submittedCropDefId || null;
+    if (!resolvedCropDefId && is_other_crop) {
+      const resolved = await resolveToCanonicalDef(canonicalName);
+      if (resolved) {
+        resolvedCropDefId = resolved.id;
+        console.log(`[POST /crops] Pre-resolved "${rawName}" → "${resolved.name}" (${resolved.id})`);
+      }
+    }
 
     // Derive location_id from area
     const { data: area } = await req.db.from("growing_areas")
@@ -825,16 +980,18 @@ app.post("/crops", requireAuth,
       user_id:              req.user.id,
       location_id:          area?.location_id || null,
       area_id,
-      name,
+      name:                 canonicalName,
       variety:              variety || null,
       variety_id:           variety_id || null,
-      crop_def_id:          crop_def_id || null,
+      crop_def_id:          resolvedCropDefId,
       status:               derivedStatus,
       sown_date:            sown_date || null,
       transplanted_date:    transplanted_date || null,
       transplant_date:      transplant_date || null,
       planted_out_date:     planted_out_date || null,
       establishment_method: establishment_method || null,
+      starting_form:        startingFormToSave,
+      raw_crop_label:       rawLabelToSave,
       quantity:             quantity || 1,
       notes:                notes || null,
       photo_url:            null,
@@ -845,17 +1002,17 @@ app.post("/crops", requireAuth,
     if (error) return res.status(500).json({ error: error.message });
 
     // Save barcode against crop_def for instant future lookups
-    if (barcode && crop_def_id) {
+    if (barcode && resolvedCropDefId) {
       await req.db.from("crop_definitions")
-        .update({ barcode }).eq("id", crop_def_id);
+        .update({ barcode }).eq("id", resolvedCropDefId);
     }
 
     // Trigger enrichment if:
-    // - crop is unknown (no crop_def_id), OR
+    // - crop is unknown (no crop_def_id resolved), OR
     // - variety was typed as free text (variety present but no variety_id)
     const needsEnrichment = !data.crop_def_id || (!data.variety_id && data.variety);
     if (needsEnrichment) {
-      await enrichCrop(data.id, name, variety || null);
+      await enrichCrop(data.id, rawName, variety || null);
     }
 
     await runRuleEngine(req.user.id);
@@ -1735,15 +1892,31 @@ app.post("/barcode/scan-image", requireAuth, async (req, res) => {
     const parsed = JSON.parse(m[0]);
     if (!parsed.found) return res.json({ found: false });
 
-    // Store barcode against DB entry if identified
-    if (parsed.barcode) {
-      if (mode === "crop" && parsed.name) {
-        const { data: cropDef } = await supabaseService.from("crop_definitions").select("id").ilike("name", parsed.name).maybeSingle();
-        if (cropDef?.id) { await supabaseService.from("crop_definitions").update({ barcode: parsed.barcode }).eq("id", cropDef.id); parsed.crop_def_id = cropDef.id; }
-      } else if (mode === "feed" && parsed.product_name) {
-        const { data: feedEntry } = await supabaseService.from("feed_catalog").select("id").ilike("product_name", parsed.product_name).maybeSingle();
-        if (feedEntry?.id) await supabaseService.from("feed_catalog").update({ barcode: parsed.barcode }).eq("id", feedEntry.id);
+    // ── Canonicalise crop name and resolve to existing def ───────────────────
+    if (mode === "crop" && parsed.name) {
+      const { canonicalName, startingForm } = canonicaliseCropName(parsed.name);
+      parsed.raw_crop_label = parsed.name !== canonicalName ? parsed.name : null;
+      parsed.name           = canonicalName;
+      parsed.starting_form  = startingForm || null;
+
+      // Try to resolve to a canonical crop def
+      const resolved = await resolveToCanonicalDef(canonicalName);
+      if (resolved) {
+        parsed.crop_def_id = resolved.id;
+        parsed.name        = resolved.name;
+        console.log(`[ScanImage] "${parsed.raw_crop_label || canonicalName}" → resolved to "${resolved.name}"`);
+      } else if (parsed.barcode) {
+        // Unknown crop but has barcode — still store barcode against def if found later
+        const { data: cropDef } = await supabaseService.from("crop_definitions")
+          .select("id").ilike("name", canonicalName).maybeSingle();
+        if (cropDef?.id) {
+          await supabaseService.from("crop_definitions").update({ barcode: parsed.barcode }).eq("id", cropDef.id);
+          parsed.crop_def_id = cropDef.id;
+        }
       }
+    } else if (mode === "feed" && parsed.barcode && parsed.product_name) {
+      const { data: feedEntry } = await supabaseService.from("feed_catalog").select("id").ilike("product_name", parsed.product_name).maybeSingle();
+      if (feedEntry?.id) await supabaseService.from("feed_catalog").update({ barcode: parsed.barcode }).eq("id", feedEntry.id);
     }
 
     res.json(parsed);
@@ -1762,19 +1935,26 @@ app.get("/barcode/:code", requireAuth, async (req, res) => {
     if (mode === "crop") {
       const { data: existing } = await req.db
         .from("crop_definitions")
-        .select("id, name, description, sow_window_start, sow_window_end")
+        .select("id, name, description, sow_window_start, sow_window_end, canonical_crop_def_id, is_legacy")
         .eq("barcode", code)
         .single();
       if (existing) {
+        // If this matched a legacy def, resolve to canonical
+        let def = existing;
+        if (existing.canonical_crop_def_id) {
+          const { data: canonical } = await supabaseService.from("crop_definitions")
+            .select("id, name, description, sow_window_start, sow_window_end").eq("id", existing.canonical_crop_def_id).single();
+          if (canonical) def = canonical;
+        }
         const monthNames = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
         return res.json({
           found: true,
           source: "vercro",
-          crop_def_id: existing.id,
-          name: existing.name,
-          description: existing.description,
-          sow_window: existing.sow_window_start
-            ? `${monthNames[existing.sow_window_start-1]} – ${monthNames[existing.sow_window_end-1]}`
+          crop_def_id: def.id,
+          name: def.name,
+          description: def.description,
+          sow_window: def.sow_window_start
+            ? `${monthNames[def.sow_window_start-1]} – ${monthNames[def.sow_window_end-1]}`
             : null,
         });
       }
@@ -1823,12 +2003,8 @@ app.get("/barcode/:code", requireAuth, async (req, res) => {
 
 async function enrichBarcodeWithClaude(productName, brand, mode, barcode) {
   const prompt = mode === "crop"
-    ? `A UK gardener scanned a barcode. Product: "${productName}"${brand ? ` by ${brand}` : ""}. 
-Is this a seed packet? If yes, identify the crop and variety. If it is NOT a seed packet, say so.
-Respond ONLY with JSON: {"is_seed":true,"name":"Carrot","variety":"Nantes 2","description":"Brief growing note","sow_window":"Mar - Jun","brand":"${brand||""}"}`
-    : `A UK gardener scanned a barcode. Product: "${productName}"${brand ? ` by ${brand}` : ""}.
-Is this a garden feed or fertiliser? If yes, identify it. If NOT, say so.
-Respond ONLY with JSON: {"is_feed":true,"name":"Product name","brand":"${brand||""}","product_name":"${productName}","form":"liquid","feed_type":"tomato","npk":"4-3-8","description":"Brief description"}`;
+    ? `A UK gardener scanned a barcode. Product: "${productName}"${brand ? ` by ${brand}` : ""}. \nIs this a seed packet? If yes, identify the crop and variety. If it is NOT a seed packet, say so.\nIMPORTANT: Return only the canonical crop name — do not include planting method in the name (e.g. return "Onion" not "Onion Sets", return "Potato" not "Potato Tubers").\nRespond ONLY with JSON: {"is_seed":true,"name":"Carrot","variety":"Nantes 2","description":"Brief growing note","sow_window":"Mar - Jun","brand":"${brand||""}"}`
+    : `A UK gardener scanned a barcode. Product: "${productName}"${brand ? ` by ${brand}` : ""}.\nIs this a garden feed or fertiliser? If yes, identify it. If NOT, say so.\nRespond ONLY with JSON: {"is_feed":true,"name":"Product name","brand":"${brand||}","product_name":"${productName}","form":"liquid","feed_type":"tomato","npk":"4-3-8","description":"Brief description"}`;
 
   const r = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -1840,21 +2016,41 @@ Respond ONLY with JSON: {"is_feed":true,"name":"Product name","brand":"${brand||
   const m    = text.match(/\{[\s\S]*\}/);
   if (!m) return { name: productName, brand };
   const parsed = JSON.parse(m[0]);
-  // Store barcode against crop_def / feed_catalog for instant future lookups
+
+  // ── Canonicalise and resolve crop name before returning ──────────────────
   if (mode === "crop" && parsed.is_seed && parsed.name) {
-    const { data: cropDef } = await supabaseService
-      .from("crop_definitions").select("id").ilike("name", parsed.name).maybeSingle();
-    if (cropDef?.id) {
-      await supabaseService.from("crop_definitions").update({ barcode: code }).eq("id", cropDef.id);
-      parsed.crop_def_id = cropDef.id;
+    const { canonicalName, startingForm } = canonicaliseCropName(parsed.name);
+    const rawLabel = parsed.name !== canonicalName ? parsed.name : null;
+    parsed.raw_crop_label = rawLabel;
+    parsed.name           = canonicalName;
+    parsed.starting_form  = startingForm || null;
+
+    // Try to resolve to existing canonical def — handles legacy aliases too
+    const resolved = await resolveToCanonicalDef(canonicalName);
+    if (resolved) {
+      parsed.crop_def_id = resolved.id;
+      parsed.name        = resolved.name;
+      console.log(`[BarcodeEnrich] "${rawLabel || canonicalName}" → resolved to "${resolved.name}"`);
+      if (barcode) {
+        await supabaseService.from("crop_definitions").update({ barcode }).eq("id", resolved.id);
+      }
+    } else if (barcode) {
+      // Genuinely new crop — try one last exact match before giving up
+      const { data: cropDef } = await supabaseService
+        .from("crop_definitions").select("id").ilike("name", canonicalName).maybeSingle();
+      if (cropDef?.id) {
+        await supabaseService.from("crop_definitions").update({ barcode }).eq("id", cropDef.id);
+        parsed.crop_def_id = cropDef.id;
+      }
     }
   } else if (mode === "feed" && parsed.is_feed && parsed.product_name) {
     const { data: feedEntry } = await supabaseService
       .from("feed_catalog").select("id").ilike("product_name", parsed.product_name).maybeSingle();
     if (feedEntry?.id) {
-      await supabaseService.from("feed_catalog").update({ barcode: code }).eq("id", feedEntry.id);
+      await supabaseService.from("feed_catalog").update({ barcode }).eq("id", feedEntry.id);
     }
   }
+
   return { ...parsed, barcode };
 }
 
