@@ -1245,84 +1245,9 @@ app.post("/succession-groups/:id/sowings", requireAuth, async (req, res) => {
   res.status(201).json(sowing);
 });
 
-// POST /crops/:id/convert-to-succession
-// Converts an existing solo crop instance into Sow 1 of a new succession group.
-// The crop instance itself is updated in place — tasks, timeline, and history preserved.
-app.post("/crops/:id/convert-to-succession", requireAuth,
-  [body("target_sowings").isInt({ min: 2 }), body("interval_days").isInt({ min: 1 })],
-  async (req, res) => {
-    if (!validate(req, res)) return;
-
-    // Load the crop to convert
-    const { data: crop, error: cropErr } = await req.db.from("crop_instances")
-      .select("id, name, variety, variety_id, crop_def_id, area_id, location_id, user_id")
-      .eq("id", req.params.id).eq("user_id", req.user.id).single();
-    if (cropErr || !crop) return res.status(404).json({ error: "Crop not found" });
-
-    // Must not already be in a succession group
-    const { data: existing } = await req.db.from("crop_instances")
-      .select("succession_group_id").eq("id", crop.id).single();
-    if (existing?.succession_group_id) {
-      return res.status(400).json({ error: "Crop is already part of a succession group" });
-    }
-
-    const { target_sowings, interval_days, notes } = req.body;
-
-    // Create the succession group
-    const { data: group, error: groupErr } = await supabaseService.from("succession_groups").insert({
-      user_id:        req.user.id,
-      crop_def_id:    crop.crop_def_id  || null,
-      crop_name:      crop.name,
-      variety_id:     crop.variety_id   || null,
-      variety_name:   typeof crop.variety === "string" ? crop.variety : crop.variety?.name || null,
-      area_id:        crop.area_id,
-      target_sowings: Number(target_sowings),
-      interval_days:  Number(interval_days),
-      notes:          notes || null,
-    }).select().single();
-    if (groupErr) return res.status(500).json({ error: groupErr.message });
-
-    // Update the existing crop instance to be Sow 1 of the new group
-    const { error: updateErr } = await supabaseService.from("crop_instances")
-      .update({ succession_group_id: group.id, succession_index: 1, updated_at: new Date().toISOString() })
-      .eq("id", crop.id).eq("user_id", req.user.id);
-    if (updateErr) {
-      await supabaseService.from("succession_groups").delete().eq("id", group.id);
-      return res.status(500).json({ error: updateErr.message });
-    }
-
-    // Immediately relabel existing open rule-engine tasks for this crop.
-    // Strip any existing "(Sow N)" suffix first so this is idempotent, then
-    // append the correct "(Sow 1)". Cleaner than concatenation.
-    try {
-      const { data: openTasks } = await supabaseService
-        .from("tasks")
-        .select("id, action")
-        .eq("crop_instance_id", crop.id)
-        .eq("user_id", req.user.id)
-        .is("completed_at", null)
-        .eq("source", "rule_engine");
-
-      if (openTasks?.length) {
-        for (const task of openTasks) {
-          // Strip any existing "(Sow N)" suffix before appending the correct one
-          const cleanAction = (task.action || "").replace(/\s*\(Sow \d+\)\s*$/, "").trim();
-          await supabaseService.from("tasks")
-            .update({ action: `${cleanAction} (Sow 1)` })
-            .eq("id", task.id);
-        }
-        console.log(`[Succession] Relabelled ${openTasks.length} tasks to (Sow 1) for crop ${crop.id}`);
-      }
-    } catch (labelErr) {
-      console.error("[Succession] Task relabel error:", labelErr.message);
-      // Non-fatal — tasks will get correct labels on next engine run
-    }
-
-    // Rule engine rerun to pick up sow label on any newly generated tasks
-    await runRuleEngine(req.user.id);
-    res.status(201).json({ group, sow_index: 1, tasks_relabelled: true });
-  }
-);
+// =============================================================================
+// TASKS
+// =============================================================================
 
 app.get("/tasks", requireAuth, async (req, res) => {
   const { view = "all", completed } = req.query;
@@ -1330,7 +1255,7 @@ app.get("/tasks", requireAuth, async (req, res) => {
   const weekEnd = weekEndISO();
 
   let query = req.db.from("tasks")
-    .select("*, crop:crop_instance_id(name, variety), area:area_id(name)")
+    .select("*, crop:crop_instance_id(name, variety, succession_group_id, succession_index), area:area_id(name)")
     .eq("user_id", req.user.id)
     .order("urgency",  { ascending: false })
     .order("due_date", { ascending: true });
@@ -3227,7 +3152,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
 
   const [tasksRes, cropsRes, profileRes, harvestRes, completedThisWeekRes] = await Promise.all([
     req.db.from("tasks")
-      .select("*, crop:crop_instance_id(name, variety), area:area_id(name)")
+      .select("*, crop:crop_instance_id(name, variety, succession_group_id, succession_index), area:area_id(name)")
       .eq("user_id", req.user.id).is("completed_at", null)
       .order("urgency",  { ascending: false })
       .order("due_date", { ascending: true }),
@@ -4857,7 +4782,6 @@ async function buildEligibleUserSet(window) {
   const tasksByUser = new Map();
   let taskOffset = 0;
   const TASK_BATCH = 1000;
-  const allTasks = [];
   while (true) {
     const { data: taskBatch } = await db
       .from("tasks")
@@ -4868,40 +4792,13 @@ async function buildEligibleUserSet(window) {
       .lte("due_date", in3days)
       .range(taskOffset, taskOffset + TASK_BATCH - 1);
 
-    allTasks.push(...(taskBatch || []));
+    for (const task of taskBatch || []) {
+      if (!tasksByUser.has(task.user_id)) tasksByUser.set(task.user_id, []);
+      tasksByUser.get(task.user_id).push(task);
+    }
+
     if (!taskBatch || taskBatch.length < TASK_BATCH) break;
     taskOffset += TASK_BATCH;
-  }
-
-  // Query 5: task_adjustments for eligible users — blocked period overlays
-  // Without this, users on holiday still receive pushes for tasks moved by the overlay.
-  const { data: adjustmentRows } = await db
-    .from("task_adjustments")
-    .select("task_id, adjusted_due_date, adjustment_type")
-    .in("user_id", eligible);
-
-  const adjMap = {};
-  for (const a of (adjustmentRows || [])) adjMap[a.task_id] = a;
-
-  // Merge effective_due_date onto tasks and filter out tasks whose effective
-  // date is beyond in3days (i.e. moved later by a blocked period)
-  for (const task of allTasks) {
-    const adj = adjMap[task.id];
-    if (adj) {
-      task.effective_due_date = adj.adjusted_due_date;
-      task.adjustment_type    = adj.adjustment_type;
-    }
-    // Use effective date for all candidate filtering in notifications
-    task._push_due = task.effective_due_date || task.due_date;
-  }
-
-  // Only include tasks that are actually due within the push window
-  // (tasks moved later by a blocked period should not trigger pushes)
-  const pushEligibleTasks = allTasks.filter(t => t._push_due <= in3days);
-
-  for (const task of pushEligibleTasks) {
-    if (!tasksByUser.has(task.user_id)) tasksByUser.set(task.user_id, []);
-    tasksByUser.get(task.user_id).push(task);
   }
 
   return { eligible, counts, tokenMap, tasksByUser };
