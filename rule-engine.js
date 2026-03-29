@@ -844,6 +844,11 @@ class ScheduledRuleEngine {
     const { txStart, txEnd, frostSensitive, cropName } = ctx;
     if (!txStart || !txEnd) return results;
 
+    // Greenhouse and polytunnel crops stay under cover — suppress outdoor
+    // transplant and harden-off tasks entirely. They may still need
+    // potting-on or spacing, but that is handled by growing rules.
+    if (ctx.areaType === "greenhouse" || ctx.areaType === "polytunnel") return results;
+
     const year        = new Date().getFullYear();
     const txDate      = monthToDate(txStart, year, 1);
     const txEndDate   = monthToDate(txEnd,   year, 28);

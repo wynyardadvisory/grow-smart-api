@@ -520,6 +520,96 @@ app.get("/crop-definitions/:id/sow-advice", async (req, res) => {
 // On success: inserts into crop_definitions/varieties and links the instance.
 // =============================================================================
 
+// ── Crop name canonicalisation ────────────────────────────────────────────────
+// Normalises free-text crop names entered by users:
+//   - trim whitespace and title-case
+//   - map common plurals and aliases to canonical singular names
+//   - strip obvious method suffixes (handled further down in succession code)
+// Only applied to "other crop" free-text entries, not crop_def names.
+// crop_def names are already canonical — always use crop_def.name directly.
+
+const CROP_ALIASES = {
+  // Plurals → singular
+  "carrots":       "Carrot",
+  "tomatoes":      "Tomato",
+  "peppers":       "Pepper",
+  "onions":        "Onion",
+  "potatoes":      "Potato",
+  "strawberries":  "Strawberry",
+  "raspberries":   "Raspberry",
+  "blackberries":  "Blackberry",
+  "gooseberries":  "Gooseberry",
+  "courgettes":    "Courgette",
+  "zucchinis":     "Courgette",
+  "zucchini":      "Courgette",
+  "lettuces":      "Lettuce",
+  "leeks":         "Leek",
+  "parsnips":      "Parsnip",
+  "beetroots":     "Beetroot",
+  "beets":         "Beetroot",
+  "beans":         "Bean",
+  "peas":          "Pea",
+  "cabbages":      "Cabbage",
+  "kales":         "Kale",
+  "spinaches":     "Spinach",
+  "radishes":      "Radish",
+  "turnips":       "Turnip",
+  "swedes":        "Swede",
+  "aubergines":    "Aubergine",
+  "eggplants":     "Aubergine",
+  "cucumbers":     "Cucumber",
+  "pumpkins":      "Pumpkin",
+  "squashes":      "Squash",
+  "melons":        "Melon",
+  "sunflowers":    "Sunflower",
+  "marigolds":     "Marigold",
+  "nasturtiums":   "Nasturtium",
+  "herbs":         "Herb",
+  "chillies":      "Chilli",
+  "chillis":       "Chilli",
+  "chilis":        "Chilli",
+  "chiles":        "Chilli",
+  "chilies":       "Chilli",
+  "chili":         "Chilli",
+  "chilli peppers":"Chilli",
+  "chili peppers": "Chilli",
+  "courgette marrows": "Courgette",
+  "french beans":  "French Bean",
+  "runner beans":  "Runner Bean",
+  "broad beans":   "Broad Bean",
+  "climbing beans":"Climbing Bean",
+  "dwarf beans":   "Dwarf Bean",
+  "spring onions": "Spring Onion",
+  "salad leaves":  "Salad Leaves",
+  "mixed salad":   "Salad Leaves",
+  "salad":         "Salad Leaves",
+  "pak choi":      "Pak Choi",
+  "bok choy":      "Pak Choi",
+  "brussel sprouts":"Brussels Sprout",
+  "brussels sprouts":"Brussels Sprout",
+  "sweetcorn":     "Sweet Corn",
+  "sweet corn":    "Sweet Corn",
+  "corn":          "Sweet Corn",
+  "psb":           "Purple Sprouting Broccoli",
+  "purple sprouting broccoli": "Purple Sprouting Broccoli",
+  "broccoli":      "Broccoli",
+  "cauliflowers":  "Cauliflower",
+  "artichokes":    "Artichoke",
+  "asparaguses":   "Asparagus",
+  "rhubarbs":      "Rhubarb",
+};
+
+function canonicaliseCropName(rawName) {
+  if (!rawName || typeof rawName !== "string") return rawName;
+  const trimmed = rawName.trim();
+  if (!trimmed) return trimmed;
+  // Check alias map (case-insensitive)
+  const lower = trimmed.toLowerCase();
+  if (CROP_ALIASES[lower]) return CROP_ALIASES[lower];
+  // Title-case the raw input as a fallback
+  return trimmed.replace(/\w\S*/g, w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase());
+}
+
 async function enrichCrop(cropInstanceId, submittedName, submittedVariety) {
   const db = supabaseService;
 
@@ -847,13 +937,18 @@ app.post("/crops", requireAuth,
   async (req, res) => {
     if (!validate(req, res)) return;
     const {
-      area_id, name, variety, variety_id, crop_def_id,
+      area_id, name: rawName, variety, variety_id, crop_def_id,
       sown_date, transplanted_date, planted_out_date, transplant_date,
       establishment_method, quantity, notes,
       start_date_confidence, source, status,
       is_other_crop, is_other_variety,
       barcode,
     } = req.body;
+
+    // For "other crop" free-text entries, normalise the name.
+    // For known crops (crop_def_id set), use the name as-is — it comes from
+    // the frontend which already uses the canonical crop_def.name.
+    const name = (is_other_crop || !crop_def_id) ? canonicaliseCropName(rawName) : rawName;
 
     // Derive location_id from area
     const { data: area } = await req.db.from("growing_areas")
@@ -985,10 +1080,13 @@ app.post("/succession-groups", requireAuth,
   async (req, res) => {
     if (!validate(req, res)) return;
     const {
-      crop_def_id, crop_name, variety_id, variety_name,
+      crop_def_id, variety_id, variety_name,
       area_id, target_sowings, interval_days, notes,
       first_sown_date, first_status,
     } = req.body;
+
+    // Normalise free-text crop name; known crops already have canonical name from crop_def
+    const crop_name = (crop_def_id) ? req.body.crop_name : canonicaliseCropName(req.body.crop_name);
 
     // Derive location_id from area
     const { data: area } = await req.db.from("growing_areas")
