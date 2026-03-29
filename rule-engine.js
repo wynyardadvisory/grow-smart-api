@@ -279,6 +279,10 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = []) 
     // Potato type
     potatoType: variety.potato_type || null,
 
+    // Lifecycle mode — seasonal | established | overwintered
+    // Defaults to seasonal for all existing crops (DB column defaults to 'seasonal')
+    lifecycleMode: crop.lifecycle_mode || "seasonal",
+
     // Observations
     observations,
     recentPestObs,
@@ -384,6 +388,20 @@ function candidate(ctx, opts) {
   };
 }
 
+// ── Lifecycle mode helpers ─────────────────────────────────────────────────────
+// These are the single source of truth for routing engine behaviour by mode.
+// Always use these helpers — do not scatter raw lifecycleMode checks everywhere.
+
+function isSetupSuppressed(ctx) {
+  // Established and overwintered crops should never receive sow, transplant,
+  // harden-off, or any early-lifecycle setup tasks.
+  return ctx.lifecycleMode === "established" || ctx.lifecycleMode === "overwintered";
+}
+
+function isSeasonalCrop(ctx) {
+  return ctx.lifecycleMode === "seasonal" || !ctx.lifecycleMode;
+}
+
 // ── SCHEDULED RULE ENGINE ─────────────────────────────────────────────────────
 
 class ScheduledRuleEngine {
@@ -414,6 +432,15 @@ class ScheduledRuleEngine {
     // ── PERENNIALS ───────────────────────────────────────────────────────────
     if (ctx.isPerennial) {
       candidates.push(...this._evalPerennial(ctx));
+      return candidates;
+    }
+
+    // ── ESTABLISHED / OVERWINTERED ────────────────────────────────────────────
+    // These crops skip all setup paths (planned, indoor, sow, transplant,
+    // harden-off). Route directly to growing logic which handles feeding,
+    // harvest, pest alerts, and seasonal care.
+    if (isSetupSuppressed(ctx)) {
+      candidates.push(...this._evalGrowing(ctx, rules));
       return candidates;
     }
 

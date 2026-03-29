@@ -942,13 +942,17 @@ app.post("/crops", requireAuth,
       establishment_method, quantity, notes,
       start_date_confidence, source, status,
       is_other_crop, is_other_variety,
-      barcode,
+      barcode, lifecycle_mode,
     } = req.body;
 
     // For "other crop" free-text entries, normalise the name.
     // For known crops (crop_def_id set), use the name as-is — it comes from
     // the frontend which already uses the canonical crop_def.name.
     const name = (is_other_crop || !crop_def_id) ? canonicaliseCropName(rawName) : rawName;
+
+    // Validate lifecycle_mode — default to seasonal
+    const validLifecycleModes = ["seasonal", "established", "overwintered"];
+    const resolvedLifecycleMode = validLifecycleModes.includes(lifecycle_mode) ? lifecycle_mode : "seasonal";
 
     // Derive location_id from area
     const { data: area } = await req.db.from("growing_areas")
@@ -976,6 +980,7 @@ app.post("/crops", requireAuth,
       photo_url:            null,
       start_date_confidence:start_date_confidence || "exact",
       source:               source || "manual",
+      lifecycle_mode:       resolvedLifecycleMode,
     }).select().single();
 
     if (error) return res.status(500).json({ error: error.message });
@@ -1007,11 +1012,17 @@ app.put("/crops/:id", requireAuth, async (req, res) => {
   const allowed = [
     "variety","variety_id","sown_date","transplanted_date","transplant_date","planted_out_date",
     "establishment_method","stage","quantity","notes","area_id","photo_url",
-    "start_date_confidence","last_fed_at","status",
+    "start_date_confidence","last_fed_at","status","lifecycle_mode",
   ];
   const updates = Object.fromEntries(Object.entries(req.body).filter(([k]) => allowed.includes(k)));
   updates.updated_at = new Date().toISOString();
   if (updates.stage) updates.stage_confidence = "exact";
+
+  // Validate lifecycle_mode if present
+  if (updates.lifecycle_mode) {
+    const valid = ["seasonal", "established", "overwintered"];
+    if (!valid.includes(updates.lifecycle_mode)) delete updates.lifecycle_mode;
+  }
 
   const { data, error } = await req.db.from("crop_instances")
     .update(updates).eq("id", req.params.id).eq("user_id", req.user.id).select().single();
@@ -1022,7 +1033,32 @@ app.put("/crops/:id", requireAuth, async (req, res) => {
     await enrichCrop(data.id, data.name, updates.variety);
   }
 
-  // Always run rule engine after any crop update — status/sow_date changes affect task generation
+  // If lifecycle_mode changed, purge stale open engine tasks for this crop
+  // so the engine regenerates a correct set for the new mode.
+  if (updates.lifecycle_mode) {
+    try {
+      const cropId = req.params.id;
+      const { data: directTasks } = await supabaseService
+        .from("tasks").select("id")
+        .eq("user_id", req.user.id).eq("crop_instance_id", cropId)
+        .is("completed_at", null).eq("source", "rule_engine");
+      const { data: areaTasks } = await supabaseService
+        .from("tasks").select("id, source_key")
+        .eq("user_id", req.user.id).is("crop_instance_id", null)
+        .is("completed_at", null).eq("source", "rule_engine");
+      const staleArea = (areaTasks || []).filter(t => t.source_key?.includes(cropId));
+      const staleIds  = [...(directTasks || []).map(t => t.id), ...staleArea.map(t => t.id)];
+      if (staleIds.length > 0) {
+        await supabaseService.from("rule_log").delete().in("task_id", staleIds);
+        await supabaseService.from("tasks").delete().in("id", staleIds);
+        console.log(`[LifecycleMode] Purged ${staleIds.length} stale tasks for crop ${cropId} (mode → ${updates.lifecycle_mode})`);
+      }
+    } catch (purgeErr) {
+      console.error("[LifecycleMode] Task purge error:", purgeErr.message);
+    }
+  }
+
+  // Always run rule engine after any crop update
   await runRuleEngine(req.user.id);
   res.json(data);
 });
