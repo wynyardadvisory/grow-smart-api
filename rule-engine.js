@@ -1235,6 +1235,26 @@ class RuleEngine {
       }
     }
 
+    // ── Succession sow-label injection ───────────────────────────────────────
+    // Append "(Sow N)" to task titles for crops that belong to a succession group.
+    // Keeps the Today screen unambiguous when a user has Carrots Sow 1 + Sow 2 etc.
+    const successionIndexMap = {};
+    for (const crop of crops) {
+      if (crop.succession_group_id && crop.succession_index) {
+        successionIndexMap[crop.id] = crop.succession_index;
+      }
+    }
+    if (Object.keys(successionIndexMap).length > 0) {
+      for (const candidate of allCandidates) {
+        if (candidate.crop_instance_id && successionIndexMap[candidate.crop_instance_id]) {
+          const idx = successionIndexMap[candidate.crop_instance_id];
+          if (candidate.action && !candidate.action.includes(`(Sow ${idx})`)) {
+            candidate.action = `${candidate.action} (Sow ${idx})`;
+          }
+        }
+      }
+    }
+
     // ── Watering tasks — one per area ────────────────────────────────────────
     // Group active outdoor crops by area, check dry conditions, generate one
     // watering task per area rather than per crop.
@@ -1339,6 +1359,18 @@ class RuleEngine {
         meta:             JSON.stringify({ dry_days: daysSinceWatered, area_type: areaType }),
         risk_payload:     null,
       });
+    }
+
+    // ── Succession next-sow reminders ────────────────────────────────────────
+    // For each succession group where target_sowings > active sowing count
+    // and the next sow date is due, generate a reminder task.
+    if (this.supabase) {
+      try {
+        const successionReminders = await this._successionReminders(userId);
+        allCandidates.push(...successionReminders);
+      } catch (err) {
+        console.error("[RuleEngine] Succession reminder error:", err.message);
+      }
     }
 
     // Upsert all candidates
@@ -1461,6 +1493,92 @@ class RuleEngine {
     } catch (err) {
       console.error("[RuleEngine] Cleanup error:", err.message);
     }
+  }
+
+  // ── Succession next-sow reminder generator ────────────────────────────────
+  // Loads succession groups, checks how many sowings exist vs target,
+  // and generates a "Sow next X (Sow N)" reminder task when due.
+
+  async _successionReminders(userId) {
+    const reminders = [];
+    const today = todayISO();
+
+    const { data: groups } = await this.supabase
+      .from("succession_groups")
+      .select("*")
+      .eq("user_id", userId);
+
+    if (!groups?.length) return reminders;
+
+    // Fetch active sowings for all groups in one query
+    const groupIds = groups.map(g => g.id);
+    const { data: sowings } = await this.supabase
+      .from("crop_instances")
+      .select("id, succession_group_id, succession_index, sown_date, status")
+      .in("succession_group_id", groupIds)
+      .eq("active", true)
+      .order("succession_index", { ascending: false });
+
+    const sowingsByGroup = {};
+    for (const s of (sowings || [])) {
+      if (!sowingsByGroup[s.succession_group_id]) sowingsByGroup[s.succession_group_id] = [];
+      sowingsByGroup[s.succession_group_id].push(s);
+    }
+
+    for (const group of groups) {
+      const groupSowings = sowingsByGroup[group.id] || [];
+      const activeCount  = groupSowings.length;
+
+      // Nothing to remind about if we've hit the target
+      if (activeCount >= group.target_sowings) continue;
+
+      // Need interval_days to calculate next due date
+      if (!group.interval_days) continue;
+
+      // Find the latest sown_date among active sowings
+      const latestSowing = groupSowings
+        .filter(s => s.sown_date)
+        .sort((a, b) => b.sown_date.localeCompare(a.sown_date))[0];
+
+      if (!latestSowing?.sown_date) continue;
+
+      // Next sow due date = latest sown date + interval_days
+      const nextDueDate = addDays(latestSowing.sown_date, group.interval_days);
+
+      // Only fire reminder if due today or overdue
+      if (nextDueDate > today) continue;
+
+      const nextIndex = (latestSowing.succession_index || activeCount) + 1;
+      const cropName  = group.crop_name;
+      const sk        = sourceKey({ u: userId, sg: group.id, r: "succession_sow", n: nextIndex });
+
+      reminders.push({
+        user_id:             userId,
+        crop_instance_id:    null,
+        area_id:             group.area_id,
+        succession_group_id: group.id,
+        action:              `Sow next ${cropName} (Sow ${nextIndex})`,
+        task_type:           "sow",
+        urgency:             "medium",
+        due_date:            nextDueDate,
+        scheduled_for:       nextDueDate,
+        visible_from:        nextDueDate,
+        expires_at:          new Date(addDays(nextDueDate, 7) + "T23:59:59Z").toISOString(),
+        status:              nextDueDate <= today ? "due" : "upcoming",
+        engine_type:         "scheduled",
+        record_type:         "task",
+        source:              "rule_engine",
+        rule_id:             "succession_sow_due",
+        source_key:          sk,
+        date_confidence:     "exact",
+        meta:                JSON.stringify({ succession_group_id: group.id, next_index: nextIndex }),
+        risk_payload:        null,
+      });
+
+      console.log(`[Succession] Reminder: ${cropName} Sow ${nextIndex} due ${nextDueDate} for group ${group.id}`);
+    }
+
+    return reminders;
   }
 
   // ── Data loaders ──────────────────────────────────────────────────────────

@@ -943,19 +943,208 @@ app.get("/crops/:id/enrichment", requireAuth, async (req, res) => {
 });
 
 app.delete("/crops/:id", requireAuth, async (req, res) => {
-  // Fetch area_id before soft-deleting so we can invalidate suggestions cache
+  // Fetch area_id + succession_group_id before soft-deleting
   const { data: crop } = await req.db.from("crop_instances")
-    .select("area_id").eq("id", req.params.id).eq("user_id", req.user.id).single();
+    .select("area_id, succession_group_id").eq("id", req.params.id).eq("user_id", req.user.id).single();
 
   const { error } = await req.db.from("crop_instances")
     .update({ active: false, updated_at: new Date().toISOString() })
     .eq("id", req.params.id).eq("user_id", req.user.id);
   if (error) return res.status(500).json({ error: error.message });
 
+  // Auto-delete empty succession group if this was the last active sowing
+  if (crop?.succession_group_id) {
+    const { count } = await supabaseService.from("crop_instances")
+      .select("id", { count: "exact", head: true })
+      .eq("succession_group_id", crop.succession_group_id)
+      .eq("active", true);
+    if ((count || 0) === 0) {
+      await supabaseService.from("succession_groups")
+        .delete().eq("id", crop.succession_group_id).eq("user_id", req.user.id);
+      console.log(`[Succession] Auto-deleted empty group ${crop.succession_group_id}`);
+    }
+  }
+
   // Invalidate suggestions cache — area contents have changed
   if (crop?.area_id) await clearSuggestions(crop.area_id, req.db);
 
   res.status(204).send();
+});
+
+// =============================================================================
+// SUCCESSION GROUPS
+// =============================================================================
+
+// POST /succession-groups — create group + first sowing
+app.post("/succession-groups", requireAuth,
+  [
+    body("crop_name").trim().notEmpty(),
+    body("area_id").isUUID(),
+    body("target_sowings").isInt({ min: 1 }),
+  ],
+  async (req, res) => {
+    if (!validate(req, res)) return;
+    const {
+      crop_def_id, crop_name, variety_id, variety_name,
+      area_id, target_sowings, interval_days, notes,
+      first_sown_date, first_status,
+    } = req.body;
+
+    // Derive location_id from area
+    const { data: area } = await req.db.from("growing_areas")
+      .select("location_id").eq("id", area_id).single();
+
+    // Create the parent group
+    const { data: group, error: groupErr } = await supabaseService.from("succession_groups").insert({
+      user_id:      req.user.id,
+      crop_def_id:  crop_def_id  || null,
+      crop_name,
+      variety_id:   variety_id   || null,
+      variety_name: variety_name || null,
+      area_id,
+      target_sowings: Number(target_sowings),
+      interval_days:  interval_days ? Number(interval_days) : null,
+      notes:          notes || null,
+    }).select().single();
+    if (groupErr) return res.status(500).json({ error: groupErr.message });
+
+    // Create Sow 1 as a real crop instance
+    const derivedStatus = first_status || (first_sown_date ? "growing" : "planned");
+    const { data: sowing, error: sowErr } = await supabaseService.from("crop_instances").insert({
+      user_id:             req.user.id,
+      location_id:         area?.location_id || null,
+      area_id,
+      name:                crop_name,
+      variety:             variety_name || null,
+      variety_id:          variety_id   || null,
+      crop_def_id:         crop_def_id  || null,
+      status:              derivedStatus,
+      sown_date:           first_sown_date || null,
+      quantity:            1,
+      source:              "manual",
+      succession_group_id: group.id,
+      succession_index:    1,
+    }).select().single();
+    if (sowErr) {
+      // Rollback group if sowing creation fails
+      await supabaseService.from("succession_groups").delete().eq("id", group.id);
+      return res.status(500).json({ error: sowErr.message });
+    }
+
+    await runRuleEngine(req.user.id);
+    res.status(201).json({ group, sowings: [sowing] });
+  }
+);
+
+// GET /succession-groups — list all groups with their active sowings
+app.get("/succession-groups", requireAuth, async (req, res) => {
+  const { data: groups, error } = await supabaseService.from("succession_groups")
+    .select("*")
+    .eq("user_id", req.user.id)
+    .order("created_at", { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Fetch all active sowings for these groups
+  const groupIds = (groups || []).map(g => g.id);
+  let sowingsByGroup = {};
+  if (groupIds.length > 0) {
+    const { data: sowings } = await supabaseService.from("crop_instances")
+      .select("*, crop_def:crop_def_id(days_to_maturity_min, days_to_maturity_max, harvest_month_start, harvest_month_end), variety:variety_id(days_to_maturity_min, days_to_maturity_max)")
+      .in("succession_group_id", groupIds)
+      .eq("active", true)
+      .order("succession_index", { ascending: true });
+    for (const s of (sowings || [])) {
+      if (!sowingsByGroup[s.succession_group_id]) sowingsByGroup[s.succession_group_id] = [];
+      sowingsByGroup[s.succession_group_id].push(s);
+    }
+  }
+
+  const result = (groups || []).map(g => ({
+    ...g,
+    sowings: sowingsByGroup[g.id] || [],
+  }));
+  res.json(result);
+});
+
+// GET /succession-groups/:id
+app.get("/succession-groups/:id", requireAuth, async (req, res) => {
+  const { data: group, error } = await supabaseService.from("succession_groups")
+    .select("*").eq("id", req.params.id).eq("user_id", req.user.id).single();
+  if (error || !group) return res.status(404).json({ error: "Not found" });
+
+  const { data: sowings } = await supabaseService.from("crop_instances")
+    .select("*, crop_def:crop_def_id(*), variety:variety_id(*)")
+    .eq("succession_group_id", group.id)
+    .eq("active", true)
+    .order("succession_index", { ascending: true });
+
+  res.json({ ...group, sowings: sowings || [] });
+});
+
+// PUT /succession-groups/:id
+app.put("/succession-groups/:id", requireAuth, async (req, res) => {
+  const allowed = ["target_sowings", "interval_days", "notes", "variety_name"];
+  const updates = Object.fromEntries(Object.entries(req.body).filter(([k]) => allowed.includes(k)));
+  if (updates.target_sowings) updates.target_sowings = Number(updates.target_sowings);
+  if (updates.interval_days)  updates.interval_days  = Number(updates.interval_days);
+  updates.updated_at = new Date().toISOString();
+  const { data, error } = await supabaseService.from("succession_groups")
+    .update(updates).eq("id", req.params.id).eq("user_id", req.user.id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// DELETE /succession-groups/:id — deletes group and soft-deletes all child sowings
+app.delete("/succession-groups/:id", requireAuth, async (req, res) => {
+  // Soft-delete all active child sowings
+  await supabaseService.from("crop_instances")
+    .update({ active: false, updated_at: new Date().toISOString() })
+    .eq("succession_group_id", req.params.id)
+    .eq("user_id", req.user.id);
+  // Delete the group
+  const { error } = await supabaseService.from("succession_groups")
+    .delete().eq("id", req.params.id).eq("user_id", req.user.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(204).send();
+});
+
+// POST /succession-groups/:id/sowings — add next sowing to a group
+app.post("/succession-groups/:id/sowings", requireAuth, async (req, res) => {
+  const { data: group, error: groupErr } = await supabaseService.from("succession_groups")
+    .select("*").eq("id", req.params.id).eq("user_id", req.user.id).single();
+  if (groupErr || !group) return res.status(404).json({ error: "Group not found" });
+
+  // Determine next succession_index
+  const { data: existing } = await supabaseService.from("crop_instances")
+    .select("succession_index").eq("succession_group_id", group.id).eq("active", true)
+    .order("succession_index", { ascending: false }).limit(1);
+  const nextIndex = ((existing?.[0]?.succession_index) || 0) + 1;
+
+  const { sown_date, notes, status } = req.body;
+  const { data: area } = await req.db.from("growing_areas")
+    .select("location_id").eq("id", group.area_id).single();
+
+  const derivedStatus = status || (sown_date ? "growing" : "planned");
+  const { data: sowing, error: sowErr } = await supabaseService.from("crop_instances").insert({
+    user_id:             req.user.id,
+    location_id:         area?.location_id || null,
+    area_id:             group.area_id,
+    name:                group.crop_name,
+    variety:             group.variety_name || null,
+    variety_id:          group.variety_id   || null,
+    crop_def_id:         group.crop_def_id  || null,
+    status:              derivedStatus,
+    sown_date:           sown_date || null,
+    notes:               notes || null,
+    quantity:            1,
+    source:              "manual",
+    succession_group_id: group.id,
+    succession_index:    nextIndex,
+  }).select().single();
+  if (sowErr) return res.status(500).json({ error: sowErr.message });
+
+  await runRuleEngine(req.user.id);
+  res.status(201).json(sowing);
 });
 
 // =============================================================================
@@ -2870,7 +3059,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       .order("urgency",  { ascending: false })
       .order("due_date", { ascending: true }),
     req.db.from("crop_instances")
-      .select("id, name, variety, variety_id, sown_date, stage, timeline_offset_days, area_id, missed_task_note, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, days_to_maturity_max, pest_window_start, pest_window_end, pest_notes, is_perennial)")
+      .select("id, name, variety, variety_id, sown_date, stage, timeline_offset_days, area_id, missed_task_note, succession_index, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, days_to_maturity_max, pest_window_start, pest_window_end, pest_notes, is_perennial)")
       .eq("user_id", req.user.id).eq("active", true),
     req.db.from("profiles").select("name, plan, postcode, photo_url").eq("id", req.user.id).single(),
     req.db.from("harvest_log")
@@ -2908,7 +3097,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       } else {
         return null;
       }
-      return { crop: c.name, variety: c.variety || null, crop_instance_id: c.id, window_start: windowStart, window_end: windowEnd };
+      return { crop: c.succession_index ? `${c.name} (Sow ${c.succession_index})` : c.name, variety: c.variety || null, crop_instance_id: c.id, window_start: windowStart, window_end: windowEnd };
     })
     .filter(Boolean);
 
