@@ -3675,6 +3675,52 @@ app.post("/crops/:id/observe", requireAuth, async (req, res) => {
     engineActions.push("timeline_offset_applied");
   }
   if (Object.keys(updates).length > 0) { updates.updated_at = new Date().toISOString(); await req.db.from("crop_instances").update(updates).eq("id", req.params.id).eq("user_id", req.user.id); }
+
+  // ── Crop-scoped task purge — runs when stage or timeline offset changes ────
+  // Clears open engine-generated tasks for this crop so the rule engine
+  // rebuilds a clean, correct set for the new effective lifecycle position.
+  // Preserves completed tasks and manual activity logs.
+  if (confirmed_stage || typeof timeline_offset_days === "number") {
+    try {
+      const cropId = req.params.id;
+
+      // 1. Direct crop-linked open engine tasks
+      const { data: directTasks } = await supabaseService
+        .from("tasks")
+        .select("id")
+        .eq("user_id", req.user.id)
+        .eq("crop_instance_id", cropId)
+        .is("completed_at", null)
+        .eq("source", "rule_engine");
+
+      // 2. Area-level open engine tasks whose source_key references this crop UUID
+      const { data: areaTasks } = await supabaseService
+        .from("tasks")
+        .select("id, source_key")
+        .eq("user_id", req.user.id)
+        .is("crop_instance_id", null)
+        .is("completed_at", null)
+        .eq("source", "rule_engine");
+
+      const staleAreaTasks = (areaTasks || []).filter(t => t.source_key?.includes(cropId));
+
+      const allStaleIds = [
+        ...(directTasks || []).map(t => t.id),
+        ...staleAreaTasks.map(t => t.id),
+      ];
+
+      if (allStaleIds.length > 0) {
+        await supabaseService.from("rule_log").delete().in("task_id", allStaleIds);
+        await supabaseService.from("tasks").delete().in("id", allStaleIds);
+        console.log(`[Observe] Purged ${allStaleIds.length} stale engine tasks for crop ${cropId}`);
+        engineActions.push(`tasks_purged:${allStaleIds.length}`);
+      }
+    } catch (purgeErr) {
+      console.error("[Observe] Task purge error:", purgeErr.message);
+      // Non-fatal — continue to rule engine run
+    }
+  }
+
   await runRuleEngine(req.user.id);
   res.json({ observation: obs, crop_updated: Object.keys(updates).length > 0, engine_actions: engineActions });
 });
