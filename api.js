@@ -329,8 +329,12 @@ app.post("/locations", requireAuth,
   async (req, res) => {
     if (!validate(req, res)) return;
     const { name, postcode, latitude, longitude, orientation, notes } = req.body;
+    const width_m  = req.body.width_m  !== "" && req.body.width_m  != null ? Number(req.body.width_m)  : null;
+    const length_m = req.body.length_m !== "" && req.body.length_m != null ? Number(req.body.length_m) : null;
+    if (width_m  !== null && (isNaN(width_m)  || width_m  <= 0)) return res.status(400).json({ error: "width_m must be a positive number" });
+    if (length_m !== null && (isNaN(length_m) || length_m <= 0)) return res.status(400).json({ error: "length_m must be a positive number" });
     const { data, error } = await req.db.from("locations")
-      .insert({ user_id: req.user.id, name, postcode, latitude, longitude, orientation, notes })
+      .insert({ user_id: req.user.id, name, postcode, latitude, longitude, orientation, notes, width_m, length_m })
       .select().single();
     if (error) return res.status(500).json({ error: error.message });
     res.status(201).json(data);
@@ -338,8 +342,20 @@ app.post("/locations", requireAuth,
 );
 
 app.put("/locations/:id", requireAuth, async (req, res) => {
-  const allowed = ["name","postcode","latitude","longitude","orientation","notes"];
+  const allowed = ["name","postcode","latitude","longitude","orientation","notes","width_m","length_m"];
   const updates = Object.fromEntries(Object.entries(req.body).filter(([k]) => allowed.includes(k)));
+  // Normalise numeric fields — empty string → null, validate positive
+  for (const field of ["width_m","length_m"]) {
+    if (field in updates) {
+      const raw = updates[field];
+      if (raw === "" || raw == null) { updates[field] = null; }
+      else {
+        const n = Number(raw);
+        if (isNaN(n) || n <= 0) return res.status(400).json({ error: `${field} must be a positive number` });
+        updates[field] = n;
+      }
+    }
+  }
   const { data, error } = await req.db.from("locations")
     .update(updates).eq("id", req.params.id).eq("user_id", req.user.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
@@ -403,9 +419,19 @@ app.post("/areas", requireAuth,
   ],
   async (req, res) => {
     if (!validate(req, res)) return;
-    const { location_id, name, type, width_m, length_m, sun_exposure, notes } = req.body;
+    const { location_id, name, type, sun_exposure, notes } = req.body;
+    // Normalise and validate numeric fields
+    const parseNumeric = (val) => (val === "" || val == null) ? null : Number(val);
+    const width_m          = parseNumeric(req.body.width_m);
+    const length_m         = parseNumeric(req.body.length_m);
+    const soil_ph          = parseNumeric(req.body.soil_ph);
+    const soil_temperature_c = parseNumeric(req.body.soil_temperature_c);
+    if (width_m          !== null && (isNaN(width_m)          || width_m  <= 0))        return res.status(400).json({ error: "width_m must be a positive number" });
+    if (length_m         !== null && (isNaN(length_m)         || length_m <= 0))        return res.status(400).json({ error: "length_m must be a positive number" });
+    if (soil_ph          !== null && (isNaN(soil_ph)          || soil_ph < 0 || soil_ph > 14)) return res.status(400).json({ error: "soil_ph must be between 0 and 14" });
+    if (soil_temperature_c !== null && (isNaN(soil_temperature_c) || soil_temperature_c < -20 || soil_temperature_c > 60)) return res.status(400).json({ error: "soil_temperature_c must be between -20 and 60" });
     const { data, error } = await req.db.from("growing_areas")
-      .insert({ location_id, name, type, width_m, length_m, sun_exposure, notes })
+      .insert({ location_id, name, type, width_m, length_m, sun_exposure, notes, soil_ph, soil_temperature_c })
       .select().single();
     if (error) return res.status(500).json({ error: error.message });
     res.status(201).json(data);
@@ -413,8 +439,23 @@ app.post("/areas", requireAuth,
 );
 
 app.put("/areas/:id", requireAuth, async (req, res) => {
-  const allowed = ["name","type","width_m","length_m","sun_exposure","notes"];
+  const allowed = ["name","type","width_m","length_m","sun_exposure","notes","soil_ph","soil_temperature_c"];
   const updates = Object.fromEntries(Object.entries(req.body).filter(([k]) => allowed.includes(k)));
+  // Normalise numeric fields — empty string → null, validate ranges
+  for (const field of ["width_m","length_m","soil_ph","soil_temperature_c"]) {
+    if (field in updates) {
+      const raw = updates[field];
+      if (raw === "" || raw == null) { updates[field] = null; }
+      else {
+        const n = Number(raw);
+        if (isNaN(n)) return res.status(400).json({ error: `${field} must be a number` });
+        if ((field === "width_m" || field === "length_m") && n <= 0) return res.status(400).json({ error: `${field} must be a positive number` });
+        if (field === "soil_ph" && (n < 0 || n > 14)) return res.status(400).json({ error: "soil_ph must be between 0 and 14" });
+        if (field === "soil_temperature_c" && (n < -20 || n > 60)) return res.status(400).json({ error: "soil_temperature_c must be between -20 and 60" });
+        updates[field] = n;
+      }
+    }
+  }
   const { data, error } = await req.db.from("growing_areas")
     .update(updates).eq("id", req.params.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
