@@ -1242,6 +1242,10 @@ class RuleEngine {
 
     const allCandidates = [];
 
+    // Build a canonical context map once — reused by both the candidate loop
+    // and the watering section so all stage/lastWateredAt values are consistent.
+    const ctxMap = new Map();
+
     for (const crop of crops) {
       const locId   = crop.location_id || crop.area?.location_id;
       const weather = weatherByLocation[locId] || null;
@@ -1251,6 +1255,7 @@ class RuleEngine {
       // Build normalised context once per crop
       const cropObs = recentObservations.filter(o => o.crop_id === crop.id);
       const ctx = buildCropContext(crop, weather, envMods, userFeeds, cropObs);
+      ctxMap.set(crop.id, ctx);
 
       // Scheduled engine — future tasks
       const scheduled = this.scheduled.evaluate(ctx, rules);
@@ -1290,6 +1295,7 @@ class RuleEngine {
     // ── Watering tasks — one per area ────────────────────────────────────────
     // Group active outdoor crops by area, check dry conditions, generate one
     // watering task per area rather than per crop.
+    // Uses ctxMap for inferred stage, tiered lastWateredAt and areaType — not raw crop fields.
     const areaMap = new Map(); // areaId -> { crops, areaType, areaName, locId, weather }
     for (const crop of crops) {
       if (crop.status === "planned" || crop.status === "sown_indoors" || crop.status === "finished") continue;
@@ -1297,7 +1303,8 @@ class RuleEngine {
       if (!areaId) continue;
       const locId = crop.location_id || crop.area?.location_id;
       const weather = weatherByLocation[locId] || null;
-      const areaType = crop.area?.type || "raised_bed";
+      const ctx = ctxMap.get(crop.id);
+      const areaType = ctx?.areaType || crop.area?.type || "raised_bed";
       const areaName = crop.area?.name || "Garden area";
       console.log(`[Watering] crop=${crop.name} areaId=${areaId} locId=${locId} rainMm=${weather?.rain_mm ?? null} areaType=${areaType}`);
       if (!areaMap.has(areaId)) {
@@ -1322,19 +1329,21 @@ class RuleEngine {
         : 6; // ground/border
 
       // Reduce threshold by 1 for flowering/fruiting crops — more drought sensitive
-      const hasHighRiskCrop = areaCrops.some(c => ["flowering", "fruiting", "harvesting"].includes(c.stage));
+      // Uses inferred ctx.stage rather than raw c.stage so stage inference is accurate
+      const hasHighRiskCrop = areaCrops.some(c => {
+        const cropCtx = ctxMap.get(c.id);
+        const stage = cropCtx?.stage || c.stage;
+        return ["flowering", "fruiting", "harvesting"].includes(stage);
+      });
       const DRY_DAY_THRESHOLD = hasHighRiskCrop && BASE_THRESHOLD > 1 ? BASE_THRESHOLD - 1 : BASE_THRESHOLD;
 
-      // Find the most recent watering signal across all crops in this area,
-      // plus the area-level last_watered_at (from manual area-scope logs)
-      // Tiered: crop-level beats area-level beats location-level
+      // Find the most recent watering signal across all crops in this area.
+      // Uses ctx.lastWateredAt which already applies tiered inheritance:
+      // crop-level beats area-level beats location-level
       let lastWateredDate = null;
-      // Check area-level timestamp first as a baseline
-      const areaWateredAt = areaCrops[0]?.area?.last_watered_at;
-      if (areaWateredAt) lastWateredDate = areaWateredAt.split("T")[0];
-      // Any crop-level timestamp overrides if more recent
       for (const crop of areaCrops) {
-        const lw = crop.last_watered_at ? crop.last_watered_at.split("T")[0] : null;
+        const cropCtx = ctxMap.get(crop.id);
+        const lw = cropCtx?.lastWateredAt ? cropCtx.lastWateredAt.split("T")[0] : null;
         if (lw && (!lastWateredDate || lw > lastWateredDate)) lastWateredDate = lw;
       }
 
@@ -1351,10 +1360,13 @@ class RuleEngine {
       }
 
       // Prioritise crops most at risk: flowering/fruiting > seedling > vegetative
+      // Uses inferred ctx.stage for accurate ordering
       const STAGE_PRIORITY = { flowering: 0, fruiting: 0, harvesting: 0, seedling: 1, vegetative: 2, seed: 3 };
-      const sortedCrops = [...areaCrops].sort((a, b) =>
-        (STAGE_PRIORITY[a.stage] ?? 3) - (STAGE_PRIORITY[b.stage] ?? 3)
-      );
+      const sortedCrops = [...areaCrops].sort((a, b) => {
+        const stageA = ctxMap.get(a.id)?.stage || a.stage;
+        const stageB = ctxMap.get(b.id)?.stage || b.stage;
+        return (STAGE_PRIORITY[stageA] ?? 3) - (STAGE_PRIORITY[stageB] ?? 3);
+      });
       const atRiskCrops = sortedCrops.slice(0, 3).map(c => c.name);
       const atRiskText = atRiskCrops.length > 0 ? " — pay particular attention to: " + atRiskCrops.join(", ") : "";
 
