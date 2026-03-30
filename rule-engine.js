@@ -1515,6 +1515,45 @@ class RuleEngine {
       finalCandidates = [{ ...best, surface_class: "task" }];
     }
 
+    // ── Null-crop safety net ──────────────────────────────────────────────────
+    // If a user still has zero surfaced candidates, check whether they have any
+    // active crops with no crop_def_id. These crops produce no engine output
+    // because the engine has no window/timing data to work with.
+    // Surface one gentle insight per unlinked crop (max 3) so the user sees
+    // something rather than an empty Today screen.
+    // Rules: surface_class = insight, low urgency, expires today, one per crop per day.
+    if (finalCandidates.length === 0) {
+      const nullDefCrops = crops.filter(c => !c.crop_def && c.status !== "planned" && c.status !== "finished");
+      const today = todayISO();
+      const nullFallbacks = nullDefCrops.slice(0, 3).map(c => ({
+        user_id:          userId,
+        crop_instance_id: c.id,
+        area_id:          c.area_id,
+        action:           `Check on your ${c.name} and log anything you notice`,
+        task_type:        "check",
+        urgency:          "low",
+        due_date:         today,
+        scheduled_for:    today,
+        visible_from:     today,
+        expires_at:       new Date(today + "T23:59:59Z").toISOString(),
+        status:           "due",
+        engine_type:      "scheduled",
+        record_type:      "task",
+        source:           "rule_engine",
+        rule_id:          "null_crop_fallback",
+        source_key:       sourceKey({ u: userId, c: c.id, r: "null_crop_fallback", d: today }),
+        date_confidence:  "approximate",
+        surface_class:    "insight",
+        meta:             JSON.stringify({ null_def: true }),
+        risk_payload:     null,
+        _score:           25,
+      }));
+      if (nullFallbacks.length > 0) {
+        console.log(`[RuleEngine] Null-crop fallback: ${nullFallbacks.length} insight(s) for user=${userId}`);
+        finalCandidates = nullFallbacks;
+      }
+    }
+
     // ── Run-level logging — always emit so suppression rates are visible ────────
     const nTask      = surfaced.length;
     const nInsight   = insights.length;
