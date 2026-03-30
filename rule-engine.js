@@ -1706,8 +1706,8 @@ class RuleEngine {
     if (!this.supabase) return [];
     const cutoff = new Date(Date.now() - 30 * 86400000).toISOString();
     const { data } = await this.supabase
-      .from("crop_observations")
-      .select("id, crop_id, symptom_code, observed_at, confirmed_stage, notes")
+      .from("observation_logs")
+      .select("id, crop_id, observation_type, symptom_code, observed_at, confirmed_stage, notes, resolved_at")
       .eq("user_id", userId)
       .gte("observed_at", cutoff)
       .order("observed_at", { ascending: false });
