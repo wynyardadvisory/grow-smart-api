@@ -485,22 +485,6 @@ class ScheduledRuleEngine {
         expiryDays:   14,
         leadTimeDays: 0,
       }));
-    } else if (hs && m < hs) {
-      // Upcoming harvest — show in Coming Up Soon
-      const harvestDate = monthToDate(hs, year, 1);
-      if (withinLookahead(harvestDate, LOOKAHEAD_DAYS.harvest)) {
-        results.push(candidate(ctx, {
-          ruleId:       "perennial_harvest_upcoming",
-        dedupeByName: true,
-          taskType:     "harvest",
-          title:        `${ctx.cropName} harvest season starts ${MONTHS[hs-1]} — prepare to pick regularly`,
-          description:  `Your ${ctx.cropName} harvest window opens in ${MONTHS[hs-1]}. Prepare to pick regularly once ripe.`,
-          scheduledFor: harvestDate,
-          urgency:      "low",
-          leadTimeDays: 7,
-          expiryDays:   7,
-        }));
-      }
     }
 
     // Spring feed — schedule for March 15 if in lookahead
@@ -625,22 +609,7 @@ class ScheduledRuleEngine {
       }));
     }
 
-    // Upcoming flowering — show in Coming Up Soon
-    if (fw && m < fw.start) {
-      const flowerDate = monthToDate(fw.start, year, 1);
-      if (withinLookahead(flowerDate, LOOKAHEAD_DAYS.seasonal)) {
-        results.push(candidate(ctx, {
-          ruleId:       "perennial_flowering_upcoming",
-        dedupeByName: true,
-          taskType:     "check",
-          title:        `${ctx.cropName} should start flowering in ${MONTHS[fw.start-1]} — watch for blossom and protect from late frosts`,
-          scheduledFor: flowerDate,
-          urgency:      "low",
-          expiryDays:   21,
-          leadTimeDays: 7,
-        }));
-      }
-    }
+
 
     return results;
   }
@@ -807,13 +776,12 @@ class ScheduledRuleEngine {
     const today          = todayISO();
     const m              = currentMonth();
 
-    // Is window open now or coming up within lookahead?
-    const windowOpenNow    = m >= sowStart && m <= sowEnd;
-    const windowUpcoming   = sowWindowStart > today && withinLookahead(sowWindowStart, LOOKAHEAD_DAYS.sow);
+    // Only fire sow prompt when the window is actually open — upcoming low-urgency
+    // prompts generated too much noise (2% completion rate) so removed.
+    const windowOpenNow = m >= sowStart && m <= sowEnd;
+    if (!windowOpenNow) return results;
 
-    if (!windowOpenNow && !windowUpcoming) return results;
-
-    const scheduledFor = windowOpenNow ? today : sowWindowStart;
+    const scheduledFor = today;
 
     // Frost suppression for outdoor sowing
     const isOutdoor = sowMethod === "outdoors" || sowMethod === "direct_sow" ||
@@ -821,15 +789,15 @@ class ScheduledRuleEngine {
     const hardFrost = frostSensitive && isOutdoor && ctx.frostRisk7day !== null && ctx.frostRisk7day <= 0;
     const softFrost = frostSensitive && isOutdoor && ctx.frostRisk7day !== null && ctx.frostRisk7day > 0 && ctx.frostRisk7day <= 3;
 
-    // Hard block — don't even show task
-    if (hardFrost && windowOpenNow) return results;
+    // Hard block — don't show task when hard frost is forecast
+    if (hardFrost) return results;
 
     let title, urgency, meta;
     const windowStr = `${MONTHS[sowStart-1]}–${MONTHS[sowEnd-1]}`;
 
     if (sowMethod === "indoors") {
       title   = `Sow ${ctx.cropName} indoors now — starting indoors gives stronger plants and an earlier harvest. Sowing window: ${windowStr}`;
-      urgency = windowOpenNow ? "medium" : "low";
+      urgency = "medium";
       meta    = { status_transition: "sown_indoors", sow_method: "indoors", can_prefer_outdoors: true };
     } else if (sowMethod === "tuber") {
       title   = softFrost
@@ -882,13 +850,18 @@ class ScheduledRuleEngine {
     const today       = todayISO();
     const m           = currentMonth();
 
-    const windowOpen     = m >= txStart && m <= txEnd;
-    const windowUpcoming = txDate > today && withinLookahead(txDate, LOOKAHEAD_DAYS.transplant);
+    // Only fire transplant prompt when window is actually open.
+    // Upcoming low-urgency prompts had 1.4% completion — removed.
+    // When frost is forecast, still show but as low urgency with advisory copy.
+    const windowOpen = m >= txStart && m <= txEnd;
+    if (!windowOpen) return results;
 
-    if (!windowOpen && !windowUpcoming) return results;
-
-    const scheduledFor = windowOpen ? today : txDate;
+    const scheduledFor = today;
     const frostRisk    = ctx.frostRisk;
+
+    // If hard frost (below 0), suppress entirely — not safe to even consider transplanting
+    const hardFrost7d = ctx.frostRisk7day !== null && ctx.frostRisk7day <= 0;
+    if (hardFrost7d) return results;
 
     const title = frostRisk
       ? `${cropName} is ready to transplant but frost is forecast — harden off and wait for a clear spell`
@@ -905,17 +878,19 @@ class ScheduledRuleEngine {
       meta:         { status_transition: "transplanted" },
     }));
 
-    // Harden off — show 1 week before transplant window
-    const hardenDate = addDays(txDate, -7);
-    if (hardenDate >= today && withinLookahead(hardenDate, LOOKAHEAD_DAYS.transplant)) {
+    // Harden off — only show when transplant is imminent (within 5 days)
+    // Previously fired 7 days before window open — 3.8% completion, too early and abstract.
+    const daysUntilTxWindow = daysBetween(today, txDate);
+    const hardenDate = addDays(txDate, -5);
+    if (hardenDate >= today && daysUntilTxWindow <= 5) {
       results.push(candidate(ctx, {
         ruleId:       "harden_off",
         taskType:     "check",
-        title:        `Start hardening off ${cropName} — put outside during the day, bring in at night for a week before transplanting`,
+        title:        `Start hardening off ${cropName} now — transplanting in a few days, put outside during the day and bring in at night`,
         scheduledFor: hardenDate,
         urgency:      "low",
-        expiryDays:   7,
-        leadTimeDays: 2,
+        expiryDays:   5,
+        leadTimeDays: 1,
       }));
     }
 
@@ -935,13 +910,18 @@ class ScheduledRuleEngine {
         // If overdue, schedule for today — feedNextDue already accounts for missed
         // tasks by anchoring from today when never fed (see buildCropContext)
         const scheduledFor = isOverdue(feedDue) ? today : feedDue;
+        // Escalate to high urgency during fruiting — skipping feeds at this stage
+        // directly reduces yield, so it warrants stronger signalling.
+        const feedUrgency = isOverdue(feedDue) ? "high"
+          : ctx.stage === "fruiting" ? "high"
+          : "medium";
         results.push(candidate(ctx, {
           ruleId:       "feed_scheduled",
           taskType:     "feed",
           title:        formatFeedAction(ctx.cropName, ctx.matchedFeed, ctx.feedType, "Time to feed"),
           description:  `Regular feeding is due for ${ctx.cropName}.`,
           scheduledFor,
-          urgency:      isOverdue(feedDue) ? "high" : "medium",
+          urgency:      feedUrgency,
           expiryDays:   7,
           leadTimeDays: LEAD_TIME_DAYS.feed,
         }));
@@ -971,10 +951,12 @@ class ScheduledRuleEngine {
         }
       }
 
-      if (!harvestWindowSuppressed && (
-        withinLookahead(harvestAlertDate, LOOKAHEAD_DAYS.harvest) ||
-        (ctx.estimatedHarvestDate >= addDays(today, -7) && ctx.estimatedHarvestDate <= addDays(today, 14))
-      )) {
+      // Tightened to 5-day window — previously fired up to 21 days ahead (9.2% completion).
+      // Harvest prompts are only actionable when harvest is genuinely imminent.
+      const harvestImminent = ctx.estimatedHarvestDate >= addDays(today, -3)
+        && ctx.estimatedHarvestDate <= addDays(today, 5);
+
+      if (!harvestWindowSuppressed && harvestImminent) {
         const scheduledFor = harvestAlertDate < today ? today : harvestAlertDate;
         results.push(candidate(ctx, {
           ruleId:       "harvest_approaching",
@@ -983,7 +965,7 @@ class ScheduledRuleEngine {
           description:  `Based on your sow date and variety, ${ctx.cropName} should be approaching harvest.`,
           scheduledFor,
           urgency:      "medium",
-          expiryDays:   21,
+          expiryDays:   7,
           leadTimeDays: LEAD_TIME_DAYS.harvest,
           meta:         { estimated_harvest_date: ctx.estimatedHarvestDate },
         }));
