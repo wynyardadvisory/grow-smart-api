@@ -388,6 +388,81 @@ function candidate(ctx, opts) {
   };
 }
 
+// ── Confidence scoring ───────────────────────────────────────────────────────
+// Scores each candidate 0–100 based on available signals.
+// Missing optional data (soil temp, pH) is NEUTRAL — does not penalise.
+// Only present data can add or subtract. This ensures data-poor users still
+// get tasks while advanced users get more precise outputs.
+//
+// Thresholds:
+//   >= 50 → task
+//   >= 30 → insight (surface_class = 'insight')
+//   <  30 → suppress (unless new-user fallback applies)
+
+function scoreCandidate(ctx, candidate) {
+  let score = 0;
+
+  // ── Base signals (always available) ────────────────────────────────────────
+
+  // Calendar window open — strongest base signal
+  // Inferred from task being generated within an open window
+  // We use rule_id to detect window-based rules
+  const windowRules = ["sow_prompt", "transplant_prompt", "harden_off", "perennial_harvest", "perennial_spring_feed"];
+  if (windowRules.includes(candidate.rule_id)) score += 20;
+
+  // Frost safe — positive signal
+  if (ctx.frostRisk7day !== null && ctx.frostRisk7day > 0) score += 20;
+
+  // Hard frost — strong negative signal
+  if (ctx.frostRisk7day !== null && ctx.frostRisk7day <= 0) score -= 30;
+
+  // Heavy rain — mild negative signal
+  if (ctx.rainMm !== null && ctx.rainMm >= 5) score -= 10;
+
+  // ── Stage confidence (common but optional) ─────────────────────────────────
+  if (ctx.stage_confidence === "confirmed") score += 20;
+
+  // ── Observation signals (high value when present, neutral if absent) ────────
+  if (ctx.recentPestObs?.length > 0) score += 15;
+
+  // Struggling suppresses generic tasks — reduce score significantly
+  if (ctx.isStruggling) score -= 20;
+
+  // ── Soil temperature (neutral if not available) ────────────────────────────
+  // ctx.soilTemp and ctx.soilTempMin populated when user has provided soil data
+  // and crop definition has a minimum threshold. Currently unused — wired for future.
+  if (ctx.soilTemp !== null && ctx.soilTemp !== undefined &&
+      ctx.soilTempMin !== null && ctx.soilTempMin !== undefined) {
+    if (ctx.soilTemp >= ctx.soilTempMin) score += 25;
+    else score -= 20;
+  }
+  // else → no effect (neutral for users without soil temp data)
+
+  // ── pH (neutral if not available) ─────────────────────────────────────────
+  if (ctx.ph !== null && ctx.ph !== undefined &&
+      ctx.phMin !== null && ctx.phMin !== undefined &&
+      ctx.phMax !== null && ctx.phMax !== undefined) {
+    if (ctx.ph >= ctx.phMin && ctx.ph <= ctx.phMax) score += 10;
+    else score -= 10;
+  }
+  // else → no effect
+
+  // ── Bypass — urgent, real-time, consequence-heavy rules always surface ───────
+  // These are already gated by their own risk/weather logic — don't double-suppress.
+  // Keep this list tight: only rules where suppression would cause real user harm.
+  // feed_scheduled and sow_prompt are NOT bypassed — let scoring filter weak signals.
+  const bypassRules = [
+    "pest_slugs_snails",   // dynamic pest risk — already gated by weather/season
+    "pest_flea_beetle",    // dynamic pest risk
+    "frost_alert",         // real-time weather alert — always urgent
+    "watering_due",        // area-level, already gated by rain/dry logic
+    "struggling_flag",     // user has flagged a problem — must surface
+  ];
+  if (bypassRules.includes(candidate.rule_id)) score = Math.max(score, 55);
+
+  return Math.max(0, score);
+}
+
 // ── Lifecycle mode helpers ─────────────────────────────────────────────────────
 // These are the single source of truth for routing engine behaviour by mode.
 // Always use these helpers — do not scatter raw lifecycleMode checks everywhere.
@@ -843,6 +918,11 @@ class ScheduledRuleEngine {
     // transplant and harden-off tasks entirely. They may still need
     // potting-on or spacing, but that is handled by growing rules.
     if (ctx.areaType === "greenhouse" || ctx.areaType === "polytunnel") return results;
+
+    // Tuber and crown crops are planted directly — not transplanted from indoor seedlings.
+    // They are handled by _evalSow where the tuber/crown path already exists.
+    // Running them through _evalIndoor causes duplicate transplant prompts (e.g. Potatoes).
+    if (ctx.sowMethod === "tuber" || ctx.sowMethod === "crown") return results;
 
     const year        = new Date().getFullYear();
     const txDate      = monthToDate(txStart, year, 1);
@@ -1399,12 +1479,95 @@ class RuleEngine {
       }
     }
 
-    // Upsert all candidates
-    if (!this.dryRun && this.supabase) {
-      await this._materialize(allCandidates);
+    // ── Confidence scoring + surface_class assignment ───────────────────────
+    // Score every candidate. Assign surface_class based on score.
+    // Suppress candidates below threshold, with new-user fallback.
+
+    const scoredCandidates = allCandidates.map(c => {
+      // Find the ctx for this candidate (area-level tasks have no crop_instance_id)
+      const ctx = c.crop_instance_id ? ctxMap.get(c.crop_instance_id) : null;
+      const score = ctx ? scoreCandidate(ctx, c) : 55; // area-level tasks (watering) default to surfaced
+      return { ...c, _score: score };
+    });
+
+    // Determine if user is new (within first 3 days of any crop being added)
+    const isNewUser = crops.some(crop => {
+      const created = crop.created_at ? new Date(crop.created_at) : null;
+      return created && (Date.now() - created.getTime()) < 3 * 86400000;
+    });
+
+    // Split into surfaced and suppressed
+    const surfaced = scoredCandidates.filter(c => c._score >= 50).map(c => ({
+      ...c, surface_class: "task",
+    }));
+    const insights = scoredCandidates.filter(c => c._score >= 30 && c._score < 50).map(c => ({
+      ...c, surface_class: "insight",
+    }));
+    const suppressed = scoredCandidates.filter(c => c._score < 30);
+
+    // Combine surfaced tasks and insights
+    let finalCandidates = [...surfaced, ...insights];
+
+    // New-user fallback — if nothing surfaced, promote highest-scoring suppressed candidate
+    if (finalCandidates.length === 0 && isNewUser && suppressed.length > 0) {
+      const best = suppressed.sort((a, b) => b._score - a._score)[0];
+      console.log(`[RuleEngine] New-user fallback: promoting ${best.rule_id} (score=${best._score})`);
+      finalCandidates = [{ ...best, surface_class: "task" }];
     }
 
-    return allCandidates;
+    // ── Run-level logging — always emit so suppression rates are visible ────────
+    const nTask      = surfaced.length;
+    const nInsight   = insights.length;
+    const nSuppressed = suppressed.length;
+    const nFallback  = (finalCandidates.length === 1 && finalCandidates[0]._score < 30) ? 1 : 0;
+    console.log(
+      `[RuleEngine] user=${userId} ` +
+      `total=${scoredCandidates.length} ` +
+      `task=${nTask} insight=${nInsight} suppressed=${nSuppressed} fallback=${nFallback}`
+    );
+
+    // Decision logging — strictly best-effort, never blocks task generation
+    if (this.supabase) {
+      this._logDecisions(userId, scoredCandidates, finalCandidates).catch(err => {
+        console.error("[RuleEngine] Decision log failed (non-fatal):", err.message);
+      });
+    }
+
+    // Upsert all candidates
+    if (!this.dryRun && this.supabase) {
+      await this._materialize(finalCandidates);
+    }
+
+    return finalCandidates;
+  }
+
+  // ── Decision logger ──────────────────────────────────────────────────────────
+  // Logs decisions for score >= 30 (surfaced and borderline suppressed).
+  // Suppressed low-score candidates are not logged to avoid noise.
+
+  async _logDecisions(userId, allScored, surfacedFinal) {
+    if (!this.supabase) return;
+    const surfacedKeys = new Set(surfacedFinal.map(c => c.source_key));
+    const toLog = allScored.filter(c => c._score >= 30);
+    if (!toLog.length) return;
+
+    const rows = toLog.map(c => ({
+      user_id:           userId,
+      crop_id:           c.crop_instance_id || null,
+      rule_id:           c.rule_id || null,
+      model_name:        "v1_max",
+      surface_class:     surfacedKeys.has(c.source_key) ? (c._score >= 50 ? "task" : "insight") : "suppressed",
+      score:             c._score,
+      surfaced:          surfacedKeys.has(c.source_key),
+      suppression_reason: !surfacedKeys.has(c.source_key) ? "score_below_threshold" : null,
+    }));
+
+    try {
+      await this.supabase.from("engine_decision_log").insert(rows);
+    } catch (err) {
+      // Non-fatal — log silently, don't break task generation
+      console.error("[RuleEngine] Decision log error:", err.message);
+    }
   }
 
   // ── Materializer — idempotent upsert ────────────────────────────────────────
@@ -1415,7 +1578,7 @@ class RuleEngine {
     for (const c of candidates) {
       try {
         // Strip internal fields
-        const { _description, _status, ...task } = c;
+        const { _description, _status, _score, ...task } = c;
 
         console.log(`[RuleEngine] Upserting: rule=${task.rule_id} type=${task.engine_type} status=${task.status} due=${task.due_date} key=${task.source_key?.slice(0,40)}`);
 
