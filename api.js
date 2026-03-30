@@ -4808,35 +4808,43 @@ async function buildEligibleUserSet(window) {
 app.post("/cron/push-morning", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-  res.json({ ok: true, status: "processing" });
   try {
     const { eligible, counts: preCounts, tokenMap, tasksByUser } = await buildEligibleUserSet("morning");
     console.log(`[PushMorning] Pre-filter: ${JSON.stringify(preCounts)}`);
+    let sendCounts = { sent: 0, failed: 0, no_candidate: 0 };
     if (!eligible.length) {
       console.log("[PushMorning] No eligible users — done.");
     } else {
-      const counts = await sendBulkNotifications(supabaseService, eligible, "morning", tokenMap, tasksByUser);
-      console.log(`[PushMorning] Eligible=${eligible.length} Sent=${counts.sent} Failed=${counts.failed} Other=${counts.no_candidate}`);
+      sendCounts = await sendBulkNotifications(supabaseService, eligible, "morning", tokenMap, tasksByUser);
+      console.log(`[PushMorning] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
     }
     const emailResult = await runDailyEmailFallback(supabaseService);
     console.log(`[EmailFallback] Sent: ${emailResult.sent}, Skipped: ${emailResult.skipped}`);
-  } catch(e) { captureError("PushMorning", e); }
+    res.json({ ok: true, eligible: eligible.length, ...sendCounts });
+  } catch(e) {
+    captureError("PushMorning", e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post("/cron/push-evening", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-  res.json({ ok: true, status: "processing" });
   try {
     const { eligible, counts: preCounts, tokenMap, tasksByUser } = await buildEligibleUserSet("evening");
     console.log(`[PushEvening] Pre-filter: ${JSON.stringify(preCounts)}`);
+    let sendCounts = { sent: 0, failed: 0, no_candidate: 0 };
     if (!eligible.length) {
       console.log("[PushEvening] No eligible users — done.");
     } else {
-      const counts = await sendBulkNotifications(supabaseService, eligible, "evening", tokenMap, tasksByUser);
-      console.log(`[PushEvening] Eligible=${eligible.length} Sent=${counts.sent} Failed=${counts.failed} Other=${counts.no_candidate}`);
+      sendCounts = await sendBulkNotifications(supabaseService, eligible, "evening", tokenMap, tasksByUser);
+      console.log(`[PushEvening] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
     }
-  } catch(e) { captureError("PushEvening", e); }
+    res.json({ ok: true, eligible: eligible.length, ...sendCounts });
+  } catch(e) {
+    captureError("PushEvening", e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // POST /cron/push-dry-run — verify eligibility without sending anything
