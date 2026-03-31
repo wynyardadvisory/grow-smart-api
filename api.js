@@ -3131,8 +3131,24 @@ app.get("/dashboard", requireAuth, async (req, res) => {
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   const today   = todayISO();
   const weekEnd = weekEndISO();
-  // Run expiry only — rule engine runs on cron and crop changes, not every page view
+  // Run expiry first
   await expireOverdueTasks(req.user.id, req.db);
+
+  // If user has no active tasks, run the engine now before returning dashboard data.
+  // This prevents users seeing an empty Today screen when they open the app between cron runs.
+  // Only fires when task count is zero — no performance impact on normal loads.
+  const { count: activeTaskCount } = await req.db
+    .from("tasks")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", req.user.id)
+    .is("completed_at", null)
+    .not("status", "eq", "expired");
+  if (activeTaskCount === 0) {
+    console.log(`[Dashboard] No active tasks for ${req.user.id} — running engine on demand`);
+    runRuleEngine(req.user.id).catch(err => {
+      console.error("[Dashboard] On-demand engine error:", err.message);
+    });
+  }
 
   // Start of current week (Monday)
   const nowDate    = new Date();
@@ -4987,10 +5003,10 @@ app.get("/sentry-test", (_req, _res) => {
 // Docs: https://www.revenuecat.com/docs/integrations/webhooks
 
 app.post("/webhooks/revenuecat",
+  express.raw({ type: "application/json" }), // raw body needed for auth header check
   async (req, res) => {
     try {
       // Verify the request is from RevenueCat using the shared secret
-      // RevenueCat sends the secret as a Bearer token in the Authorization header
       const authHeader = req.headers.authorization;
       const expectedSecret = process.env.REVENUECAT_WEBHOOK_SECRET;
       if (expectedSecret && authHeader !== `Bearer ${expectedSecret}`) {
@@ -4998,8 +5014,7 @@ app.post("/webhooks/revenuecat",
         return res.status(401).json({ error: "Unauthorised" });
       }
 
-      // Body is already parsed by global express.json() middleware
-      const body = req.body;
+      const body = JSON.parse(req.body);
       const event = body.event;
 
       if (!event) {
