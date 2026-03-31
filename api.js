@@ -3136,20 +3136,35 @@ app.get("/dashboard", requireAuth, async (req, res) => {
   // Run expiry first
   await expireOverdueTasks(req.user.id, req.db);
 
-  // If user has no active tasks, run the engine now before returning dashboard data.
-  // This prevents users seeing an empty Today screen when they open the app between cron runs.
-  // Only fires when task count is zero — no performance impact on normal loads.
-  const { count: activeTaskCount } = await req.db
+  // ── Synchronous on-demand engine ────────────────────────────────────────────
+  // Check whether the user has anything useful for today or this week.
+  // If today + this_week are both empty (even if coming_up has items), run the
+  // engine synchronously and re-query — so the response always contains fresh data.
+  // Guard: only runs when today AND this_week are empty to avoid running on every load.
+  // Timeout: engine is given 8 seconds max to avoid hanging the response.
+  let engineRanSync = false;
+  const { data: usefulTasks } = await req.db
     .from("tasks")
-    .select("id", { count: "exact", head: true })
+    .select("id, due_date, surface_class")
     .eq("user_id", req.user.id)
     .is("completed_at", null)
-    .not("status", "eq", "expired");
-  if (activeTaskCount === 0) {
-    console.log(`[Dashboard] No active tasks for ${req.user.id} — running engine on demand`);
-    runRuleEngine(req.user.id).catch(err => {
-      console.error("[Dashboard] On-demand engine error:", err.message);
-    });
+    .not("status", "eq", "expired")
+    .lte("due_date", weekEnd) // only today + this week
+    .neq("surface_class", "insight"); // exclude insights — not actionable tasks
+
+  const hasUsefulTasks = (usefulTasks || []).length > 0;
+
+  if (!hasUsefulTasks) {
+    console.log(`[Dashboard] No useful tasks for ${req.user.id} — running engine synchronously`);
+    try {
+      await Promise.race([
+        runRuleEngine(req.user.id),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("Engine timeout")), 8000)),
+      ]);
+      engineRanSync = true;
+    } catch (err) {
+      console.error("[Dashboard] Sync engine error:", err.message);
+    }
   }
 
   // Start of current week (Monday)
@@ -3298,15 +3313,35 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     else                frostRisk = "low";
   }
 
+  // Re-query tasks if engine ran synchronously — ensure fresh data in response
+  let finalTasks = tasks;
+  if (engineRanSync) {
+    const { data: freshTasks } = await req.db
+      .from("tasks")
+      .select("*, crop:crop_instance_id(name, variety, succession_group_id, succession_index), area:area_id(name)")
+      .eq("user_id", req.user.id).is("completed_at", null)
+      .not("status", "eq", "expired")
+      .order("urgency",  { ascending: false })
+      .order("due_date", { ascending: true });
+    finalTasks = freshTasks || tasks;
+  }
+
+  // Separate real tasks from insights — insights are informational, not actionable
+  const actionableTasks = finalTasks.filter(t => t.surface_class !== "insight");
+  const insightTasks    = finalTasks.filter(t => t.surface_class === "insight");
+
   res.json({
     user:             profile?.name,
     profile_photo:    profile?.photo_url || null,
     plan:             profile?.plan || "free",
+    engine_ran_sync:  engineRanSync,
     tasks: {
-      tasks:     tasks, // full list including overdue
-      today:     tasks.filter(t => t.due_date <= today),
-      this_week: tasks.filter(t => t.due_date > today && t.due_date <= weekEnd),
-      coming_up: tasks.filter(t => t.due_date > weekEnd),
+      tasks:     actionableTasks, // actionable only — insights excluded from main feed
+      today:     actionableTasks.filter(t => !t.record_type || t.record_type !== "alert").filter(t => t.due_date <= today),
+      this_week: actionableTasks.filter(t => !t.record_type || t.record_type !== "alert").filter(t => t.due_date > today && t.due_date <= weekEnd),
+      coming_up: actionableTasks.filter(t => !t.record_type || t.record_type !== "alert").filter(t => t.due_date > weekEnd),
+      alerts:    actionableTasks.filter(t => t.record_type === "alert"),
+      insights:  insightTasks, // separate bucket — frontend can show these differently
     },
     crop_count:       crops.length,
     crops_with_flags: crops.filter(c => c.missed_task_note).map(c => ({ id: c.id, name: c.name, missed_task_note: c.missed_task_note })),

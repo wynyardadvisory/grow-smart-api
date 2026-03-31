@@ -142,13 +142,14 @@ function buildCandidatesFromCache(userId, window, tasksByUser) {
       }
     }
 
-    // Priority 3: task due today
+    // Priority 3: task due today — exclude insights (informational only, not push-worthy)
     if (!candidates.length) {
       const dueTasks = tasks
         .filter(t =>
           !t.completed_at && t.status !== "expired" &&
           t.due_date <= today &&
-          t.task_type !== "check" && t.record_type !== "alert"
+          t.task_type !== "check" && t.record_type !== "alert" &&
+          t.surface_class !== "insight"
         )
         .sort((a, b) => (URGENCY_RANK[b.urgency] || 0) - (URGENCY_RANK[a.urgency] || 0));
 
@@ -203,12 +204,13 @@ function buildCandidatesFromCache(userId, window, tasksByUser) {
     }
 
   } else {
-    // Evening priority 1: missed due-today task
+    // Evening priority 1: missed due-today task — exclude insights
     const missed = tasks
       .filter(t =>
         !t.completed_at && t.status !== "expired" &&
         t.due_date <= today &&
-        ["high", "medium"].includes(t.urgency)
+        ["high", "medium"].includes(t.urgency) &&
+        t.surface_class !== "insight"
       )
       .sort((a, b) => (URGENCY_RANK[b.urgency] || 0) - (URGENCY_RANK[a.urgency] || 0))[0];
 
