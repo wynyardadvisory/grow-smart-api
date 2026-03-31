@@ -4979,6 +4979,150 @@ app.get("/sentry-test", (_req, _res) => {
   throw new Error("Sentry test error — Vercro API staging");
 });
 
+// =============================================================================
+// REVENUECAT WEBHOOK
+// =============================================================================
+// RevenueCat calls this endpoint when subscription events occur.
+// We update the user's plan in profiles based on the event type.
+// Docs: https://www.revenuecat.com/docs/integrations/webhooks
+
+app.post("/webhooks/revenuecat",
+  express.raw({ type: "application/json" }), // raw body needed for auth header check
+  async (req, res) => {
+    try {
+      // Verify the request is from RevenueCat using the shared secret
+      const authHeader = req.headers.authorization;
+      const expectedSecret = process.env.REVENUECAT_WEBHOOK_SECRET;
+      if (expectedSecret && authHeader !== `Bearer ${expectedSecret}`) {
+        console.warn("[RevenueCat] Webhook auth failed");
+        return res.status(401).json({ error: "Unauthorised" });
+      }
+
+      const body = JSON.parse(req.body);
+      const event = body.event;
+
+      if (!event) {
+        return res.status(400).json({ error: "No event in payload" });
+      }
+
+      const { type, app_user_id, expiration_at_ms, store } = event;
+
+      console.log(`[RevenueCat] Event: ${type} for user: ${app_user_id}`);
+
+      // Map RevenueCat app_user_id to our Supabase user ID
+      // We use the Supabase user UUID as the RevenueCat App User ID
+      const userId = app_user_id;
+
+      // Determine new plan state based on event type
+      // INITIAL_PURCHASE, RENEWAL, UNCANCELLATION → pro
+      // CANCELLATION, EXPIRATION, BILLING_ISSUE → free
+      // NON_SUBSCRIPTION_PURCHASE → pro (lifetime/one-off)
+
+      const proEvents = [
+        "INITIAL_PURCHASE",
+        "RENEWAL",
+        "UNCANCELLATION",
+        "NON_SUBSCRIPTION_PURCHASE",
+        "SUBSCRIBER_ALIAS",
+      ];
+
+      const freeEvents = [
+        "CANCELLATION",
+        "EXPIRATION",
+        "BILLING_ISSUE",
+      ];
+
+      let newPlan = null;
+      let proExpiresAt = null;
+
+      if (proEvents.includes(type)) {
+        newPlan = "pro";
+        proExpiresAt = expiration_at_ms
+          ? new Date(expiration_at_ms).toISOString()
+          : null;
+      } else if (freeEvents.includes(type)) {
+        newPlan = "free";
+        proExpiresAt = null;
+      }
+
+      if (!newPlan) {
+        // Unhandled event type — acknowledge and ignore
+        console.log(`[RevenueCat] Unhandled event type: ${type}`);
+        return res.status(200).json({ received: true });
+      }
+
+      // Update profile
+      const { error } = await supabaseService
+        .from("profiles")
+        .update({
+          plan:           newPlan,
+          pro_expires_at: proExpiresAt,
+          pro_source:     store || "revenuecat",
+          revenuecat_app_user_id: userId,
+        })
+        .eq("id", userId);
+
+      if (error) {
+        console.error("[RevenueCat] Profile update error:", error.message);
+        // Still return 200 so RevenueCat doesn't retry indefinitely
+        return res.status(200).json({ received: true, error: error.message });
+      }
+
+      console.log(`[RevenueCat] Updated user ${userId} to plan: ${newPlan}`);
+      return res.status(200).json({ received: true });
+
+    } catch (err) {
+      console.error("[RevenueCat] Webhook error:", err.message);
+      captureError("RevenueCat Webhook", err);
+      // Return 200 to prevent RevenueCat retrying on our parsing errors
+      return res.status(200).json({ received: true });
+    }
+  }
+);
+
+// =============================================================================
+// SUBSCRIPTION STATUS ENDPOINT
+// =============================================================================
+// Frontend calls this to get current subscription state for the user.
+
+app.get("/subscription/status", requireAuth, async (req, res) => {
+  try {
+    const { data: profile, error } = await req.db
+      .from("profiles")
+      .select("plan, pro_expires_at, pro_source")
+      .eq("id", req.user.id)
+      .single();
+
+    if (error) throw error;
+
+    const isPro = profile?.plan === "pro";
+    const isExpired = profile?.pro_expires_at
+      ? new Date(profile.pro_expires_at) < new Date()
+      : false;
+
+    // If pro but expired, downgrade automatically
+    if (isPro && isExpired) {
+      await supabaseService
+        .from("profiles")
+        .update({ plan: "free", pro_expires_at: null })
+        .eq("id", req.user.id);
+
+      return res.json({ plan: "free", is_pro: false, expired: true });
+    }
+
+    return res.json({
+      plan:           profile?.plan || "free",
+      is_pro:         isPro && !isExpired,
+      pro_expires_at: profile?.pro_expires_at || null,
+      pro_source:     profile?.pro_source || null,
+    });
+
+  } catch (err) {
+    captureError("SubscriptionStatus", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Sentry error handler — must be before any other error middleware ──────────
 Sentry.setupExpressErrorHandler(app);
 
