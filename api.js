@@ -46,6 +46,8 @@ function captureError(context, err, extra = {}) {
 }
 
 const { RuleEngine } = require("./rule-engine");
+const Stripe = require("stripe");
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const { applyBlockedPeriodAdjustments, reapplyAllBlockedPeriods } = require("./blocked-period-adjustment");
 const { runNotificationsForUser, sendBulkNotifications } = require("./notifications");
 const { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement, runDailyEmailFallback } = require("./emails");
@@ -5140,6 +5142,175 @@ app.get("/subscription/status", requireAuth, async (req, res) => {
 
   } catch (err) {
     captureError("SubscriptionStatus", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// =============================================================================
+// STRIPE — WEB SUBSCRIPTION CHECKOUT
+// =============================================================================
+
+const STRIPE_PRICES = {
+  early:    "price_1TGz47D44o8wCiOZ9mG7HREJ", // £49/year — early subscriber loyalty price
+  standard: "price_1TGz5jD44o8wCiOZIsEcIwBT", // £79/year — standard price
+};
+
+// POST /subscription/create-checkout
+// Creates a Stripe Checkout session for web subscribers.
+// Returns a URL to redirect the user to Stripe's hosted checkout page.
+app.post("/subscription/create-checkout", requireAuth, async (req, res) => {
+  try {
+    const { price_type = "standard" } = req.body; // "early" or "standard"
+    const priceId = STRIPE_PRICES[price_type] || STRIPE_PRICES.standard;
+
+    // Get or create Stripe customer linked to this user
+    const { data: profile } = await supabaseService
+      .from("profiles")
+      .select("email, stripe_customer_id")
+      .eq("id", req.user.id)
+      .single();
+
+    let customerId = profile?.stripe_customer_id;
+
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: profile?.email || req.user.email,
+        metadata: { supabase_user_id: req.user.id },
+      });
+      customerId = customer.id;
+
+      // Save customer ID to profile
+      await supabaseService
+        .from("profiles")
+        .update({ stripe_customer_id: customerId })
+        .eq("id", req.user.id);
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      customer: customerId,
+      mode: "subscription",
+      payment_method_types: ["card"],
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: "https://app.vercro.com/?subscribed=true",
+      cancel_url:  "https://app.vercro.com/?subscription_cancelled=true",
+      metadata: {
+        supabase_user_id: req.user.id,
+        price_type,
+      },
+      subscription_data: {
+        metadata: {
+          supabase_user_id: req.user.id,
+          price_type,
+        },
+      },
+    });
+
+    res.json({ url: session.url, session_id: session.id });
+  } catch (err) {
+    captureError("StripeCheckout", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /subscription/stripe-webhook
+// Stripe calls this when subscription events occur.
+// Uses raw body for Stripe signature verification.
+app.post("/subscription/stripe-webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"];
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    } catch (err) {
+      console.error("[Stripe] Webhook signature failed:", err.message);
+      return res.status(400).json({ error: `Webhook error: ${err.message}` });
+    }
+
+    console.log(`[Stripe] Event: ${event.type}`);
+
+    try {
+      if (event.type === "checkout.session.completed") {
+        const session = event.data.object;
+        const userId = session.metadata?.supabase_user_id;
+        if (userId) {
+          await supabaseService.from("profiles").update({
+            plan:       "pro",
+            pro_source: "stripe",
+          }).eq("id", userId);
+          console.log(`[Stripe] checkout.session.completed — upgraded user ${userId} to pro`);
+        }
+      }
+
+      if (event.type === "invoice.payment_succeeded") {
+        const invoice = event.data.object;
+        const customerId = invoice.customer;
+        const { data: profile } = await supabaseService
+          .from("profiles")
+          .select("id")
+          .eq("stripe_customer_id", customerId)
+          .single();
+        if (profile) {
+          const periodEnd = invoice.lines?.data?.[0]?.period?.end;
+          await supabaseService.from("profiles").update({
+            plan:           "pro",
+            pro_source:     "stripe",
+            pro_expires_at: periodEnd ? new Date(periodEnd * 1000).toISOString() : null,
+          }).eq("id", profile.id);
+          console.log(`[Stripe] invoice.payment_succeeded — renewed pro for user ${profile.id}`);
+        }
+      }
+
+      if (event.type === "customer.subscription.deleted" ||
+          event.type === "invoice.payment_failed") {
+        const obj = event.data.object;
+        const customerId = obj.customer;
+        const { data: profile } = await supabaseService
+          .from("profiles")
+          .select("id")
+          .eq("stripe_customer_id", customerId)
+          .single();
+        if (profile) {
+          await supabaseService.from("profiles").update({
+            plan:           "free",
+            pro_expires_at: null,
+          }).eq("id", profile.id);
+          console.log(`[Stripe] ${event.type} — downgraded user ${profile.id} to free`);
+        }
+      }
+    } catch (err) {
+      console.error("[Stripe] Webhook handler error:", err.message);
+      captureError("StripeWebhook", err);
+    }
+
+    res.json({ received: true });
+  }
+);
+
+// GET /subscription/manage
+// Returns a Stripe billing portal URL so users can manage/cancel their subscription.
+app.get("/subscription/manage", requireAuth, async (req, res) => {
+  try {
+    const { data: profile } = await supabaseService
+      .from("profiles")
+      .select("stripe_customer_id")
+      .eq("id", req.user.id)
+      .single();
+
+    if (!profile?.stripe_customer_id) {
+      return res.status(404).json({ error: "No subscription found" });
+    }
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer:   profile.stripe_customer_id,
+      return_url: "https://app.vercro.com/",
+    });
+
+    res.json({ url: session.url });
+  } catch (err) {
+    captureError("StripeManage", err);
     res.status(500).json({ error: err.message });
   }
 });
