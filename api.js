@@ -4987,10 +4987,10 @@ app.get("/sentry-test", (_req, _res) => {
 // Docs: https://www.revenuecat.com/docs/integrations/webhooks
 
 app.post("/webhooks/revenuecat",
-  express.raw({ type: "application/json" }), // raw body needed for auth header check
   async (req, res) => {
     try {
       // Verify the request is from RevenueCat using the shared secret
+      // RevenueCat sends the secret as a Bearer token in the Authorization header
       const authHeader = req.headers.authorization;
       const expectedSecret = process.env.REVENUECAT_WEBHOOK_SECRET;
       if (expectedSecret && authHeader !== `Bearer ${expectedSecret}`) {
@@ -4998,7 +4998,8 @@ app.post("/webhooks/revenuecat",
         return res.status(401).json({ error: "Unauthorised" });
       }
 
-      const body = JSON.parse(req.body);
+      // Body is already parsed by global express.json() middleware
+      const body = req.body;
       const event = body.event;
 
       if (!event) {
