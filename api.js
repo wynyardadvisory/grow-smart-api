@@ -5007,14 +5007,19 @@ app.post("/webhooks/revenuecat",
   async (req, res) => {
     try {
       // Verify the request is from RevenueCat using the shared secret
+      // RevenueCat sends the secret as a plain string OR as "Bearer <secret>"
       const authHeader = req.headers.authorization;
       const expectedSecret = process.env.REVENUECAT_WEBHOOK_SECRET;
-      if (expectedSecret && authHeader !== `Bearer ${expectedSecret}`) {
-        console.warn("[RevenueCat] Webhook auth failed");
-        return res.status(401).json({ error: "Unauthorised" });
+      if (expectedSecret) {
+        const isValid = authHeader === expectedSecret ||
+                        authHeader === `Bearer ${expectedSecret}`;
+        if (!isValid) {
+          console.warn("[RevenueCat] Webhook auth failed — header:", authHeader?.slice(0, 20));
+          return res.status(401).json({ error: "Unauthorised" });
+        }
       }
 
-      const body = JSON.parse(req.body);
+      const body = req.body;
       const event = body.event;
 
       if (!event) {
