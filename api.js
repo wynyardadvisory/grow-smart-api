@@ -441,7 +441,7 @@ app.post("/areas", requireAuth,
 );
 
 app.put("/areas/:id", requireAuth, async (req, res) => {
-  const allowed = ["name","type","width_m","length_m","sun_exposure","notes","soil_ph","soil_temperature_c"];
+  const allowed = ["name","type","width_m","length_m","sun_exposure","notes","soil_ph","soil_temperature_c","layout_x","layout_y","rotation","shape_type"];
   const updates = Object.fromEntries(Object.entries(req.body).filter(([k]) => allowed.includes(k)));
   // Normalise numeric fields — empty string → null, validate ranges
   for (const field of ["width_m","length_m","soil_ph","soil_temperature_c"]) {
@@ -3566,7 +3566,9 @@ function isMarkAccount(req) {
 async function userIsPro(req) {
   if (isMarkAccount(req)) return true;
   const { data: profile } = await req.db.from("profiles")
-    .select("plan").eq("id", req.user.id).single();
+    .select("plan, is_demo").eq("id", req.user.id).single();
+  // Demo accounts get unlimited Plant Check — they exist to showcase the product
+  if (profile?.is_demo) return true;
   return profile?.plan === "pro";
 }
 
