@@ -3552,9 +3552,23 @@ app.delete("/harvest/:id", requireAuth, async (req, res) => {
 
 // =============================================================================
 // DIAGNOSIS LOG
-// Phase 1: routes exist, table stores records. AI call + UI are Phase 2.
-// Free plan: 3 diagnoses/month. Grow/Pro: unlimited.
+// Free plan: 3 lifetime diagnoses then paywall.
+// Mark's account (ADMIN_EMAIL) always bypasses plan checks — full Pro access.
 // =============================================================================
+
+// ── Pro bypass helper ─────────────────────────────────────────────────────────
+// Mark's account always has Pro access regardless of plan or PRO_ENABLED flag.
+// This lets the founder test all Pro features in production without affecting users.
+function isMarkAccount(req) {
+  return req.user?.email === ADMIN_EMAIL;
+}
+
+async function userIsPro(req) {
+  if (isMarkAccount(req)) return true;
+  const { data: profile } = await req.db.from("profiles")
+    .select("plan").eq("id", req.user.id).single();
+  return profile?.plan === "pro";
+}
 
 app.get("/diagnoses", requireAuth, async (req, res) => {
   const { crop_instance_id } = req.query;
@@ -3568,24 +3582,39 @@ app.get("/diagnoses", requireAuth, async (req, res) => {
   res.json(data);
 });
 
+// GET /diagnoses/count — how many lifetime diagnoses this user has used
+app.get("/diagnoses/count", requireAuth, async (req, res) => {
+  try {
+    const pro = await userIsPro(req);
+    const { count } = await req.db.from("diagnosis_log")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", req.user.id);
+    res.json({
+      count: count || 0,
+      limit: 3,
+      is_pro: pro,
+      remaining: pro ? null : Math.max(0, 3 - (count || 0)),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/diagnoses", requireAuth,
   [body("crop_instance_id").optional().isUUID()],
   async (req, res) => {
     if (!validate(req, res)) return;
 
-    // Plan check — free users capped at 3 diagnoses per calendar month
-    const { data: profile } = await req.db.from("profiles")
-      .select("plan").eq("id", req.user.id).single();
-    if (!profile?.plan || profile.plan === "free") {
-      const monthStart = new Date();
-      monthStart.setDate(1); monthStart.setHours(0, 0, 0, 0);
+    // Plan check — free users capped at 3 lifetime diagnoses
+    // Mark's account always bypasses
+    const pro = await userIsPro(req);
+    if (!pro) {
       const { count } = await req.db.from("diagnosis_log")
         .select("id", { count: "exact", head: true })
-        .eq("user_id", req.user.id)
-        .gte("created_at", monthStart.toISOString());
-      if (count >= 3) {
+        .eq("user_id", req.user.id);
+      if ((count || 0) >= 3) {
         return res.status(403).json({
-          error: "Monthly diagnosis limit reached on free plan. Upgrade to Grow for unlimited diagnoses.",
+          error: "You've used your 3 free plant checks. Upgrade to Pro for unlimited diagnosis.",
           upgrade_required: true,
         });
       }
@@ -3605,6 +3634,259 @@ app.post("/diagnoses", requireAuth,
     res.status(201).json(data);
   }
 );
+
+// =============================================================================
+// POST /diagnoses/analyze
+// Full Claude Vision plant check. Assembles rich context from crop, area,
+// location, neighbours, weather, and recent activity before calling Claude.
+// Returns structured diagnosis result. Logs to diagnosis_log on success.
+// Mark's account always bypasses plan limits.
+// =============================================================================
+
+app.post("/diagnoses/analyze", requireAuth, async (req, res) => {
+  const { crop_instance_id, image } = req.body;
+  if (!image)             return res.status(400).json({ error: "image required" });
+  if (!crop_instance_id)  return res.status(400).json({ error: "crop_instance_id required" });
+
+  try {
+    // ── Plan check ────────────────────────────────────────────────────────────
+    const pro = await userIsPro(req);
+    if (!pro) {
+      const { count } = await req.db.from("diagnosis_log")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", req.user.id);
+      if ((count || 0) >= 3) {
+        return res.status(403).json({
+          error: "You've used your 3 free plant checks. Upgrade to Pro for unlimited diagnosis.",
+          upgrade_required: true,
+          count: count || 0,
+        });
+      }
+    }
+
+    // ── Assemble crop context ─────────────────────────────────────────────────
+    const { data: crop, error: cropErr } = await req.db.from("crop_instances")
+      .select("*, area:area_id(id, name, type, location_id), crop_def:crop_def_id(name, category, pest_notes, pest_window_start, pest_window_end, days_to_maturity_min, days_to_maturity_max, companions, avoid), variety:variety_id(name, days_to_maturity_min, days_to_maturity_max)")
+      .eq("id", crop_instance_id)
+      .eq("user_id", req.user.id)
+      .single();
+
+    if (cropErr || !crop) return res.status(404).json({ error: "Crop not found" });
+
+    // ── Neighbouring crops in same area ──────────────────────────────────────
+    const { data: neighbours } = await supabaseService.from("crop_instances")
+      .select("name, variety")
+      .eq("area_id", crop.area_id)
+      .eq("active", true)
+      .neq("id", crop_instance_id)
+      .limit(8);
+
+    // ── Weather context ───────────────────────────────────────────────────────
+    let weatherCtx = null;
+    try {
+      const { data: loc } = await req.db.from("locations")
+        .select("postcode").eq("id", crop.area?.location_id).single();
+      if (loc?.postcode) {
+        const postcode = loc.postcode.trim().split(" ")[0].toUpperCase();
+        const { data: wx } = await supabaseService.from("weather_cache")
+          .select("temp_c, condition, frost_risk, frost_risk_7day, rain_mm")
+          .eq("postcode", postcode)
+          .gt("expires_at", new Date().toISOString())
+          .single();
+        if (wx) weatherCtx = wx;
+      }
+    } catch(_) {}
+
+    // ── Recent activity ───────────────────────────────────────────────────────
+    const { data: recentTasks } = await req.db.from("tasks")
+      .select("action, task_type, completed_at")
+      .eq("crop_instance_id", crop_instance_id)
+      .not("completed_at", "is", null)
+      .order("completed_at", { ascending: false })
+      .limit(5);
+
+    // ── Previous diagnoses for this crop ─────────────────────────────────────
+    const { data: prevDiagnoses } = await req.db.from("diagnosis_log")
+      .select("diagnosis, severity, created_at")
+      .eq("crop_instance_id", crop_instance_id)
+      .order("created_at", { ascending: false })
+      .limit(3);
+
+    // ── Build prompt ──────────────────────────────────────────────────────────
+    const cropName    = crop.crop_def?.name || crop.name || "Unknown crop";
+    const variety     = crop.variety?.name || crop.variety || null;
+    const areaType    = crop.area?.type?.replace(/_/g, " ") || "growing area";
+    const currentStage = crop.stage || "unknown";
+    const sowDate     = crop.sown_date || crop.transplanted_date || null;
+    const lastWatered = crop.last_watered_at ? new Date(crop.last_watered_at).toLocaleDateString("en-GB") : "unknown";
+    const lastFed     = crop.last_fed_at ? new Date(crop.last_fed_at).toLocaleDateString("en-GB") : "unknown";
+
+    const neighbourStr = neighbours?.length
+      ? neighbours.map(n => `${n.name}${n.variety ? " (" + n.variety + ")" : ""}`).join(", ")
+      : "none recorded";
+
+    const weatherStr = weatherCtx
+      ? `Current temp: ${weatherCtx.temp_c}°C, Conditions: ${weatherCtx.condition}, Frost risk next 7 days: ${weatherCtx.frost_risk_7day !== undefined ? weatherCtx.frost_risk_7day + "°C min" : "unknown"}, Recent rain: ${weatherCtx.rain_mm || 0}mm`
+      : "Weather data unavailable";
+
+    const recentStr = recentTasks?.length
+      ? recentTasks.map(t => `${t.task_type}: ${t.action} (${new Date(t.completed_at).toLocaleDateString("en-GB")})`).join("; ")
+      : "No recent tasks logged";
+
+    const prevStr = prevDiagnoses?.length
+      ? prevDiagnoses.map(d => `${new Date(d.created_at).toLocaleDateString("en-GB")}: ${d.diagnosis} (${d.severity})`).join("; ")
+      : "No previous diagnoses";
+
+    const currentMonth = new Date().getMonth() + 1;
+    const pestWindow = crop.crop_def?.pest_window_start && crop.crop_def?.pest_window_end
+      ? currentMonth >= crop.crop_def.pest_window_start && currentMonth <= crop.crop_def.pest_window_end
+      : false;
+
+    const prompt = `You are an expert UK horticulturalist and plant pathologist helping a home grower or allotment holder.
+
+Analyse this photo of a growing plant and provide a structured diagnosis.
+
+CROP CONTEXT:
+- Crop: ${cropName}${variety ? " (" + variety + ")" : ""}
+- Recorded lifecycle stage: ${currentStage}
+- Sow/transplant date: ${sowDate || "not recorded"}
+- Growing in: ${areaType}
+- Last watered: ${lastWatered}
+- Last fed: ${lastFed}
+- Neighbouring crops in same area: ${neighbourStr}
+- Currently in peak pest risk window: ${pestWindow ? "YES" : "no"}
+- Pest notes: ${crop.crop_def?.pest_notes || "none"}
+- Companion plants (beneficial): ${(crop.crop_def?.companions || []).join(", ") || "none recorded"}
+
+ENVIRONMENTAL CONTEXT:
+- ${weatherStr}
+- Month: ${new Date().toLocaleString("en-GB", { month: "long" })}
+
+RECENT ACTIVITY:
+- ${recentStr}
+
+PREVIOUS DIAGNOSES FOR THIS CROP:
+- ${prevStr}
+
+YOUR TASK:
+Examine the photo carefully. Respond ONLY with a JSON object — no markdown, no preamble.
+
+Return this exact structure:
+{
+  "problem_detected": true or false,
+  "problem_name": "name of disease/pest/deficiency or null",
+  "problem_description": "1-2 sentence description of what you can see or null",
+  "severity": "low" | "medium" | "high" | null,
+  "stage_detected": "seed" | "seedling" | "vegetative" | "flowering" | "fruiting" | "harvesting" | null,
+  "stage_confidence": "low" | "medium" | "high" | null,
+  "stage_matches_record": true or false or null,
+  "harvest_readiness": "ready" | "soon" | "not_ready" | null,
+  "harvest_readiness_detail": "1 sentence e.g. 'Ready to pick now' or 'Allow another 1-2 weeks' or null",
+  "yield_impact_pct": integer between -80 and 0 or null (negative = yield reduction, null = no impact detected),
+  "quality_impact": "none" | "low" | "medium" | "high" | null,
+  "treatment_steps": ["step 1", "step 2"] or [],
+  "prevention_tips": ["tip 1", "tip 2"] or [],
+  "reasoning_summary": "2-3 sentence plain English summary of your overall assessment",
+  "requires_confirmation": true or false,
+  "confirmation_prompt": "Short question to ask user before updating their crop record, e.g. 'Your tomatoes look like they are at flowering stage — update your crop record?' or null",
+  "looks_healthy": true or false
+}
+
+RULES:
+- stage_detected: only fill if you can clearly see the growth stage from the photo
+- harvest_readiness: only fill if this is a fruiting/harvesting crop and readiness is visible
+- requires_confirmation: set true ONLY if stage_detected differs from recorded stage OR harvest_readiness is "ready" or "soon"
+- yield_impact_pct: estimate realistically for UK conditions. A mild mildew might be -10%, severe blight -50%
+- treatment_steps: practical, UK-specific steps. Maximum 4 steps.
+- If the photo is unclear or not a plant, set problem_detected: false and explain in reasoning_summary
+- Base everything on UK growing conditions and the specific crop context provided`;
+
+    // ── Call Claude Vision ────────────────────────────────────────────────────
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1200,
+        messages: [{
+          role: "user",
+          content: [
+            {
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: "image/jpeg",
+                data: image,
+              },
+            },
+            { type: "text", text: prompt },
+          ],
+        }],
+      }),
+    });
+
+    const raw  = await response.json();
+    const text = raw.content?.[0]?.text || "";
+
+    let result;
+    try {
+      const match = text.match(/\{[\s\S]*\}/);
+      if (!match) throw new Error("No JSON in response");
+      result = JSON.parse(match[0]);
+    } catch {
+      throw new Error(`Claude returned unparseable response: ${text.slice(0, 200)}`);
+    }
+
+    // ── Validate result before logging ───────────────────────────────────────
+    // Only count as a use if Claude returned a meaningful, usable result.
+    // A response missing both problem_detected and looks_healthy is a failed
+    // analysis — don't charge the user a use for an upstream failure.
+    const isUsableResult = (
+      typeof result.problem_detected === "boolean" ||
+      typeof result.looks_healthy === "boolean" ||
+      result.stage_detected ||
+      result.harvest_readiness
+    );
+
+    if (!isUsableResult) {
+      throw new Error("Claude returned an incomplete analysis result — not counted as a use");
+    }
+
+    // ── Log to diagnosis_log — only on successful analysis ────────────────────
+    const { data: logEntry, error: logErr } = await req.db.from("diagnosis_log").insert({
+      user_id:          req.user.id,
+      crop_instance_id: crop_instance_id,
+      diagnosis:        result.problem_name || (result.looks_healthy ? "Healthy" : "No issue detected"),
+      severity:         result.severity || null,
+      confidence:       result.stage_confidence || null,
+      ai_model:         "claude-sonnet-4-20250514",
+    }).select().single();
+
+    if (logErr) console.error("[DiagnosisAnalyze] Log error:", logErr.message);
+
+    // ── Return result with usage info ─────────────────────────────────────────
+    const { count: newCount } = await req.db.from("diagnosis_log")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", req.user.id);
+
+    res.json({
+      ...result,
+      diagnosis_id: logEntry?.id || null,
+      is_pro: pro,
+      diagnoses_used: newCount || 1,
+      diagnoses_remaining: pro ? null : Math.max(0, 3 - (newCount || 1)),
+    });
+
+  } catch (err) {
+    console.error("[DiagnosisAnalyze] Error:", err.message);
+    captureError("DiagnosisAnalyze", err, { crop_instance_id });
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // =============================================================================
 // RULE ENGINE — manual trigger
