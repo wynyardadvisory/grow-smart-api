@@ -4437,14 +4437,18 @@ app.post("/crops/:id/log-action", requireAuth, async (req, res) => {
                       : action_type === "pruned" ? "pruned_mulched"
                       : action_type;
 
-  // Write to observation_logs (existing behaviour — keep for continuity)
-  await req.db.from("observation_logs").insert({
-    user_id: req.user.id, crop_id: req.params.id,
-    observed_at: today, observation_type: canonicalType, notes: notes || null,
-  });
+  // Write to observation_logs (existing behaviour — non-fatal if fails)
+  try {
+    await req.db.from("observation_logs").insert({
+      user_id: req.user.id, crop_id: req.params.id,
+      observed_at: today, observation_type: canonicalType, notes: notes || null,
+    });
+  } catch(obsErr) { console.error("[LogAction] observation_logs insert failed:", obsErr.message); }
 
-  // Write to manual_activity_logs (new canonical source of truth)
-  await writeActivityLog(req.user.id, canonicalType, "crop", req.params.id, now, notes, custom_label);
+  // Write to manual_activity_logs (non-fatal if fails)
+  try {
+    await writeActivityLog(req.user.id, canonicalType, "crop", req.params.id, now, notes, custom_label);
+  } catch(malErr) { console.error("[LogAction] manual_activity_logs insert failed:", malErr.message); }
 
   // Update summary timestamps + build hint
   const updates = { updated_at: now };
@@ -4577,8 +4581,10 @@ app.post("/activity/log", requireAuth, async (req, res) => {
     }
   }
 
-  // Always write to manual_activity_logs
-  await writeActivityLog(userId, activity_type, scope_type, scope_id, now, notes, custom_label);
+  // Always write to manual_activity_logs (non-fatal if fails)
+  try {
+    await writeActivityLog(userId, activity_type, scope_type, scope_id, now, notes, custom_label);
+  } catch(malErr) { console.error("[ActivityLog] manual_activity_logs insert failed:", malErr.message); }
 
   // Re-run engine for actions that affect scheduling
   if (activity_type === "watered" || activity_type === "fed") {
