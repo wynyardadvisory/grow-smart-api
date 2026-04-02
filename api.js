@@ -5826,7 +5826,7 @@ function _pickCrop(category, cropDefs, preferredCropIds = new Set()) {
   return pool[Math.floor(Math.random() * Math.min(pool.length, 5))];
 }
 
-function _buildOption(name, areaAssignments, currentStateMap, cropDefs, goal, preferredCropIds) {
+function _buildOption(name, areaAssignments, currentStateMap, cropDefs, goal, preferredCropIds, varietyMap = {}) {
   let totalRotation = 0, totalYield = 0, totalEase = 0, count = 0;
   const assignments = [];
   for (const { area, category } of areaAssignments) {
@@ -5840,12 +5840,21 @@ function _buildOption(name, areaAssignments, currentStateMap, cropDefs, goal, pr
     totalEase     += eScore;
     count++;
     const cropDef = _pickCrop(category, cropDefs, preferredCropIds);
+    const cropDefId = cropDef ? cropDef.id : null;
+    // Pick default variety if available, otherwise first variety
+    const varieties = cropDefId ? (varietyMap[cropDefId] || []) : [];
+    const defaultVar = varieties.find(v => v.is_default) || varieties[0] || null;
+    const displayName = cropDef
+      ? (defaultVar ? `${cropDef.name} (${defaultVar.name})` : cropDef.name)
+      : category;
     assignments.push({
       area_id:            area.id,
       area_name:          area.name,
       category,
-      crop_definition_id: cropDef ? cropDef.id   : null,
-      crop_name:          cropDef ? cropDef.name : category,
+      crop_definition_id: cropDefId,
+      variety_id:         defaultVar ? defaultVar.id : null,
+      variety_name:       defaultVar ? defaultVar.name : null,
+      crop_name:          displayName,
       crop_emoji:         cropDef ? (cropDef.emoji || "🌱") : "🌱",
       rotation_score:     rotScore,
     });
@@ -5862,7 +5871,7 @@ function _buildOption(name, areaAssignments, currentStateMap, cropDefs, goal, pr
   };
 }
 
-function _generateOptions(goal, rotatableAreas, currentStateMap, cropDefs, userFavCats, preferredCropIds = new Set()) {
+function _generateOptions(goal, rotatableAreas, currentStateMap, cropDefs, userFavCats, preferredCropIds = new Set(), varietyMap = {}) {
   const allCats = ["legume", "brassica", "root", "fruiting", "allium", "salad"];
 
   if (goal === "best_rotation") {
@@ -5971,9 +5980,9 @@ function _generateOptions(goal, rotatableAreas, currentStateMap, cropDefs, userF
       return { area, category: nextList[0] || currentCats[i % currentCats.length] };
     });
     return [
-      _buildOption("Rotate Your Crops", assignA, currentStateMap, cropDefs, goal, preferredCropIds),
-      _buildOption("Book Rotation", assignB, currentStateMap, cropDefs, goal, preferredCropIds),
-      _buildOption("Add a Legume Year", assignC, currentStateMap, cropDefs, goal, preferredCropIds),
+      _buildOption("Rotate Your Crops", assignA, currentStateMap, cropDefs, goal, preferredCropIds, varietyMap),
+      _buildOption("Book Rotation", assignB, currentStateMap, cropDefs, goal, preferredCropIds, varietyMap),
+      _buildOption("Add a Legume Year", assignC, currentStateMap, cropDefs, goal, preferredCropIds, varietyMap),
     ];
   }
 
@@ -6038,6 +6047,17 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
       .select("id, name, category, emoji, sow_direct_start, sow_indoors_start")
       .eq("hidden", false);
 
+    // Fetch default varieties for crop defs so we can suggest specific varieties
+    const { data: allVarieties } = await supabaseService
+      .from("varieties")
+      .select("id, crop_def_id, name, is_default")
+      .eq("active", true);
+    const varietyMap = {};
+    for (const v of (allVarieties || [])) {
+      if (!varietyMap[v.crop_def_id]) varietyMap[v.crop_def_id] = [];
+      varietyMap[v.crop_def_id].push(v);
+    }
+
     const categoryCounts = {};
     for (const crop of (currentCrops || [])) {
       const cat = crop.crop_definitions && crop.crop_definitions.category;
@@ -6047,7 +6067,7 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
 
     // Build set of crop def IDs the user actually grows — for crop selection preference
     const preferredCropIds = new Set((currentCrops || []).map(c => c.crop_def_id).filter(Boolean));
-    const options = _generateOptions(goal, rotatableAreas, currentStateMap, cropDefs || [], userFavCats, preferredCropIds);
+    const options = _generateOptions(goal, rotatableAreas, currentStateMap, cropDefs || [], userFavCats, preferredCropIds, varietyMap || {});
 
     const gardenContext = areas.map(a => {
       const state = currentStateMap[a.id];
