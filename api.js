@@ -5712,7 +5712,7 @@ app.get("/plans/:id/assignments", requireAuth, async (req, res) => {
       .from("garden_plans").select("id").eq("id", id).eq("user_id", req.user.id).single();
     if (planErr || !plan) return res.status(404).json({ error: "Plan not found" });
     const { data, error } = await req.db.from("plan_area_assignments")
-      .select("*, crop_definition:crop_definitions(id, name, emoji, category), area:growing_areas(id, name, location_id)")
+      .select("*, crop_definition:crop_definitions(id, name, category), area:growing_areas(id, name, location_id)")
       .eq("plan_id", id).order("sequence_order", { ascending: true });
     if (error) throw error;
     res.json(data || []);
@@ -5855,7 +5855,7 @@ function _buildOption(name, areaAssignments, currentStateMap, cropDefs, goal, pr
       variety_id:         defaultVar ? defaultVar.id : null,
       variety_name:       defaultVar ? defaultVar.name : null,
       crop_name:          displayName,
-      crop_emoji:         cropDef ? (cropDef.emoji || "🌱") : "🌱",
+      crop_emoji:         "🌱",
       rotation_score:     rotScore,
     });
   }
@@ -6044,7 +6044,7 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
 
     const { data: cropDefs } = await supabaseService
       .from("crop_definitions")
-      .select("id, name, category, emoji, sow_direct_start, sow_indoors_start")
+      .select("id, name, category, sow_direct_start, sow_indoors_start")
       .eq("hidden", false);
 
     // Fetch default varieties for crop defs so we can suggest specific varieties
