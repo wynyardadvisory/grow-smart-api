@@ -5753,264 +5753,498 @@ app.delete("/plans/:id/assignments/:assignmentId", requireAuth, async (req, res)
 
 // ── Plan Generation ───────────────────────────────────────────────────────────
 // POST /plans/generate
-// Takes location_id + goal, reads current garden state, generates 3 plan options.
-// Rule engine produces candidates; Claude writes explanation cards.
+// Core principle: DEFAULT = rotate current crops, not invent a new garden.
+// Only "suggest_new" goal opens the crop pool to alternatives.
 
+// ── Constraints ───────────────────────────────────────────────────────────────
+
+// Categories never assigned to raised beds in standard rotation
+const INVASIVE_CATEGORIES = new Set(["herb", "flower", "perennial", "fruit"]);
+
+// Categories that are fixed — never moved, never included in rotation suggestions
+const FIXED_CATEGORIES = new Set(["fruit", "perennial"]);
+
+// Crops never suggested in raised beds (containment-only or invasive)
+const RAISED_BED_EXCLUDE_NAMES = new Set([
+  "Mint", "Lemon Balm", "Comfrey", "Horseradish", "Jerusalem Artichoke",
+  "Rhubarb", "Asparagus", "Fennel",
+]);
+
+// Max times any single crop can appear across a plan
+const CROP_MAX_AREAS = {
+  default:    1,   // most crops: 1 area max
+  Potato:     2,   // potatoes are commonly grown in bulk
+  Courgette:  1,
+  Garlic:     2,
+  Onion:      2,
+  Leek:       1,
+  Carrot:     1,
+  Beetroot:   1,
+  Pea:        2,
+  Bean:       2,
+};
+
+// Area type pools — what crops are appropriate for each area type
+// Based on area name heuristics (no area_type column exists)
+function _classifyArea(area) {
+  const n = (area.name || "").toLowerCase();
+  const size = (area.width_m || 1) * (area.length_m || 1);
+  if (n.includes("pot") || n.includes("container") || n.includes("tub") || size < 0.4) return "pot";
+  if (n.includes("greenhouse") || n.includes("polytunnel")) return "greenhouse";
+  if (n.includes("allotment") || n.includes("perennial") || n.includes("fruit")) return "fixed";
+  return "bed"; // raised bed, open bed, etc.
+}
+
+// Rotation scoring — does this category follow well from the previous?
 const ROTATION_AVOID = {
-  brassica:  ["brassica"],
-  fruiting:  ["fruiting"],
-  root:      ["root"],
-  allium:    ["allium"],
-  legume:    [],
-  salad:     [],
-  herb:      [],
-  flower:    [],
-  fruit:     [],
-  perennial: [],
+  brassica: ["brassica"],
+  fruiting: ["fruiting"],
+  root:     ["root"],
+  allium:   ["allium"],
+  legume:   [],
+  salad:    [],
 };
 
 const ROTATION_PREFER_AFTER = {
-  brassica:  ["legume"],
-  fruiting:  ["legume", "root"],
-  root:      ["legume", "salad"],
-  allium:    ["fruiting", "root"],
-  legume:    ["brassica", "fruiting", "root", "allium"],
-  salad:     ["legume", "root"],
-};
-
-const FIXED_CATEGORIES = new Set(["fruit", "perennial"]);
-
-const YIELD_SCORE = {
-  fruiting: 9, brassica: 7, root: 7, legume: 6,
-  allium: 5, salad: 5, herb: 3, flower: 1, fruit: 4, perennial: 2,
-};
-
-const EASE_SCORE = {
-  salad: 9, herb: 8, legume: 8, allium: 7, root: 6,
-  brassica: 5, fruiting: 5, flower: 7, fruit: 5, perennial: 6,
+  brassica: ["legume"],
+  fruiting: ["legume", "root"],
+  root:     ["legume", "salad"],
+  allium:   ["fruiting", "root"],
+  legume:   ["brassica", "fruiting", "root", "allium"],
+  salad:    ["legume", "root"],
 };
 
 const ROTATION_NEXT = {
-  brassica:  ["legume", "root", "salad", "allium", "fruiting"],
-  fruiting:  ["legume", "brassica", "root", "salad", "allium"],
-  root:      ["legume", "salad", "allium", "fruiting", "brassica"],
-  allium:    ["legume", "fruiting", "root", "salad", "brassica"],
-  legume:    ["brassica", "fruiting", "root", "allium", "salad"],
-  salad:     ["legume", "root", "allium", "fruiting", "brassica"],
-  herb:      ["herb", "salad", "legume", "allium"],
-  flower:    ["flower", "salad", "legume"],
-  fruit:     ["fruit"],
-  perennial: ["perennial"],
+  brassica: ["legume", "root", "salad", "allium", "fruiting"],
+  fruiting: ["legume", "brassica", "root", "salad", "allium"],
+  root:     ["legume", "salad", "allium", "fruiting", "brassica"],
+  allium:   ["legume", "fruiting", "root", "salad", "brassica"],
+  legume:   ["brassica", "fruiting", "root", "allium", "salad"],
+  salad:    ["legume", "root", "allium", "fruiting", "brassica"],
 };
 
-function _scoreRotation(currentCategory, nextCategory) {
-  if (!currentCategory) return 5;
-  if (FIXED_CATEGORIES.has(currentCategory)) return 5;
-  if ((ROTATION_AVOID[currentCategory] || []).includes(nextCategory)) return 0;
-  const preferAfter = ROTATION_PREFER_AFTER[nextCategory] || [];
-  if (preferAfter.includes(currentCategory)) return 10;
-  const nextList = ROTATION_NEXT[currentCategory] || [];
-  const idx = nextList.indexOf(nextCategory);
+const YIELD_SCORE = { fruiting:9, brassica:7, root:7, legume:6, allium:5, salad:5, herb:3, flower:1, fruit:4, perennial:2 };
+const EASE_SCORE  = { salad:9, herb:8, legume:8, allium:7, root:6, brassica:5, fruiting:5, flower:7, fruit:5, perennial:6 };
+
+function _scoreRotation(curCat, nextCat) {
+  if (!curCat) return 5;
+  if (FIXED_CATEGORIES.has(curCat)) return 5;
+  if ((ROTATION_AVOID[curCat] || []).includes(nextCat)) return 0;
+  if ((ROTATION_PREFER_AFTER[nextCat] || []).includes(curCat)) return 10;
+  const idx = (ROTATION_NEXT[curCat] || []).indexOf(nextCat);
   if (idx === -1) return 3;
   return Math.max(1, 8 - idx * 2);
 }
 
-function _pickCrop(category, cropDefs, preferredCropIds = new Set()) {
-  const candidates = cropDefs.filter(d => d.category === category);
-  if (!candidates.length) return null;
-  // Prefer crops the user already grows
-  const preferred = candidates.filter(d => preferredCropIds.has(d.id));
-  if (preferred.length) return preferred[0];
-  const withWindow = candidates.filter(d => d.sow_direct_start || d.sow_indoors_start);
-  const pool = withWindow.length ? withWindow : candidates;
-  return pool[Math.floor(Math.random() * Math.min(pool.length, 5))];
+// Pick the best matching crop definition for a crop name from user's current crops
+function _findCropDef(cropName, cropDefs) {
+  if (!cropName) return null;
+  const exact = cropDefs.find(d => d.name.toLowerCase() === cropName.toLowerCase());
+  if (exact) return exact;
+  const partial = cropDefs.find(d => d.name.toLowerCase().includes(cropName.toLowerCase()) ||
+    cropName.toLowerCase().includes(d.name.toLowerCase()));
+  return partial || null;
 }
 
-function _buildOption(name, areaAssignments, currentStateMap, cropDefs, goal, preferredCropIds, varietyMap = {}) {
-  let totalRotation = 0, totalYield = 0, totalEase = 0, count = 0;
-  const assignments = [];
-  for (const { area, category } of areaAssignments) {
-    if (FIXED_CATEGORIES.has(category)) continue;
-    const current = currentStateMap[area.id];
-    const rotScore = _scoreRotation(current && current.category, category);
-    const yScore   = YIELD_SCORE[category]  || 5;
-    const eScore   = EASE_SCORE[category]   || 5;
-    totalRotation += rotScore;
-    totalYield    += yScore;
-    totalEase     += eScore;
-    count++;
-    const cropDef = _pickCrop(category, cropDefs, preferredCropIds);
-    const cropDefId = cropDef ? cropDef.id : null;
-    // Pick default variety if available, otherwise first variety
-    const varieties = cropDefId ? (varietyMap[cropDefId] || []) : [];
-    const defaultVar = varieties.find(v => v.is_default) || varieties[0] || null;
-    const displayName = cropDef
-      ? (defaultVar ? `${cropDef.name} (${defaultVar.name})` : cropDef.name)
-      : category;
-    assignments.push({
-      area_id:            area.id,
-      area_name:          area.name,
-      category,
-      crop_definition_id: cropDefId,
-      variety_id:         defaultVar ? defaultVar.id : null,
-      variety_name:       defaultVar ? defaultVar.name : null,
-      crop_name:          displayName,
-      crop_emoji:         "🌱",
-      rotation_score:     rotScore,
+// Pick a crop def for a category, preferring user's current crops
+function _pickCropForCategory(category, cropDefs, preferredNames = [], usedNames = new Set()) {
+  // First: prefer a crop from user's current garden in this category that hasn't been used
+  for (const name of preferredNames) {
+    const def = cropDefs.find(d => d.category === category &&
+      d.name.toLowerCase() === name.toLowerCase() &&
+      !usedNames.has(d.name) &&
+      !RAISED_BED_EXCLUDE_NAMES.has(d.name));
+    if (def) return def;
+  }
+  // Second: any crop in category not yet used
+  const candidates = cropDefs.filter(d =>
+    d.category === category &&
+    !usedNames.has(d.name) &&
+    !RAISED_BED_EXCLUDE_NAMES.has(d.name) &&
+    (d.sow_direct_start || d.sow_indoors_start)
+  );
+  if (candidates.length) return candidates[0];
+  // Fallback: any in category
+  return cropDefs.find(d => d.category === category && !RAISED_BED_EXCLUDE_NAMES.has(d.name)) || null;
+}
+
+// Build display name with variety
+function _displayName(cropDef, varietyMap) {
+  if (!cropDef) return null;
+  const vars = varietyMap[cropDef.id] || [];
+  const defaultVar = vars.find(v => v.is_default) || vars[0] || null;
+  return defaultVar ? `${cropDef.name} (${defaultVar.name})` : cropDef.name;
+}
+
+// ── Core generation function ──────────────────────────────────────────────────
+// currentCropsByArea: { area_id: [{ name, category, crop_def_id }] }
+// rotatableAreas: areas classified as "bed" type
+// Returns array of plan option objects
+
+function _generatePlanOptions(goal, areas, currentCropsByArea, cropDefs, varietyMap, preferredNames) {
+  // Separate areas by type
+  const bedAreas   = areas.filter(a => _classifyArea(a) === "bed");
+  const potAreas   = areas.filter(a => _classifyArea(a) === "pot");
+  const fixedAreas = areas.filter(a => ["fixed", "greenhouse"].includes(_classifyArea(a)));
+
+  // Current category per bed area (use most common category in that area)
+  const currentCatByArea = {};
+  for (const area of bedAreas) {
+    const crops = currentCropsByArea[area.id] || [];
+    const cats  = crops.map(c => c.category).filter(c => c && !FIXED_CATEGORIES.has(c));
+    if (cats.length) {
+      const counts = {};
+      cats.forEach(c => counts[c] = (counts[c]||0)+1);
+      currentCatByArea[area.id] = Object.entries(counts).sort((a,b)=>b[1]-a[1])[0][0];
+    }
+  }
+
+  // Current named crops in bed areas — these are the crops we rotate by default
+  const currentBedCrops = [];
+  for (const area of bedAreas) {
+    for (const crop of (currentCropsByArea[area.id] || [])) {
+      if (!FIXED_CATEGORIES.has(crop.category) && !INVASIVE_CATEGORIES.has(crop.category)) {
+        if (!currentBedCrops.find(c => c.name === crop.name)) {
+          currentBedCrops.push(crop);
+        }
+      }
+    }
+  }
+
+  // Build category → best crop name mapping from user's current crops
+  const userCropsByCategory = {};
+  for (const crop of currentBedCrops) {
+    if (!userCropsByCategory[crop.category]) userCropsByCategory[crop.category] = [];
+    userCropsByCategory[crop.category].push(crop.name);
+  }
+
+  // Rotation categories in use by user (plus legume if not present — always useful)
+  const userCategories = [...new Set(currentBedCrops.map(c => c.category))];
+  if (!userCategories.includes("legume")) userCategories.push("legume");
+
+  function _buildOption(name, bedAssignments, potAssignments) {
+    const assignments = [];
+    const usedCropNames = new Set();
+    let totalRot=0, totalYield=0, totalEase=0, count=0;
+
+    for (const { area, category, cropName } of bedAssignments) {
+      const curCat = currentCatByArea[area.id];
+      const rotScore = _scoreRotation(curCat, category);
+      totalRot   += rotScore;
+      totalYield += YIELD_SCORE[category] || 5;
+      totalEase  += EASE_SCORE[category]  || 5;
+      count++;
+
+      // Pick crop def — prefer specific cropName if given, then user's crops in category
+      let cropDef = null;
+      if (cropName) cropDef = _findCropDef(cropName, cropDefs);
+      if (!cropDef) cropDef = _pickCropForCategory(category, cropDefs, userCropsByCategory[category] || preferredNames, usedCropNames);
+      if (cropDef) usedCropNames.add(cropDef.name);
+
+      const display = cropDef ? _displayName(cropDef, varietyMap) : (category || "TBC");
+      assignments.push({
+        area_id:            area.id,
+        area_name:          area.name,
+        category:           category || "unknown",
+        crop_definition_id: cropDef?.id || null,
+        variety_id:         null,
+        crop_name:          display || category,
+        crop_emoji:         "🌱",
+        rotation_score:     rotScore,
+      });
+    }
+
+    // Pot assignments — keep current or assign compact crops
+    for (const { area, cropName, category } of (potAssignments || [])) {
+      const cropDef = cropName ? _findCropDef(cropName, cropDefs) : null;
+      const display = cropDef ? _displayName(cropDef, varietyMap) : (cropName || "As current");
+      assignments.push({
+        area_id:            area.id,
+        area_name:          area.name,
+        category:           category || "pot",
+        crop_definition_id: cropDef?.id || null,
+        variety_id:         null,
+        crop_name:          display || cropName || "As current",
+        crop_emoji:         "🪴",
+        rotation_score:     5,
+      });
+    }
+
+    const n = count || 1;
+    return {
+      name,
+      goal,
+      assignments,
+      fixed_areas: fixedAreas.map(a => ({ area_id:a.id, area_name:a.name, note:"Fixed — kept as-is" })),
+      scores: {
+        rotation: Math.round(totalRot/n),
+        yield:    Math.round(totalYield/n),
+        ease:     Math.round(totalEase/n),
+        overall:  Math.round((totalRot+totalYield+totalEase)/(n*3)),
+      },
+    };
+  }
+
+  // Pot handling — keep current crops or suggest compact alternatives
+  function _potAssignments() {
+    return potAreas.map(area => {
+      const crops = currentCropsByArea[area.id] || [];
+      const current = crops[0];
+      if (current) return { area, cropName: current.name, category: current.category };
+      return { area, cropName: "Herbs", category: "herb" };
     });
   }
-  const n = count || 1;
-  return {
-    name, goal, assignments,
-    scores: {
-      rotation: Math.round(totalRotation / n),
-      yield:    Math.round(totalYield    / n),
-      ease:     Math.round(totalEase     / n),
-      overall:  Math.round((totalRotation + totalYield + totalEase) / (n * 3)),
-    },
-  };
-}
 
-function _generateOptions(goal, rotatableAreas, currentStateMap, cropDefs, userFavCats, preferredCropIds = new Set(), varietyMap = {}) {
-  const allCats = ["legume", "brassica", "root", "fruiting", "allium", "salad"];
+  // ── ROTATE MINE / BEST ROTATION ──────────────────────────────────────────────
+  // Core: keep user's crop universe, just move to better rotational positions
+  if (goal === "rotate_mine" || goal === "best_rotation") {
+    // We have N beds and N crops (roughly). Assign crops to beds in rotation order.
+    // Simple approach: for each bed, find the best crop from current pool that:
+    // a) isn't in the same category as current occupant
+    // b) hasn't been used yet
+    // c) has best rotation score
 
-  if (goal === "best_rotation") {
+    function _rotateCrops(variantName, biasYield = false, addLegume = false) {
+      const availableCrops = [...currentBedCrops];
+      // Optionally inject legume if user doesn't grow them
+      if (addLegume && !availableCrops.find(c => c.category === "legume")) {
+        const legumeDef = _pickCropForCategory("legume", cropDefs, [], new Set());
+        if (legumeDef) availableCrops.push({ name: legumeDef.name, category: "legume" });
+      }
+
+      const usedCropIndices = new Set();
+      const bedAssignments = bedAreas.map(area => {
+        const curCat = currentCatByArea[area.id];
+
+        // Score each available crop for this bed
+        const scored = availableCrops.map((crop, i) => {
+          if (usedCropIndices.has(i)) return { i, score: -1 };
+          const rotScore  = _scoreRotation(curCat, crop.category);
+          const yieldBias = biasYield ? (YIELD_SCORE[crop.category]||5) * 0.3 : 0;
+          return { i, crop, score: rotScore * 0.7 + yieldBias };
+        }).filter(s => s.score >= 0).sort((a,b) => b.score - a.score);
+
+        const best = scored[0];
+        if (best) {
+          usedCropIndices.add(best.i);
+          return { area, category: best.crop.category, cropName: best.crop.name };
+        }
+        // Fallback: use whatever hasn't been used
+        const fallback = availableCrops.findIndex((_,i) => !usedCropIndices.has(i));
+        if (fallback >= 0) {
+          usedCropIndices.add(fallback);
+          const fc = availableCrops[fallback];
+          return { area, category: fc.category, cropName: fc.name };
+        }
+        return { area, category: curCat || "root", cropName: null };
+      });
+
+      return _buildOption(variantName, bedAssignments, _potAssignments());
+    }
+
     return [
-      _buildOption("Optimal Rotation", rotatableAreas.map(area => {
-        const cur = currentStateMap[area.id] && currentStateMap[area.id].category;
-        const next = (ROTATION_NEXT[cur] || allCats);
-        return { area, category: next[0] };
-      }), currentStateMap, cropDefs, goal),
-      _buildOption("Rotation + Yield", rotatableAreas.map(area => {
-        const cur = currentStateMap[area.id] && currentStateMap[area.id].category;
-        const next = (ROTATION_NEXT[cur] || allCats);
-        const scored = next.map(cat => ({ cat, score: _scoreRotation(cur, cat) * 0.6 + (YIELD_SCORE[cat] || 5) * 0.4 })).sort((a,b) => b.score - a.score);
-        return { area, category: scored[0].cat };
-      }), currentStateMap, cropDefs, goal),
-      _buildOption("Soil Recovery", rotatableAreas.map(area => {
-        const cur = currentStateMap[area.id] && currentStateMap[area.id].category;
-        if (cur && !["legume","fruit","perennial"].includes(cur)) return { area, category: "legume" };
-        const next = ROTATION_NEXT[cur] || allCats;
-        return { area, category: next[0] };
-      }), currentStateMap, cropDefs, goal),
+      _rotateCrops("Optimal Rotation",         false, false),
+      _rotateCrops("Rotation + Better Yield",   true,  false),
+      _rotateCrops("Rotation + Legume Year",    false, true),
     ];
   }
 
+  // ── MAX YIELD ────────────────────────────────────────────────────────────────
   if (goal === "max_yield") {
-    const highYield = ["fruiting", "brassica", "root", "legume", "allium"];
-    const used = new Set();
+    // Keep user's crops but prioritise high-yield categories in best beds
+    const highYieldOrder = ["fruiting", "brassica", "root", "legume", "allium", "salad"];
+
+    function _yieldPlan(variantName, mixRotation = false) {
+      const usedCropIndices = new Set();
+      const pool = [...currentBedCrops];
+      // Add high-yield alternatives if user pool is thin
+      for (const cat of highYieldOrder) {
+        if (!pool.find(c => c.category === cat)) {
+          const def = _pickCropForCategory(cat, cropDefs, preferredNames, new Set(pool.map(c=>c.name)));
+          if (def) pool.push({ name: def.name, category: cat });
+        }
+        if (pool.length >= bedAreas.length + 2) break;
+      }
+
+      const bedAssignments = bedAreas.map(area => {
+        const curCat = currentCatByArea[area.id];
+        const scored = pool.map((crop, i) => {
+          if (usedCropIndices.has(i)) return { i, score:-1 };
+          const yScore  = (YIELD_SCORE[crop.category]||5) * (mixRotation ? 0.6 : 0.9);
+          const rotScore = mixRotation ? _scoreRotation(curCat, crop.category) * 0.4 : 0;
+          return { i, crop, score: yScore + rotScore };
+        }).filter(s=>s.score>=0).sort((a,b)=>b.score-a.score);
+        const best = scored[0];
+        if (best) { usedCropIndices.add(best.i); return { area, category: best.crop.category, cropName: best.crop.name }; }
+        return { area, category: "root", cropName: null };
+      });
+      return _buildOption(variantName, bedAssignments, _potAssignments());
+    }
+
     return [
-      _buildOption("Maximum Yield", rotatableAreas.map(area => {
-        const cur = currentStateMap[area.id] && currentStateMap[area.id].category;
-        const ranked = highYield.filter(c => !(ROTATION_AVOID[cur] || []).includes(c)).sort((a,b) => (YIELD_SCORE[b]||5) - (YIELD_SCORE[a]||5));
-        return { area, category: ranked[0] || "fruiting" };
-      }), currentStateMap, cropDefs, goal),
-      _buildOption("Yield + Rotation", rotatableAreas.map(area => {
-        const cur = currentStateMap[area.id] && currentStateMap[area.id].category;
-        const ranked = highYield.map(cat => ({ cat, score: (YIELD_SCORE[cat]||5) * 0.7 + _scoreRotation(cur, cat) * 0.3 })).sort((a,b) => b.score - a.score);
-        return { area, category: ranked[0].cat };
-      }), currentStateMap, cropDefs, goal),
-      _buildOption("Diversified Yield", rotatableAreas.map(area => {
-        const cur = currentStateMap[area.id] && currentStateMap[area.id].category;
-        const ranked = highYield.filter(c => !(ROTATION_AVOID[cur]||[]).includes(c)).sort((a,b) => (used.has(a)?-2:0) + (YIELD_SCORE[b]||5) - (YIELD_SCORE[a]||5));
-        const chosen = ranked[0] || "fruiting";
-        used.add(chosen);
-        return { area, category: chosen };
-      }), currentStateMap, cropDefs, goal),
+      _yieldPlan("Maximum Yield",          false),
+      _yieldPlan("Yield + Rotation",       true),
+      (() => {
+        // Diversified: each bed gets a different category
+        const usedCats = new Set();
+        const usedIdx  = new Set();
+        const pool = [...currentBedCrops];
+        for (const cat of highYieldOrder) {
+          if (!pool.find(c => c.category === cat)) {
+            const def = _pickCropForCategory(cat, cropDefs, preferredNames, new Set(pool.map(c=>c.name)));
+            if (def) pool.push({ name: def.name, category: cat });
+          }
+        }
+        const bedAssignments = bedAreas.map(area => {
+          const scored = pool.map((crop,i) => {
+            if (usedIdx.has(i)) return { i, score:-1 };
+            const diversity = usedCats.has(crop.category) ? -3 : 0;
+            return { i, crop, score: (YIELD_SCORE[crop.category]||5) + diversity };
+          }).filter(s=>s.score>=0).sort((a,b)=>b.score-a.score);
+          const best = scored[0];
+          if (best) { usedIdx.add(best.i); usedCats.add(best.crop.category); return { area, category: best.crop.category, cropName: best.crop.name }; }
+          return { area, category: "root", cropName: null };
+        });
+        return _buildOption("Diversified Yield", bedAssignments, _potAssignments());
+      })(),
     ];
   }
 
+  // ── EASY ─────────────────────────────────────────────────────────────────────
   if (goal === "easy") {
-    const easyCats = ["salad", "legume", "herb", "allium", "root"];
+    const easyOrder = ["salad", "legume", "allium", "root", "brassica", "fruiting"];
+
+    function _easyPlan(variantName, addRotation = false) {
+      const pool = [...currentBedCrops];
+      for (const cat of easyOrder) {
+        if (!pool.find(c => c.category === cat)) {
+          const def = _pickCropForCategory(cat, cropDefs, preferredNames, new Set(pool.map(c=>c.name)));
+          if (def) pool.push({ name: def.name, category: cat });
+        }
+        if (pool.length >= bedAreas.length + 2) break;
+      }
+      const usedIdx = new Set();
+      const bedAssignments = bedAreas.map(area => {
+        const curCat = currentCatByArea[area.id];
+        const scored = pool.map((crop,i) => {
+          if (usedIdx.has(i)) return { i, score:-1 };
+          const eScore  = (EASE_SCORE[crop.category]||5) * (addRotation?0.6:0.9);
+          const rotScore = addRotation ? _scoreRotation(curCat, crop.category)*0.4 : 0;
+          return { i, crop, score: eScore+rotScore };
+        }).filter(s=>s.score>=0).sort((a,b)=>b.score-a.score);
+        const best = scored[0];
+        if (best) { usedIdx.add(best.i); return { area, category: best.crop.category, cropName: best.crop.name }; }
+        return { area, category: "salad", cropName: null };
+      });
+      return _buildOption(variantName, bedAssignments, _potAssignments());
+    }
+
     return [
-      _buildOption("Easiest Season", rotatableAreas.map(area => {
-        const cur = currentStateMap[area.id] && currentStateMap[area.id].category;
-        const ranked = easyCats.filter(c => !(ROTATION_AVOID[cur]||[]).includes(c)).sort((a,b) => (EASE_SCORE[b]||5) - (EASE_SCORE[a]||5));
-        return { area, category: ranked[0] || "salad" };
-      }), currentStateMap, cropDefs, goal),
-      _buildOption("Easy + Rotation", rotatableAreas.map(area => {
-        const cur = currentStateMap[area.id] && currentStateMap[area.id].category;
-        const ranked = easyCats.map(cat => ({ cat, score: (EASE_SCORE[cat]||5) * 0.6 + _scoreRotation(cur, cat) * 0.4 })).sort((a,b) => b.score - a.score);
-        return { area, category: ranked[0].cat };
-      }), currentStateMap, cropDefs, goal),
-      _buildOption("Rest the Garden", rotatableAreas.map(area => ({ area, category: "legume" })), currentStateMap, cropDefs, goal),
+      _easyPlan("Easiest Season",   false),
+      _easyPlan("Easy + Rotation",  true),
+      (() => {
+        // Rest the garden — all legumes to fix nitrogen
+        const legumeDef = _pickCropForCategory("legume", cropDefs, preferredNames, new Set());
+        const bedAssignments = bedAreas.map(area => ({
+          area, category: "legume", cropName: legumeDef?.name || "Peas"
+        }));
+        return _buildOption("Rest the Garden (Legumes)", bedAssignments, _potAssignments());
+      })(),
     ];
   }
 
+  // ── FAVOURITES ────────────────────────────────────────────────────────────────
   if (goal === "favourites") {
-    const favCats = userFavCats.length ? userFavCats : ["fruiting", "root", "brassica", "legume"];
-    return [
-      _buildOption("Your Favourites", rotatableAreas.map(area => {
-        const cur = currentStateMap[area.id] && currentStateMap[area.id].category;
-        const ranked = favCats.filter(c => !(ROTATION_AVOID[cur]||[]).includes(c));
-        return { area, category: ranked[0] || favCats[0] };
-      }), currentStateMap, cropDefs, goal),
-      _buildOption("Favourites + Rotation", rotatableAreas.map(area => {
-        const cur = currentStateMap[area.id] && currentStateMap[area.id].category;
-        const ranked = favCats.map(cat => ({ cat, score: _scoreRotation(cur, cat) * 0.5 + (YIELD_SCORE[cat]||5) * 0.5 })).sort((a,b) => b.score - a.score);
-        return { area, category: ranked[0].cat || favCats[0] };
-      }), currentStateMap, cropDefs, goal),
-      _buildOption("Spread Your Favourites", rotatableAreas.map((area, i) => ({ area, category: favCats[i % favCats.length] })), currentStateMap, cropDefs, goal),
-    ];
+    // Prioritise user's most-grown crops, use rotation as tiebreaker
+    const favPool = currentBedCrops.length ? currentBedCrops : [];
+    const usedIdx = new Set();
+    const bedAssignments = bedAreas.map(area => {
+      const curCat = currentCatByArea[area.id];
+      const scored = favPool.map((crop,i) => {
+        if (usedIdx.has(i)) return { i, score:-1 };
+        return { i, crop, score: _scoreRotation(curCat, crop.category) };
+      }).filter(s=>s.score>=0).sort((a,b)=>b.score-a.score);
+      const best = scored[0];
+      if (best) { usedIdx.add(best.i); return { area, category: best.crop.category, cropName: best.crop.name }; }
+      return { area, category: "root", cropName: null };
+    });
+    const opt1 = _buildOption("Your Favourites (Rotated)", bedAssignments, _potAssignments());
+
+    // Option 2: spread favourites evenly with one legume for soil
+    const usedIdx2 = new Set();
+    const bedAssignments2 = bedAreas.map((area, i) => {
+      if (i === 0 && !favPool.find(c=>c.category==="legume")) {
+        const ld = _pickCropForCategory("legume", cropDefs, [], new Set());
+        return { area, category: "legume", cropName: ld?.name || "Peas" };
+      }
+      const curCat = currentCatByArea[area.id];
+      const scored = favPool.map((crop,j) => {
+        if (usedIdx2.has(j)) return { j, score:-1 };
+        return { j, crop, score: _scoreRotation(curCat, crop.category) };
+      }).filter(s=>s.score>=0).sort((a,b)=>b.score-a.score);
+      const best = scored[0];
+      if (best) { usedIdx2.add(best.i||0); return { area, category: best.crop.category, cropName: best.crop.name }; }
+      return { area, category: "root", cropName: null };
+    });
+    const opt2 = _buildOption("Favourites + Soil Rest", bedAssignments2, _potAssignments());
+
+    // Option 3: same as opt1 but yield-biased
+    const usedIdx3 = new Set();
+    const bedAssignments3 = bedAreas.map(area => {
+      const curCat = currentCatByArea[area.id];
+      const scored = favPool.map((crop,i) => {
+        if (usedIdx3.has(i)) return { i, score:-1 };
+        return { i, crop, score: _scoreRotation(curCat, crop.category)*0.5 + (YIELD_SCORE[crop.category]||5)*0.5 };
+      }).filter(s=>s.score>=0).sort((a,b)=>b.score-a.score);
+      const best = scored[0];
+      if (best) { usedIdx3.add(best.i); return { area, category: best.crop.category, cropName: best.crop.name }; }
+      return { area, category: "root", cropName: null };
+    });
+    const opt3 = _buildOption("Favourites + Yield", bedAssignments3, _potAssignments());
+
+    return [opt1, opt2, opt3];
   }
 
-  if (goal === "rotate_mine") {
-    // Take the categories the user currently grows, rotate them to correct beds
-    const currentCats = rotatableAreas.map(a => (currentStateMap[a.id] && currentStateMap[a.id].category) || "legume");
-    // Option A: strict rotation of what they have
-    const assignA = rotatableAreas.map((area, i) => {
-      const cur = currentStateMap[area.id] && currentStateMap[area.id].category;
-      const allCurrentCats = currentCats.filter((c,j) => j !== i);
-      // Pick from the pool of what user grows, avoiding same family
-      const rotated = allCurrentCats.filter(c => !(ROTATION_AVOID[cur] || []).includes(c));
-      return { area, category: rotated[i % rotated.length] || (ROTATION_NEXT[cur] || ["legume"])[0] };
-    });
-    // Option B: rotate strictly by book order using only current categories
-    const uniqCats = [...new Set(currentCats)].filter(c => !FIXED_CATEGORIES.has(c));
-    const assignB = rotatableAreas.map((area, i) => {
-      const cur = currentStateMap[area.id] && currentStateMap[area.id].category;
-      const nextList = (ROTATION_NEXT[cur] || []).filter(c => uniqCats.includes(c));
-      return { area, category: nextList[0] || uniqCats[i % uniqCats.length] };
-    });
-    // Option C: introduce one legume bed for soil recovery, keep rest rotating
-    const assignC = rotatableAreas.map((area, i) => {
-      if (i === 0) return { area, category: "legume" };
-      const cur = currentStateMap[area.id] && currentStateMap[area.id].category;
-      const nextList = (ROTATION_NEXT[cur] || currentCats).filter(c => c !== "legume");
-      return { area, category: nextList[0] || currentCats[i % currentCats.length] };
-    });
-    return [
-      _buildOption("Rotate Your Crops", assignA, currentStateMap, cropDefs, goal, preferredCropIds, varietyMap),
-      _buildOption("Book Rotation", assignB, currentStateMap, cropDefs, goal, preferredCropIds, varietyMap),
-      _buildOption("Add a Legume Year", assignC, currentStateMap, cropDefs, goal, preferredCropIds, varietyMap),
-    ];
+  // ── BALANCED (default) ────────────────────────────────────────────────────────
+  const pool = [...currentBedCrops];
+  const balancedCats = ["legume", "brassica", "root", "fruiting", "allium", "salad"];
+  for (const cat of balancedCats) {
+    if (!pool.find(c => c.category === cat)) {
+      const def = _pickCropForCategory(cat, cropDefs, preferredNames, new Set(pool.map(c=>c.name)));
+      if (def) pool.push({ name: def.name, category: cat });
+    }
   }
 
-  // balanced (default)
+  function _balancedPlan(variantName, weights = { rot:0.4, yield:0.3, ease:0.3 }) {
+    const usedIdx = new Set();
+    const bedAssignments = bedAreas.map(area => {
+      const curCat = currentCatByArea[area.id];
+      const scored = pool.map((crop,i) => {
+        if (usedIdx.has(i)) return { i, score:-1 };
+        const s = _scoreRotation(curCat, crop.category)*weights.rot +
+                  (YIELD_SCORE[crop.category]||5)*weights.yield +
+                  (EASE_SCORE[crop.category]||5)*weights.ease;
+        return { i, crop, score: s };
+      }).filter(s=>s.score>=0).sort((a,b)=>b.score-a.score);
+      const best = scored[0];
+      if (best) { usedIdx.add(best.i); return { area, category: best.crop.category, cropName: best.crop.name }; }
+      return { area, category: "root", cropName: null };
+    });
+    return _buildOption(variantName, bedAssignments, _potAssignments());
+  }
+
   return [
-    _buildOption("Balanced Garden", rotatableAreas.map((area, i) => {
-      const cur = currentStateMap[area.id] && currentStateMap[area.id].category;
-      const rotated = allCats.filter(c => !(ROTATION_AVOID[cur]||[]).includes(c));
-      return { area, category: rotated[i % rotated.length] || allCats[i % allCats.length] };
-    }), currentStateMap, cropDefs, goal),
-    _buildOption("Optimised Balance", rotatableAreas.map(area => {
-      const cur = currentStateMap[area.id] && currentStateMap[area.id].category;
-      const scored = allCats.map(cat => ({ cat, score: _scoreRotation(cur, cat) * 0.4 + (YIELD_SCORE[cat]||5) * 0.3 + (EASE_SCORE[cat]||5) * 0.3 })).sort((a,b) => b.score - a.score);
-      return { area, category: scored[0].cat };
-    }), currentStateMap, cropDefs, goal),
-    _buildOption("Rotation First", rotatableAreas.map(area => {
-      const cur = currentStateMap[area.id] && currentStateMap[area.id].category;
-      const next = ROTATION_NEXT[cur] || allCats;
-      return { area, category: next[0] };
-    }), currentStateMap, cropDefs, goal),
+    _balancedPlan("Balanced Garden",    { rot:0.4, yield:0.3, ease:0.3 }),
+    _balancedPlan("Balanced + Yield",   { rot:0.3, yield:0.5, ease:0.2 }),
+    _balancedPlan("Balanced + Rotation",{ rot:0.6, yield:0.2, ease:0.2 }),
   ];
 }
 
 app.post("/plans/generate", requireAuth, async (req, res) => {
   try {
-    const { location_id, goal = "balanced" } = req.body;
+    const { location_id, goal = "rotate_mine" } = req.body;
     if (!location_id) return res.status(400).json({ error: "location_id required" });
-    const validGoals = ["max_yield", "best_rotation", "favourites", "easy", "balanced", "rotate_mine"];
+    const validGoals = ["rotate_mine", "best_rotation", "max_yield", "favourites", "easy", "balanced"];
     if (!validGoals.includes(goal)) return res.status(400).json({ error: "invalid goal" });
 
     const { data: loc, error: locErr } = await req.db
@@ -6022,88 +6256,79 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
     if (areasErr) throw areasErr;
     if (!areas || !areas.length) return res.status(400).json({ error: "No areas found for this location" });
 
+    // Get current active crops per area
     const { data: currentCrops, error: cropsErr } = await supabaseService
       .from("crop_instances")
-      .select("area_id, crop_def_id, crop_definitions(category, name)")
+      .select("area_id, crop_def_id, name, crop_definitions(name, category)")
       .eq("user_id", req.user.id)
       .eq("active", true)
       .in("area_id", areas.map(a => a.id));
     if (cropsErr) throw cropsErr;
 
-    const currentStateMap = {};
+    // Build currentCropsByArea: { area_id: [{ name, category, crop_def_id }] }
+    const currentCropsByArea = {};
     for (const crop of (currentCrops || [])) {
-      const cat  = crop.crop_definitions && crop.crop_definitions.category;
-      const name = crop.crop_definitions && crop.crop_definitions.name;
-      if (!currentStateMap[crop.area_id]) currentStateMap[crop.area_id] = { category: cat, names: [] };
-      if (name) currentStateMap[crop.area_id].names.push(name);
-      if (cat && !FIXED_CATEGORIES.has(cat)) currentStateMap[crop.area_id].category = cat;
+      if (!currentCropsByArea[crop.area_id]) currentCropsByArea[crop.area_id] = [];
+      currentCropsByArea[crop.area_id].push({
+        name:        crop.crop_definitions?.name || crop.name || "Unknown",
+        category:    crop.crop_definitions?.category || null,
+        crop_def_id: crop.crop_def_id,
+      });
     }
 
-    const rotatableAreas = areas.filter(a => { const cat = currentStateMap[a.id] && currentStateMap[a.id].category; return !cat || !FIXED_CATEGORIES.has(cat); });
-    const fixedAreas     = areas.filter(a => { const cat = currentStateMap[a.id] && currentStateMap[a.id].category; return cat && FIXED_CATEGORIES.has(cat); });
-
+    // Get crop definitions (no emoji column)
     const { data: cropDefs } = await supabaseService
       .from("crop_definitions")
       .select("id, name, category, sow_direct_start, sow_indoors_start")
       .eq("hidden", false);
 
-    // Fetch default varieties for crop defs so we can suggest specific varieties
+    // Get varieties
     const { data: allVarieties } = await supabaseService
-      .from("varieties")
-      .select("id, crop_def_id, name, is_default")
-      .eq("active", true);
+      .from("varieties").select("id, crop_def_id, name, is_default").eq("active", true);
     const varietyMap = {};
     for (const v of (allVarieties || [])) {
       if (!varietyMap[v.crop_def_id]) varietyMap[v.crop_def_id] = [];
       varietyMap[v.crop_def_id].push(v);
     }
 
-    const categoryCounts = {};
-    for (const crop of (currentCrops || [])) {
-      const cat = crop.crop_definitions && crop.crop_definitions.category;
-      if (cat) categoryCounts[cat] = (categoryCounts[cat] || 0) + 1;
-    }
-    const userFavCats = Object.entries(categoryCounts).sort((a,b) => b[1] - a[1]).map(([cat]) => cat).filter(c => !FIXED_CATEGORIES.has(c));
+    // Names of crops user grows (preferred)
+    const preferredNames = [...new Set((currentCrops||[]).map(c => c.crop_definitions?.name || c.name).filter(Boolean))];
 
-    // Build set of crop def IDs the user actually grows — for crop selection preference
-    const preferredCropIds = new Set((currentCrops || []).map(c => c.crop_def_id).filter(Boolean));
-    const options = _generateOptions(goal, rotatableAreas, currentStateMap, cropDefs || [], userFavCats, preferredCropIds, varietyMap || {});
+    // Generate options
+    const options = _generatePlanOptions(goal, areas, currentCropsByArea, cropDefs || [], varietyMap, preferredNames);
 
+    // Claude explanation cards
     const gardenContext = areas.map(a => {
-      const state = currentStateMap[a.id];
-      return `${a.name} (${a.width_m||"?"}x${a.length_m||"?"}m): currently ${state && state.names && state.names.length ? state.names.join(", ") : "empty"} [${state && state.category || "unknown"}]`;
+      const crops = currentCropsByArea[a.id];
+      const type  = _classifyArea(a);
+      return `${a.name} (${type}, ${a.width_m||"?"}x${a.length_m||"?"}m): ${crops ? crops.map(c=>c.name).join(", ") : "empty"}`;
     }).join("\n");
 
-    const optionsContext = options.map((o, i) => {
-      const assignStr = o.assignments.map(a => `${a.area_name}: ${a.crop_name} (${a.category})`).join(", ");
-      return `Option ${i+1} - ${o.name}: ${assignStr}. Scores: rotation=${o.scores.rotation}/10, yield=${o.scores.yield}/10, ease=${o.scores.ease}/10`;
-    }).join("\n");
+    const optionsContext = options.map((o,i) =>
+      `Option ${i+1} "${o.name}": ${o.assignments.map(a=>`${a.area_name}→${a.crop_name}`).join(", ")}. Rotation=${o.scores.rotation}/10, Yield=${o.scores.yield}/10, Ease=${o.scores.ease}/10`
+    ).join("\n");
 
-    let explanations = options.map(o => `${o.name} plan tailored to your ${goal.replace(/_/g," ")} goal.`);
+    let explanations = options.map(o => `${o.name} — tailored to your garden.`);
     try {
-      const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
+      const cr = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+        headers: { "Content-Type":"application/json", "x-api-key":process.env.ANTHROPIC_API_KEY, "anthropic-version":"2023-06-01" },
         body: JSON.stringify({
           model: "claude-sonnet-4-20250514",
           max_tokens: 600,
-          messages: [{ role: "user", content: `You are a UK vegetable gardening expert helping a grower plan next season.\n\nGarden: ${loc.name}\nCurrent state:\n${gardenContext}\n\nGoal: ${goal.replace(/_/g," ")}\n\nGenerated options:\n${optionsContext}\n\nFor each option write 2-3 sentences explaining why it suits this specific garden and what the key trade-off is vs the other options. Plain friendly UK English.\n\nRespond with JSON only, no markdown:\n{"explanations": ["explanation 1", "explanation 2", "explanation 3"]}` }],
+          messages: [{ role:"user", content:`You are a UK vegetable gardening expert.\n\nGarden: ${loc.name}\nCurrent state:\n${gardenContext}\n\nGoal: ${goal.replace(/_/g," ")}\n\nGenerated plans:\n${optionsContext}\n\nWrite a 2-3 sentence explanation for each plan. Focus on WHY this rotation works for THIS specific garden, and the key trade-off vs the other options. Plain, friendly UK English. No jargon.\n\nJSON only, no markdown:\n{"explanations":["...","...","..."]}` }],
         }),
       });
-      const cd = await claudeRes.json();
-      const text = (cd.content && cd.content[0] && cd.content[0].text) || "";
-      const parsed = JSON.parse(text.replace(/```json|```/g,"").trim());
+      const cd = await cr.json();
+      const txt = (cd.content&&cd.content[0]&&cd.content[0].text)||"";
+      const parsed = JSON.parse(txt.replace(/```json|```/g,"").trim());
       if (Array.isArray(parsed.explanations)) explanations = parsed.explanations;
     } catch(e) { console.error("[PlanGenerate] Claude failed:", e.message); }
 
     res.json({
       location_id,
       goal,
-      options: options.map((o, i) => ({
-        ...o,
-        explanation: explanations[i] || "",
-        fixed_areas: fixedAreas.map(a => ({ area_id: a.id, area_name: a.name, note: "Fixed — perennial or fruit crops, not included in rotation" })),
-      })),
+      options: options.map((o,i) => ({ ...o, explanation: explanations[i]||"" })),
     });
 
   } catch (err) {
