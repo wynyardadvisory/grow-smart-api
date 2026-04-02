@@ -289,8 +289,9 @@ async function runNudgeUnactivated(supabase) {
   const { data: { users } } = await supabase.auth.admin.listUsers({ perPage: 1000 });
 
   // Get all profile IDs (users who completed onboarding)
-  const { data: profiles } = await supabase.from("profiles").select("id");
+  const { data: profiles } = await supabase.from("profiles").select("id, email_unsubscribed");
   const profileIds = new Set((profiles || []).map(p => p.id));
+  const unsubscribedIds = new Set((profiles || []).filter(p => p.email_unsubscribed).map(p => p.id));
 
   // Get already-nudged users from email_log
   const { data: alreadySent } = await supabase
@@ -312,6 +313,8 @@ async function runNudgeUnactivated(supabase) {
     if (now - confirmedAt < 24 * 3600000) { skipped++; continue; }
     // Must not have been nudged before
     if (alreadySentIds.has(user.id)) { skipped++; continue; }
+    // Skip unsubscribed users
+    if (unsubscribedIds.has(user.id)) { skipped++; continue; }
 
     const result = await sendEmail(user.email, templateNudgeUnactivated(user.user_metadata?.full_name || null));
     if (result.sent) {
@@ -330,6 +333,9 @@ async function runNudgeUnactivated(supabase) {
 }
 
 async function runNudgeUnconfirmed(supabase) {
+  // Fetch unsubscribed profile IDs
+  const { data: _unsubProfiles } = await supabase.from("profiles").select("id, email_unsubscribed");
+  const _unsubIds = new Set((_unsubProfiles || []).filter(p => p.email_unsubscribed).map(p => p.id));
   const { data: { users } } = await supabase.auth.admin.listUsers({ perPage: 1000 });
 
   const { data: alreadySent } = await supabase
@@ -350,6 +356,7 @@ async function runNudgeUnconfirmed(supabase) {
     // Must not have been nudged before
     if (alreadySentIds.has(user.id)) { skipped++; continue; }
 
+    if (_unsubIds.has(user.id)) { skipped++; continue; }
     const result = await sendEmail(user.email, templateNudgeUnconfirmed(user.user_metadata?.full_name || null));
     if (result.sent) {
       await supabase.from("email_log").insert({
@@ -369,7 +376,7 @@ async function runNudgeUnconfirmed(supabase) {
 async function runFeedbackSequence(supabase) {
   const { data: profiles } = await supabase
     .from("profiles")
-    .select("id, name")
+    .select("id, name, email_unsubscribed")
     .order("created_at");
 
   const { data: { users } } = await supabase.auth.admin.listUsers({ perPage: 1000 });
@@ -401,6 +408,7 @@ async function runFeedbackSequence(supabase) {
   for (const profile of (profiles || [])) {
     const user = userMap[profile.id];
     if (!user?.email) continue;
+    if (profile.email_unsubscribed) continue;
 
     const createdAt  = new Date(user.created_at).getTime();
     const daysSince  = (now - createdAt) / 86400000;
@@ -847,7 +855,7 @@ async function runWaitlistNudges3(supabase) {
 // ── Re-engagement runners ─────────────────────────────────────────────────────
 
 async function runReengagement(supabase) {
-  const { data: profiles } = await supabase.from("profiles").select("id, name").order("created_at");
+  const { data: profiles } = await supabase.from("profiles").select("id, name, email_unsubscribed").order("created_at");
   const { data: { users } } = await supabase.auth.admin.listUsers({ perPage: 1000 });
   const userMap = {};
   (users || []).forEach(u => { userMap[u.id] = u; });
@@ -865,6 +873,7 @@ async function runReengagement(supabase) {
   for (const profile of (profiles || [])) {
     const user = userMap[profile.id];
     if (!user?.email) continue;
+    if (profile.email_unsubscribed) continue;
     const daysSince = (now - new Date(user.created_at).getTime()) / 86400000;
     const userSent  = sentMap[profile.id] || new Set();
 
@@ -1113,7 +1122,7 @@ async function runDailyEmailFallback(supabase) {
   // Get all profiles with last_seen_at
   const { data: profiles } = await supabase
     .from("profiles")
-    .select("id, name, last_seen_at");
+    .select("id, name, last_seen_at, email_unsubscribed");
   if (!profiles?.length) return { sent: 0, skipped: 0 };
 
   // Get users with active push tokens
@@ -1171,6 +1180,7 @@ async function runDailyEmailFallback(supabase) {
   for (const profile of profiles) {
     const user = userMap[profile.id];
     if (!user?.email) { skipped++; continue; }
+    if (profile.email_unsubscribed) { skipped++; continue; }
 
     // Skip if they have push enabled and a token — push handles them
     if (hasPush.has(profile.id) && pushEnabled[profile.id] !== false) { skipped++; continue; }
