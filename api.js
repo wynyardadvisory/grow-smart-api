@@ -5881,7 +5881,7 @@ function _displayName(cropDef, varietyMap) {
 // rotatableAreas: areas classified as "bed" type
 // Returns array of plan option objects
 
-function _generatePlanOptions(goal, areas, currentCropsByArea, cropDefs, varietyMap, preferredNames) {
+function _generatePlanOptions(goal, areas, currentCropsByArea, cropDefs, varietyMap, preferredNames, sequenceByArea = {}) {
   // Separate areas by type
   const bedAreas   = areas.filter(a => _classifyArea(a) === "bed");
   const potAreas   = areas.filter(a => _classifyArea(a) === "pot");
@@ -5988,64 +5988,105 @@ function _generatePlanOptions(goal, areas, currentCropsByArea, cropDefs, variety
   // Pot handling — keep current crops or suggest compact alternatives
   function _potAssignments() {
     return potAreas.map(area => {
-      const crops = currentCropsByArea[area.id] || [];
-      const current = crops[0];
-      if (current) return { area, cropName: current.name, category: current.category };
-      return { area, cropName: "Herbs", category: "herb" };
+      const crops  = currentCropsByArea[area.id] || [];
+      const active = crops.filter(c => !["fruit","perennial"].includes(c.category));
+      const fixed  = crops.filter(c =>  ["fruit","perennial"].includes(c.category));
+      const display = active.length ? active.map(c=>c.name).join(" + ") :
+                      fixed.length  ? fixed.map(c=>c.name).join(" + ") : "Herbs / as current";
+      return { area, cropName: display, category: crops[0]?.category || "herb" };
     });
   }
 
   // ── ROTATE MINE / BEST ROTATION ──────────────────────────────────────────────
   // Core: keep user's crop universe, just move to better rotational positions
   if (goal === "rotate_mine" || goal === "best_rotation") {
-    // We have N beds and N crops (roughly). Assign crops to beds in rotation order.
-    // Simple approach: for each bed, find the best crop from current pool that:
-    // a) isn't in the same category as current occupant
-    // b) hasn't been used yet
-    // c) has best rotation score
+    // Core principle: preserve the crops the user already grows, move them to better beds.
+    // Respect existing sequences (e.g. Bed 5: Garlic → Sprouts + Swede already planned).
+    // Each bed gets a primary crop + optional follow-on string.
 
-    function _rotateCrops(variantName, biasYield = false, addLegume = false) {
-      const availableCrops = [...currentBedCrops];
-      // Optionally inject legume if user doesn't grow them
-      if (addLegume && !availableCrops.find(c => c.category === "legume")) {
-        const legumeDef = _pickCropForCategory("legume", cropDefs, [], new Set());
-        if (legumeDef) availableCrops.push({ name: legumeDef.name, category: "legume" });
+    // Step 1: build the rotation pool from current BED crops only (not pots/fixed)
+    // Deduplicate by name, preserve order of importance (most beds = most important)
+    const cropBedCount = {};
+    for (const area of bedAreas) {
+      const seq = sequenceByArea[area.id];
+      if (seq && seq.primary) {
+        const n = seq.primary.name;
+        cropBedCount[n] = (cropBedCount[n] || 0) + 1;
+      }
+    }
+
+    // Pool: unique primary crops from bed areas, sorted by how many beds they occupy
+    const rotationPool = Object.entries(cropBedCount)
+      .sort((a,b) => b[1] - a[1])
+      .map(([name]) => {
+        const seq = Object.values(sequenceByArea).find(s => s.primary && s.primary.name === name);
+        return seq ? seq.primary : { name, category: null };
+      });
+
+    // If pool is smaller than bed count, pad with legume (soil improver)
+    while (rotationPool.length < bedAreas.length) {
+      const legDef = _pickCropForCategory("legume", cropDefs, preferredNames, new Set(rotationPool.map(c=>c.name)));
+      if (legDef) rotationPool.push({ name: legDef.name, category: "legume" });
+      else break;
+    }
+
+    // Step 2: helper to build follow-on string for a crop's typical follow-ons
+    function _followOnLabel(cropName, seq) {
+      // If this exact sequence is already planned in user's garden, use it
+      const existingSeq = Object.values(sequenceByArea).find(s =>
+        s.primary && s.primary.name === cropName && s.followOns && s.followOns.length
+      );
+      if (existingSeq) return existingSeq.followOns.map(f => f.name).join(" + ");
+      // Otherwise derive sensible follow-on from rotation logic
+      const cat = seq && seq.category;
+      const followCats = (ROTATION_NEXT[cat] || []).slice(0, 2);
+      if (!followCats.length) return null;
+      const followCrops = followCats.map(fc => {
+        const def = _pickCropForCategory(fc, cropDefs, preferredNames, new Set([cropName]));
+        return def ? def.name : null;
+      }).filter(Boolean);
+      return followCrops.length ? followCrops.join(" + ") : null;
+    }
+
+    // Step 3: assign crops to beds — rotate away from current category
+    function _rotateCrops(variantName, biasYield = false, injectLegume = false) {
+      const pool = [...rotationPool];
+      if (injectLegume && !pool.find(c => c.category === "legume")) {
+        const ld = _pickCropForCategory("legume", cropDefs, preferredNames, new Set(pool.map(c=>c.name)));
+        if (ld) pool.push({ name: ld.name, category: "legume" });
       }
 
-      const usedCropIndices = new Set();
+      const usedIdx = new Set();
       const bedAssignments = bedAreas.map(area => {
         const curCat = currentCatByArea[area.id];
 
-        // Score each available crop for this bed
-        const scored = availableCrops.map((crop, i) => {
-          if (usedCropIndices.has(i)) return { i, score: -1 };
+        const scored = pool.map((crop, i) => {
+          if (usedIdx.has(i)) return { i, score: -1 };
           const rotScore  = _scoreRotation(curCat, crop.category);
-          const yieldBias = biasYield ? (YIELD_SCORE[crop.category]||5) * 0.3 : 0;
+          const yieldBias = biasYield ? (YIELD_SCORE[crop.category] || 5) * 0.3 : 0;
           return { i, crop, score: rotScore * 0.7 + yieldBias };
-        }).filter(s => s.score >= 0).sort((a,b) => b.score - a.score);
+        }).filter(s => s.score >= 0).sort((a, b) => b.score - a.score);
 
         const best = scored[0];
-        if (best) {
-          usedCropIndices.add(best.i);
-          return { area, category: best.crop.category, cropName: best.crop.name };
-        }
-        // Fallback: use whatever hasn't been used
-        const fallback = availableCrops.findIndex((_,i) => !usedCropIndices.has(i));
-        if (fallback >= 0) {
-          usedCropIndices.add(fallback);
-          const fc = availableCrops[fallback];
-          return { area, category: fc.category, cropName: fc.name };
-        }
-        return { area, category: curCat || "root", cropName: null };
+        if (!best) return { area, category: curCat || "root", cropName: null };
+        usedIdx.add(best.i);
+
+        // Build display name: "Potato → then Peas + Beans" if there's a follow-on
+        const followOn = _followOnLabel(best.crop.name, best.crop);
+        const displayName = followOn
+          ? `${best.crop.name} → then ${followOn}`
+          : best.crop.name;
+
+        return { area, category: best.crop.category || "root", cropName: displayName };
       });
 
       return _buildOption(variantName, bedAssignments, _potAssignments());
     }
 
     return [
-      _rotateCrops("Optimal Rotation",         false, false),
-      _rotateCrops("Rotation + Better Yield",   true,  false),
-      _rotateCrops("Rotation + Legume Year",    false, true),
+      _rotateCrops("Rotate Your Crops",            false, false),
+      _rotateCrops("Rotation + Yield Boost",        true,  false),
+      _rotateCrops("Rotation + Legume for Soil",    false, true),
     ];
   }
 
@@ -6256,27 +6297,65 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
     if (areasErr) throw areasErr;
     if (!areas || !areas.length) return res.status(400).json({ error: "No areas found for this location" });
 
-    // Get current active crops per area
-    const { data: currentCrops, error: cropsErr } = await supabaseService
+    const areaIds = areas.map(a => a.id);
+
+    // Fetch ALL crop instances — active AND planned — to understand full bed reality
+    const { data: allCrops, error: cropsErr } = await supabaseService
       .from("crop_instances")
-      .select("area_id, crop_def_id, name, crop_definitions(name, category)")
+      .select("area_id, crop_def_id, name, active, status, sown_date, crop_definitions(name, category)")
       .eq("user_id", req.user.id)
-      .eq("active", true)
-      .in("area_id", areas.map(a => a.id));
+      .in("area_id", areaIds);
     if (cropsErr) throw cropsErr;
 
-    // Build currentCropsByArea: { area_id: [{ name, category, crop_def_id }] }
-    const currentCropsByArea = {};
-    for (const crop of (currentCrops || [])) {
-      if (!currentCropsByArea[crop.area_id]) currentCropsByArea[crop.area_id] = [];
-      currentCropsByArea[crop.area_id].push({
-        name:        crop.crop_definitions?.name || crop.name || "Unknown",
-        category:    crop.crop_definitions?.category || null,
-        crop_def_id: crop.crop_def_id,
-      });
+    const cropRows = allCrops || [];
+
+    // Build per-area state:
+    // activeCropsByArea   — what is currently growing (active=true)
+    // plannedCropsByArea  — what is already planned as follow-ons (active=false, status=planned)
+    const activeCropsByArea  = {};
+    const plannedCropsByArea = {};
+
+    for (const crop of cropRows) {
+      const name     = crop.crop_definitions?.name || crop.name || "Unknown";
+      const category = crop.crop_definitions?.category || null;
+      const entry    = { name, category, crop_def_id: crop.crop_def_id, status: crop.status };
+
+      if (crop.active) {
+        if (!activeCropsByArea[crop.area_id])  activeCropsByArea[crop.area_id]  = [];
+        activeCropsByArea[crop.area_id].push(entry);
+      } else if (crop.status === "planned") {
+        if (!plannedCropsByArea[crop.area_id]) plannedCropsByArea[crop.area_id] = [];
+        plannedCropsByArea[crop.area_id].push(entry);
+      }
     }
 
-    // Get crop definitions (no emoji column)
+    // Infer follow-on sequences per area:
+    // If an area has planned crops after active crops, capture the sequence
+    // e.g. Bed 5: Garlic (active) → Brussels Sprout + Swede (planned)
+    const sequenceByArea = {}; // area_id → { primary, followOns: [] }
+    for (const area of areas) {
+      const active  = activeCropsByArea[area.id]  || [];
+      const planned = plannedCropsByArea[area.id] || [];
+
+      // Deduplicate planned crops by name
+      const uniquePlanned = [];
+      const seenNames = new Set();
+      for (const p of planned) {
+        if (!seenNames.has(p.name)) { uniquePlanned.push(p); seenNames.add(p.name); }
+      }
+
+      // Active: pick dominant crop (most common category, or first)
+      const primaryCrops = active.filter(c => c.category && !["fruit","perennial","herb"].includes(c.category));
+      const primary = primaryCrops.length ? primaryCrops[0] : (active[0] || null);
+
+      sequenceByArea[area.id] = {
+        primary,
+        allActive:  active,
+        followOns:  uniquePlanned.filter(p => p.category && !["fruit","perennial"].includes(p.category)),
+      };
+    }
+
+    // Get crop definitions
     const { data: cropDefs } = await supabaseService
       .from("crop_definitions")
       .select("id, name, category, sow_direct_start, sow_indoors_start")
@@ -6291,17 +6370,24 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
       varietyMap[v.crop_def_id].push(v);
     }
 
-    // Names of crops user grows (preferred)
-    const preferredNames = [...new Set((currentCrops||[]).map(c => c.crop_definitions?.name || c.name).filter(Boolean))];
+    // Names of crops user grows (preferred for crop selection)
+    const preferredNames = [...new Set(cropRows.map(c => c.crop_definitions?.name || c.name).filter(Boolean))];
 
-    // Generate options
-    const options = _generatePlanOptions(goal, areas, currentCropsByArea, cropDefs || [], varietyMap, preferredNames);
+    // Also pass activeCropsByArea as currentCropsByArea for backwards compat
+    const currentCropsByArea = activeCropsByArea;
+
+    // Generate options — pass sequenceByArea so generator can use existing sequences
+    const options = _generatePlanOptions(goal, areas, currentCropsByArea, cropDefs || [], varietyMap, preferredNames, sequenceByArea);
 
     // Claude explanation cards
     const gardenContext = areas.map(a => {
-      const crops = currentCropsByArea[a.id];
-      const type  = _classifyArea(a);
-      return `${a.name} (${type}, ${a.width_m||"?"}x${a.length_m||"?"}m): ${crops ? crops.map(c=>c.name).join(", ") : "empty"}`;
+      const seq  = sequenceByArea[a.id];
+      const type = _classifyArea(a);
+      let desc = seq && seq.primary ? seq.primary.name : "empty";
+      if (seq && seq.followOns && seq.followOns.length) {
+        desc += ` → then ${seq.followOns.map(f=>f.name).join(" + ")}`;
+      }
+      return `${a.name} (${type}, ${a.width_m||"?"}x${a.length_m||"?"}m): ${desc}`;
     }).join("\n");
 
     const optionsContext = options.map((o,i) =>
