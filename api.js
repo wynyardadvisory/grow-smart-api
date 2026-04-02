@@ -5639,16 +5639,10 @@ app.get("/subscription/manage", requireAuth, async (req, res) => {
 app.get("/plans", requireAuth, async (req, res) => {
   try {
     const { data, error } = await req.db
-      .from("garden_plans")
-      .select("*")
-      .eq("user_id", req.user.id)
-      .order("created_at", { ascending: false });
+      .from("garden_plans").select("*").eq("user_id", req.user.id).order("created_at", { ascending: false });
     if (error) throw error;
     res.json(data || []);
-  } catch (err) {
-    captureError("GetPlans", err);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { captureError("GetPlans", err); res.status(500).json({ error: err.message }); }
 });
 
 app.post("/plans", requireAuth, async (req, res) => {
@@ -5659,38 +5653,30 @@ app.post("/plans", requireAuth, async (req, res) => {
     const { data: loc, error: locErr } = await req.db
       .from("locations").select("id").eq("id", location_id).eq("user_id", req.user.id).single();
     if (locErr || !loc) return res.status(403).json({ error: "Location not found" });
-    const { data, error } = await req.db
-      .from("garden_plans")
+    const { data, error } = await req.db.from("garden_plans")
       .insert({ user_id: req.user.id, location_id, name: name.trim(), status: "draft", effective_from_date: effective_from_date || null })
       .select().single();
     if (error) throw error;
     res.json(data);
-  } catch (err) {
-    captureError("CreatePlan", err);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { captureError("CreatePlan", err); res.status(500).json({ error: err.message }); }
 });
 
 app.put("/plans/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const { name, effective_from_date, status } = req.body;
-    if (status && !["draft", "archived"].includes(status)) {
+    if (status && !["draft", "archived"].includes(status))
       return res.status(400).json({ error: "Use POST /plans/:id/commit to commit a plan" });
-    }
     const updates = { updated_at: new Date().toISOString() };
     if (name !== undefined) updates.name = name.trim();
     if (effective_from_date !== undefined) updates.effective_from_date = effective_from_date || null;
     if (status !== undefined) updates.status = status;
-    const { data, error } = await req.db
-      .from("garden_plans").update(updates).eq("id", id).eq("user_id", req.user.id).select().single();
+    const { data, error } = await req.db.from("garden_plans")
+      .update(updates).eq("id", id).eq("user_id", req.user.id).select().single();
     if (error) throw error;
     if (!data) return res.status(404).json({ error: "Plan not found" });
     res.json(data);
-  } catch (err) {
-    captureError("UpdatePlan", err);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { captureError("UpdatePlan", err); res.status(500).json({ error: err.message }); }
 });
 
 app.delete("/plans/:id", requireAuth, async (req, res) => {
@@ -5699,10 +5685,7 @@ app.delete("/plans/:id", requireAuth, async (req, res) => {
     const { error } = await req.db.from("garden_plans").delete().eq("id", id).eq("user_id", req.user.id);
     if (error) throw error;
     res.json({ ok: true });
-  } catch (err) {
-    captureError("DeletePlan", err);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { captureError("DeletePlan", err); res.status(500).json({ error: err.message }); }
 });
 
 app.post("/plans/:id/commit", requireAuth, async (req, res) => {
@@ -5714,15 +5697,12 @@ app.post("/plans/:id/commit", requireAuth, async (req, res) => {
     await req.db.from("garden_plans")
       .update({ status: "archived", updated_at: new Date().toISOString() })
       .eq("user_id", req.user.id).eq("location_id", plan.location_id).eq("status", "committed").neq("id", id);
-    const { data, error } = await req.db
-      .from("garden_plans").update({ status: "committed", updated_at: new Date().toISOString() })
+    const { data, error } = await req.db.from("garden_plans")
+      .update({ status: "committed", updated_at: new Date().toISOString() })
       .eq("id", id).eq("user_id", req.user.id).select().single();
     if (error) throw error;
     res.json(data);
-  } catch (err) {
-    captureError("CommitPlan", err);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { captureError("CommitPlan", err); res.status(500).json({ error: err.message }); }
 });
 
 app.get("/plans/:id/assignments", requireAuth, async (req, res) => {
@@ -5731,17 +5711,12 @@ app.get("/plans/:id/assignments", requireAuth, async (req, res) => {
     const { data: plan, error: planErr } = await req.db
       .from("garden_plans").select("id").eq("id", id).eq("user_id", req.user.id).single();
     if (planErr || !plan) return res.status(404).json({ error: "Plan not found" });
-    const { data, error } = await req.db
-      .from("plan_area_assignments")
+    const { data, error } = await req.db.from("plan_area_assignments")
       .select("*, crop_definition:crop_definitions(id, name, emoji, category), area:growing_areas(id, name, location_id)")
-      .eq("plan_id", id)
-      .order("sequence_order", { ascending: true });
+      .eq("plan_id", id).order("sequence_order", { ascending: true });
     if (error) throw error;
     res.json(data || []);
-  } catch (err) {
-    captureError("GetPlanAssignments", err);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { captureError("GetPlanAssignments", err); res.status(500).json({ error: err.message }); }
 });
 
 app.post("/plans/:id/assignments", requireAuth, async (req, res) => {
@@ -5756,16 +5731,12 @@ app.post("/plans/:id/assignments", requireAuth, async (req, res) => {
       .from("growing_areas").select("id, location_id").eq("id", area_id).single();
     if (areaErr || !area) return res.status(404).json({ error: "Area not found" });
     if (area.location_id !== plan.location_id) return res.status(400).json({ error: "Area does not belong to this plan's location" });
-    const { data, error } = await req.db
-      .from("plan_area_assignments")
+    const { data, error } = await req.db.from("plan_area_assignments")
       .upsert({ plan_id: id, area_id, crop_definition_id: crop_definition_id || null, crop_name: crop_name || null, variety_id: variety_id || null, planned_start_date: planned_start_date || null, planned_end_date: planned_end_date || null, sequence_order: sequence_order ?? null, notes: notes || null }, { onConflict: "plan_id,area_id" })
       .select().single();
     if (error) throw error;
     res.json(data);
-  } catch (err) {
-    captureError("UpsertPlanAssignment", err);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { captureError("UpsertPlanAssignment", err); res.status(500).json({ error: err.message }); }
 });
 
 app.delete("/plans/:id/assignments/:assignmentId", requireAuth, async (req, res) => {
@@ -5777,10 +5748,7 @@ app.delete("/plans/:id/assignments/:assignmentId", requireAuth, async (req, res)
     const { error } = await req.db.from("plan_area_assignments").delete().eq("id", assignmentId).eq("plan_id", id);
     if (error) throw error;
     res.json({ ok: true });
-  } catch (err) {
-    captureError("DeletePlanAssignment", err);
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { captureError("DeletePlanAssignment", err); res.status(500).json({ error: err.message }); }
 });
 
 // ── Plan Generation ───────────────────────────────────────────────────────────
@@ -5847,15 +5815,18 @@ function _scoreRotation(currentCategory, nextCategory) {
   return Math.max(1, 8 - idx * 2);
 }
 
-function _pickCrop(category, cropDefs) {
+function _pickCrop(category, cropDefs, preferredCropIds = new Set()) {
   const candidates = cropDefs.filter(d => d.category === category);
   if (!candidates.length) return null;
+  // Prefer crops the user already grows
+  const preferred = candidates.filter(d => preferredCropIds.has(d.id));
+  if (preferred.length) return preferred[0];
   const withWindow = candidates.filter(d => d.sow_direct_start || d.sow_indoors_start);
   const pool = withWindow.length ? withWindow : candidates;
   return pool[Math.floor(Math.random() * Math.min(pool.length, 5))];
 }
 
-function _buildOption(name, areaAssignments, currentStateMap, cropDefs, goal) {
+function _buildOption(name, areaAssignments, currentStateMap, cropDefs, goal, preferredCropIds) {
   let totalRotation = 0, totalYield = 0, totalEase = 0, count = 0;
   const assignments = [];
   for (const { area, category } of areaAssignments) {
@@ -5868,7 +5839,7 @@ function _buildOption(name, areaAssignments, currentStateMap, cropDefs, goal) {
     totalYield    += yScore;
     totalEase     += eScore;
     count++;
-    const cropDef = _pickCrop(category, cropDefs);
+    const cropDef = _pickCrop(category, cropDefs, preferredCropIds);
     assignments.push({
       area_id:            area.id,
       area_name:          area.name,
@@ -5891,7 +5862,7 @@ function _buildOption(name, areaAssignments, currentStateMap, cropDefs, goal) {
   };
 }
 
-function _generateOptions(goal, rotatableAreas, currentStateMap, cropDefs, userFavCats) {
+function _generateOptions(goal, rotatableAreas, currentStateMap, cropDefs, userFavCats, preferredCropIds = new Set()) {
   const allCats = ["legume", "brassica", "root", "fruiting", "allium", "salad"];
 
   if (goal === "best_rotation") {
@@ -5974,6 +5945,38 @@ function _generateOptions(goal, rotatableAreas, currentStateMap, cropDefs, userF
     ];
   }
 
+  if (goal === "rotate_mine") {
+    // Take the categories the user currently grows, rotate them to correct beds
+    const currentCats = rotatableAreas.map(a => (currentStateMap[a.id] && currentStateMap[a.id].category) || "legume");
+    // Option A: strict rotation of what they have
+    const assignA = rotatableAreas.map((area, i) => {
+      const cur = currentStateMap[area.id] && currentStateMap[area.id].category;
+      const allCurrentCats = currentCats.filter((c,j) => j !== i);
+      // Pick from the pool of what user grows, avoiding same family
+      const rotated = allCurrentCats.filter(c => !(ROTATION_AVOID[cur] || []).includes(c));
+      return { area, category: rotated[i % rotated.length] || (ROTATION_NEXT[cur] || ["legume"])[0] };
+    });
+    // Option B: rotate strictly by book order using only current categories
+    const uniqCats = [...new Set(currentCats)].filter(c => !FIXED_CATEGORIES.has(c));
+    const assignB = rotatableAreas.map((area, i) => {
+      const cur = currentStateMap[area.id] && currentStateMap[area.id].category;
+      const nextList = (ROTATION_NEXT[cur] || []).filter(c => uniqCats.includes(c));
+      return { area, category: nextList[0] || uniqCats[i % uniqCats.length] };
+    });
+    // Option C: introduce one legume bed for soil recovery, keep rest rotating
+    const assignC = rotatableAreas.map((area, i) => {
+      if (i === 0) return { area, category: "legume" };
+      const cur = currentStateMap[area.id] && currentStateMap[area.id].category;
+      const nextList = (ROTATION_NEXT[cur] || currentCats).filter(c => c !== "legume");
+      return { area, category: nextList[0] || currentCats[i % currentCats.length] };
+    });
+    return [
+      _buildOption("Rotate Your Crops", assignA, currentStateMap, cropDefs, goal, preferredCropIds),
+      _buildOption("Book Rotation", assignB, currentStateMap, cropDefs, goal, preferredCropIds),
+      _buildOption("Add a Legume Year", assignC, currentStateMap, cropDefs, goal, preferredCropIds),
+    ];
+  }
+
   // balanced (default)
   return [
     _buildOption("Balanced Garden", rotatableAreas.map((area, i) => {
@@ -5998,7 +6001,7 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
   try {
     const { location_id, goal = "balanced" } = req.body;
     if (!location_id) return res.status(400).json({ error: "location_id required" });
-    const validGoals = ["max_yield", "best_rotation", "favourites", "easy", "balanced"];
+    const validGoals = ["max_yield", "best_rotation", "favourites", "easy", "balanced", "rotate_mine"];
     if (!validGoals.includes(goal)) return res.status(400).json({ error: "invalid goal" });
 
     const { data: loc, error: locErr } = await req.db
@@ -6042,7 +6045,9 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
     }
     const userFavCats = Object.entries(categoryCounts).sort((a,b) => b[1] - a[1]).map(([cat]) => cat).filter(c => !FIXED_CATEGORIES.has(c));
 
-    const options = _generateOptions(goal, rotatableAreas, currentStateMap, cropDefs || [], userFavCats);
+    // Build set of crop def IDs the user actually grows — for crop selection preference
+    const preferredCropIds = new Set((currentCrops || []).map(c => c.crop_def_id).filter(Boolean));
+    const options = _generateOptions(goal, rotatableAreas, currentStateMap, cropDefs || [], userFavCats, preferredCropIds);
 
     const gardenContext = areas.map(a => {
       const state = currentStateMap[a.id];
