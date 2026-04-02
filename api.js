@@ -5634,6 +5634,260 @@ app.get("/subscription/manage", requireAuth, async (req, res) => {
   }
 });
 
+// ── Garden Plans ──────────────────────────────────────────────────────────────
+// GET /plans — list all plans for the authenticated user (across all locations)
+app.get("/plans", requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await req.db
+      .from("garden_plans")
+      .select("*")
+      .eq("user_id", req.user.id)
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    captureError("GetPlans", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /plans — create a new draft plan
+app.post("/plans", requireAuth, async (req, res) => {
+  try {
+    const { location_id, name, effective_from_date } = req.body;
+    if (!location_id) return res.status(400).json({ error: "location_id required" });
+    if (!name || !name.trim()) return res.status(400).json({ error: "name required" });
+
+    // Verify location belongs to user
+    const { data: loc, error: locErr } = await req.db
+      .from("locations")
+      .select("id")
+      .eq("id", location_id)
+      .eq("user_id", req.user.id)
+      .single();
+    if (locErr || !loc) return res.status(403).json({ error: "Location not found" });
+
+    const { data, error } = await req.db
+      .from("garden_plans")
+      .insert({
+        user_id:             req.user.id,
+        location_id,
+        name:                name.trim(),
+        status:              "draft",
+        effective_from_date: effective_from_date || null,
+      })
+      .select()
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    captureError("CreatePlan", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /plans/:id — update plan name, effective_from_date, or status (draft/archived only — use /commit for committing)
+app.put("/plans/:id", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, effective_from_date, status } = req.body;
+
+    // Only allow updating to draft or archived via this endpoint
+    if (status && !["draft", "archived"].includes(status)) {
+      return res.status(400).json({ error: "Use POST /plans/:id/commit to commit a plan" });
+    }
+
+    const updates = { updated_at: new Date().toISOString() };
+    if (name !== undefined) updates.name = name.trim();
+    if (effective_from_date !== undefined) updates.effective_from_date = effective_from_date || null;
+    if (status !== undefined) updates.status = status;
+
+    const { data, error } = await req.db
+      .from("garden_plans")
+      .update(updates)
+      .eq("id", id)
+      .eq("user_id", req.user.id)
+      .select()
+      .single();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: "Plan not found" });
+    res.json(data);
+  } catch (err) {
+    captureError("UpdatePlan", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /plans/:id — delete a plan and all its assignments
+app.delete("/plans/:id", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { error } = await req.db
+      .from("garden_plans")
+      .delete()
+      .eq("id", id)
+      .eq("user_id", req.user.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (err) {
+    captureError("DeletePlan", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /plans/:id/commit — commit a plan; archives any previously committed plan for same location
+app.post("/plans/:id/commit", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Fetch the plan to get location_id
+    const { data: plan, error: planErr } = await req.db
+      .from("garden_plans")
+      .select("*")
+      .eq("id", id)
+      .eq("user_id", req.user.id)
+      .single();
+    if (planErr || !plan) return res.status(404).json({ error: "Plan not found" });
+
+    // Archive any currently committed plans for this location
+    const { error: archiveErr } = await req.db
+      .from("garden_plans")
+      .update({ status: "archived", updated_at: new Date().toISOString() })
+      .eq("user_id", req.user.id)
+      .eq("location_id", plan.location_id)
+      .eq("status", "committed")
+      .neq("id", id);
+    if (archiveErr) throw archiveErr;
+
+    // Commit this plan
+    const { data, error } = await req.db
+      .from("garden_plans")
+      .update({ status: "committed", updated_at: new Date().toISOString() })
+      .eq("id", id)
+      .eq("user_id", req.user.id)
+      .select()
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    captureError("CommitPlan", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /plans/:id/assignments — all area assignments for a plan
+app.get("/plans/:id/assignments", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Verify plan ownership
+    const { data: plan, error: planErr } = await req.db
+      .from("garden_plans")
+      .select("id")
+      .eq("id", id)
+      .eq("user_id", req.user.id)
+      .single();
+    if (planErr || !plan) return res.status(404).json({ error: "Plan not found" });
+
+    const { data, error } = await req.db
+      .from("plan_area_assignments")
+      .select(`
+        *,
+        crop_definition:crop_definitions(id, name, emoji, category),
+        area:growing_areas(id, name, location_id)
+      `)
+      .eq("plan_id", id)
+      .order("sequence_order", { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    captureError("GetPlanAssignments", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /plans/:id/assignments — add or update an area assignment within a plan
+app.post("/plans/:id/assignments", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      area_id, crop_definition_id, crop_name,
+      variety_id, planned_start_date, planned_end_date,
+      sequence_order, notes,
+    } = req.body;
+    if (!area_id) return res.status(400).json({ error: "area_id required" });
+
+    // Verify plan ownership and get location_id
+    const { data: plan, error: planErr } = await req.db
+      .from("garden_plans")
+      .select("id, location_id")
+      .eq("id", id)
+      .eq("user_id", req.user.id)
+      .single();
+    if (planErr || !plan) return res.status(404).json({ error: "Plan not found" });
+
+    // Verify area belongs to the same location as the plan
+    const { data: area, error: areaErr } = await req.db
+      .from("growing_areas")
+      .select("id, location_id")
+      .eq("id", area_id)
+      .single();
+    if (areaErr || !area) return res.status(404).json({ error: "Area not found" });
+    if (area.location_id !== plan.location_id) {
+      return res.status(400).json({ error: "Area does not belong to this plan's location" });
+    }
+
+    // Upsert — one assignment per area per plan
+    const { data, error } = await req.db
+      .from("plan_area_assignments")
+      .upsert({
+        plan_id:             id,
+        area_id,
+        crop_definition_id:  crop_definition_id  || null,
+        crop_name:           crop_name           || null,
+        variety_id:          variety_id           || null,
+        planned_start_date:  planned_start_date   || null,
+        planned_end_date:    planned_end_date     || null,
+        sequence_order:      sequence_order       ?? null,
+        notes:               notes               || null,
+      }, { onConflict: "plan_id,area_id" })
+      .select()
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    captureError("UpsertPlanAssignment", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /plans/:id/assignments/:assignmentId — remove an area from a plan
+app.delete("/plans/:id/assignments/:assignmentId", requireAuth, async (req, res) => {
+  try {
+    const { id, assignmentId } = req.params;
+
+    // Verify plan ownership
+    const { data: plan, error: planErr } = await req.db
+      .from("garden_plans")
+      .select("id")
+      .eq("id", id)
+      .eq("user_id", req.user.id)
+      .single();
+    if (planErr || !plan) return res.status(404).json({ error: "Plan not found" });
+
+    const { error } = await req.db
+      .from("plan_area_assignments")
+      .delete()
+      .eq("id", assignmentId)
+      .eq("plan_id", id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (err) {
+    captureError("DeletePlanAssignment", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Sentry error handler — must be before any other error middleware ──────────
 Sentry.setupExpressErrorHandler(app);
 
