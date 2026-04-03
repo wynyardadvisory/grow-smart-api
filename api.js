@@ -4957,6 +4957,8 @@ app.post("/admin/backfill-badges", requireAuth, requireAdmin, async (req, res) =
       const tasksTotal  = userTasks.length;
       const tasksMonth  = userTasks.filter(t => t.completed_at >= monthStart).length;
       const tasksSeason = userTasks.filter(t => t.completed_at >= seasonStart).length;
+      const sevenDaysAgo = new Date(now - 7 * 86400000).toISOString();
+      const tasks7Days  = userTasks.filter(t => t.completed_at >= sevenDaysAgo).length;
       const sowTotal    = userTasks.filter(t => t.task_type === "sow").length;
       const sowMonth    = userTasks.filter(t => t.task_type === "sow" && t.completed_at >= monthStart).length;
       const sowSeason   = userTasks.filter(t => t.task_type === "sow" && t.completed_at >= seasonStart).length;
@@ -4985,11 +4987,15 @@ app.post("/admin/backfill-badges", requireAuth, requireAdmin, async (req, res) =
         current_streak_days: streak, longest_streak_days: longest,
         last_qualifying_activity_date: distinctDays[0] || null,
         active_dates_this_month: activeDatesMonth,
+        tasks_completed_7_days: tasks7Days,
         current_month_key: monthKey, current_season_key: currentSeason, updated_at: now.toISOString(),
       };
       counterUpserts.push(counters);
 
       for (const badge of (allBadges || [])) {
+        // Spring Starter: only award if user actually sowed in spring — skip in backfill
+        // (we can't know the season of historical sows reliably without per-task date checks)
+        if (badge.id === "spring_starter") continue;
         const val       = counters[badge.threshold_type] || 0;
         const completed = val >= badge.threshold_value;
         const progress  = Math.min(val, badge.threshold_value);
