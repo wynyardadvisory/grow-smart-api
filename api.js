@@ -1010,6 +1010,7 @@ app.put("/crops/:id", requireAuth, async (req, res) => {
     "variety","variety_id","sown_date","transplanted_date","transplant_date","planted_out_date",
     "establishment_method","stage","quantity","notes","area_id","photo_url",
     "start_date_confidence","last_fed_at","status",
+    "grown_from","lifecycle_mode","sow_preference",
   ];
   const updates = Object.fromEntries(Object.entries(req.body).filter(([k]) => allowed.includes(k)));
   updates.updated_at = new Date().toISOString();
