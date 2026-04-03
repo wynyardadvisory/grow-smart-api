@@ -4759,7 +4759,7 @@ async function updateStreak(userId, counters) {
 async function evaluateBadges(userId, eventType, counters) {
   const unlocks = [];
   const relevantThresholds = {
-    task_completed:   ["tasks_completed_total","tasks_completed_this_month","tasks_completed_this_season","current_streak_days"],
+    task_completed:   ["tasks_completed_total","tasks_completed_this_month","tasks_completed_this_season","tasks_completed_7_days","current_streak_days"],
     crop_added:       ["crops_added_total"],
     area_created:     ["growing_areas_created_total"],
     sow_logged:       ["sowing_logged_total","sowing_logged_this_month","sowing_logged_this_season","current_streak_days"],
@@ -4777,6 +4777,8 @@ async function evaluateBadges(userId, eventType, counters) {
   for (const badge of badges) {
     const { data: existing } = await supabaseService.from("user_badge_progress").select("is_completed, current_progress").eq("user_id", userId).eq("badge_id", badge.id).eq("month_key", badge.time_scope === "monthly" ? monthKey : "").maybeSingle();
     if (existing?.is_completed) continue;
+    // Spring Starter: only award during spring (March–May UK)
+    if (badge.id === "spring_starter" && seasonKey !== "spring") continue;
     const currentValue = counters[badge.threshold_type] || 0;
     const progress     = Math.min(currentValue, badge.threshold_value);
     const completed    = currentValue >= badge.threshold_value;
@@ -4812,6 +4814,14 @@ async function processBadgeEvent(userId, eventType, extraCounterUpdates = {}) {
     if (!counters) return [];
     const today    = getTodayISO();
     const updates  = { updated_at: new Date().toISOString(), ...extraCounterUpdates };
+    // Recalculate rolling 7-day task count from scratch using tasks table
+    const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString();
+    const { data: recent7 } = await supabaseService.from("tasks")
+      .select("id").eq("user_id", userId).not("completed_at", "is", null).gte("completed_at", sevenDaysAgo);
+    const rolling7 = (recent7 || []).length;
+    // Write rolling7 into extraCounterUpdates so evaluateBadges sees the live value
+    extraCounterUpdates.tasks_completed_7_days = rolling7;
+    updates.tasks_completed_7_days = rolling7;
     if (eventType === "task_completed") {
       updates.tasks_completed_total         = (counters.tasks_completed_total        || 0) + 1;
       updates.tasks_completed_this_month    = (counters.tasks_completed_this_month   || 0) + 1;
