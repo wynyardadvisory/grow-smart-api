@@ -867,6 +867,9 @@ async function runReengagement(supabase) {
     sentMap[e.user_id].add(e.email_type);
   });
 
+  // 7-day cooldown — don't send re-engagement if a non-transactional email went recently
+  const recentMap = await buildRecentNonTransactionalMap(supabase);
+
   const now = Date.now();
   let sent = 0;
 
@@ -874,6 +877,10 @@ async function runReengagement(supabase) {
     const user = userMap[profile.id];
     if (!user?.email) continue;
     if (profile.email_unsubscribed) continue;
+
+    // 7-day cooldown across all non-transactional emails
+    if (recentMap[profile.id] && (now - recentMap[profile.id]) < 7 * 24 * 3600000) continue;
+
     const daysSince = (now - new Date(user.created_at).getTime()) / 86400000;
     const userSent  = sentMap[profile.id] || new Set();
 
@@ -936,78 +943,6 @@ function templateGardenToday(name, tasks, cropNames) {
       </div>
       <div style="text-align:center;margin-bottom:16px;">
         <a href="${APP_URL}" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">Open my garden →</a>
-      </div>
-    </div>
-    <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
-      <p style="font-size:12px;color:#888;margin:0;">Vercro · Built for UK growers · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
-    </div>
-  </div>
-</body>
-</html>`,
-  };
-}
-
-function templateGardenEngagement(name, cropNames) {
-  const firstName = name ? name.split(" ")[0] : "there";
-  const cropList  = cropNames.slice(0, 3).join(", ");
-  return {
-    subject: "Your garden's looking good 👌",
-    html: `
-<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#f4f8f2;font-family:Georgia,serif;">
-  <div style="max-width:560px;margin:40px auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 2px 16px rgba(47,93,80,0.08);">
-    <div style="background:#2F5D50;padding:32px 40px;text-align:center;">
-      <div style="font-size:32px;margin-bottom:8px;">🌱</div>
-      <div style="font-family:Georgia,serif;font-size:24px;font-weight:700;color:#ffffff;">Vercro</div>
-    </div>
-    <div style="padding:40px;">
-      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">Nothing urgent today, ${firstName}</h1>
-      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
-        ${cropList ? `Your ${cropList} ${cropNames.length === 1 ? "is" : "are"} growing well` : "Your garden is on track"} — no pressing tasks today.
-      </p>
-      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 32px;">
-        A quick 2-minute check is always worthwhile — tap in and see how everything's coming along.
-      </p>
-      <div style="text-align:center;margin-bottom:16px;">
-        <a href="${APP_URL}" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">Check my garden →</a>
-      </div>
-    </div>
-    <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
-      <p style="font-size:12px;color:#888;margin:0;">Vercro · Built for UK growers · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
-    </div>
-  </div>
-</body>
-</html>`,
-  };
-}
-
-function templateGardenLapsed(name, cropNames) {
-  const firstName = name ? name.split(" ")[0] : "there";
-  const topCrop   = cropNames[0] || "your garden";
-  return {
-    subject: `${topCrop !== "your garden" ? `Your ${topCrop} needs you 🌱` : "Your garden needs you 🌱"}`,
-    html: `
-<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#f4f8f2;font-family:Georgia,serif;">
-  <div style="max-width:560px;margin:40px auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 2px 16px rgba(47,93,80,0.08);">
-    <div style="background:#2F5D50;padding:32px 40px;text-align:center;">
-      <div style="font-size:32px;margin-bottom:8px;">🌱</div>
-      <div style="font-family:Georgia,serif;font-size:24px;font-weight:700;color:#ffffff;">Vercro</div>
-    </div>
-    <div style="padding:40px;">
-      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">Hey ${firstName} — been a little while</h1>
-      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
-        ${cropNames.length > 0 ? `Your ${cropNames.slice(0, 2).join(" and ")} ${cropNames.length <= 2 ? "is" : "are"} still growing` : "Your garden is still there"} — and there may be tasks building up that need attention.
-      </p>
-      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 32px;">
-        A quick check-in keeps everything on track. Takes 2 minutes.
-      </p>
-      <div style="text-align:center;margin-bottom:16px;">
-        <a href="${APP_URL}" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">Back to my garden →</a>
       </div>
     </div>
     <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
@@ -1110,64 +1045,108 @@ async function runOnboardingRecovery(supabase) {
   return { sent, skipped, total: affected.length };
 }
 
-// ── Daily email fallback runner ───────────────────────────────────────────────
-// Fires after the morning push cron for users with no push token or push disabled
-// Suppressed if user opened the app in the last 6 hours
+// ── Weekly email digest runner ────────────────────────────────────────────────
+// Replaces the old daily fallback. Only sends on Sundays. Only sends if the
+// user has tasks due. Respects a 7-day cooldown across all non-transactional
+// emails so users never feel clustered.
+//
+// Triggered from POST /cron/weekly-digest (called by Vercel Cron on Sundays).
+// No longer called from /cron/push-morning.
+//
+// Non-transactional email types (subject to cooldown):
+//   weekly_digest, reengage_day14, reengage_day30, feedback_day3, feedback_day7
+//
+// Transactional (NOT subject to cooldown — always send):
+//   nudge_unactivated, nudge_unconfirmed, onboarding_recovery
 
-async function runDailyEmailFallback(supabase) {
+const NON_TRANSACTIONAL_EMAIL_TYPES = [
+  "weekly_digest",
+  "reengage_day14",
+  "reengage_day30",
+  "feedback_day3",
+  "feedback_day7",
+];
+
+// Returns the most recent sent_at (ms) for any non-transactional email per user.
+// Used by both runWeeklyEmailDigest and runReengagement for cooldown enforcement.
+async function buildRecentNonTransactionalMap(supabase) {
+  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 3600000).toISOString();
+  const { data: recentEmails } = await supabase
+    .from("email_log")
+    .select("user_id, email_type, sent_at")
+    .in("email_type", NON_TRANSACTIONAL_EMAIL_TYPES)
+    .gte("sent_at", sevenDaysAgo);
+
+  // Map: user_id → most recent sent_at ms
+  const map = {};
+  (recentEmails || []).forEach(e => {
+    const ms = new Date(e.sent_at).getTime();
+    if (!map[e.user_id] || ms > map[e.user_id]) map[e.user_id] = ms;
+  });
+  return map;
+}
+
+async function runWeeklyEmailDigest(supabase) {
+  // Only run on Sundays (day 0). Cron is scheduled for Sunday but this guard
+  // makes it safe to call manually without spamming on wrong days.
+  const today = new Date();
+  if (today.getDay() !== 0) {
+    console.log("[WeeklyDigest] Not Sunday — skipping.");
+    return { sent: 0, skipped: 0, reason: "not_sunday" };
+  }
+
   const { data: { users } } = await supabase.auth.admin.listUsers({ perPage: 1000 });
   const userMap = {};
   (users || []).forEach(u => { userMap[u.id] = u; });
 
-  // Get all profiles with last_seen_at
   const { data: profiles } = await supabase
     .from("profiles")
-    .select("id, name, last_seen_at, email_unsubscribed");
+    .select("id, name, last_seen_at, email_unsubscribed")
+    .eq("is_demo", false);
   if (!profiles?.length) return { sent: 0, skipped: 0 };
 
-  // Get users with active push tokens
+  // Skip users with active push tokens and push enabled — push covers them
   const { data: pushTokens } = await supabase
-    .from("device_push_tokens")
-    .select("user_id")
-    .eq("is_active", true);
+    .from("device_push_tokens").select("user_id").eq("is_active", true);
   const hasPush = new Set((pushTokens || []).map(t => t.user_id));
 
-  // Get push preferences
   const { data: pushPrefs } = await supabase
-    .from("notification_preferences")
-    .select("user_id, push_enabled");
+    .from("notification_preferences").select("user_id, push_enabled");
   const pushEnabled = {};
   (pushPrefs || []).forEach(p => { pushEnabled[p.user_id] = p.push_enabled; });
 
-  // Get already-sent today
-  const todayStart = new Date();
-  todayStart.setHours(0, 0, 0, 0);
-  const { data: sentToday } = await supabase
+  // 7-day cooldown — skip anyone who got a non-transactional email in last 7 days
+  const recentMap = await buildRecentNonTransactionalMap(supabase);
+
+  // Already sent this week's digest
+  const weekStart = new Date();
+  weekStart.setHours(0, 0, 0, 0);
+  weekStart.setDate(weekStart.getDate() - weekStart.getDay()); // last Sunday 00:00
+  const { data: sentThisWeek } = await supabase
     .from("email_log")
     .select("user_id")
-    .eq("email_type", "daily_fallback")
-    .gte("sent_at", todayStart.toISOString());
-  const sentTodayIds = new Set((sentToday || []).map(e => e.user_id));
+    .eq("email_type", "weekly_digest")
+    .gte("sent_at", weekStart.toISOString());
+  const sentThisWeekIds = new Set((sentThisWeek || []).map(e => e.user_id));
 
-  // Get today's tasks per user
-  const today = new Date().toISOString().split("T")[0];
+  // Tasks due this week per user
+  const todayStr = today.toISOString().split("T")[0];
   const { data: dueTasks } = await supabase
     .from("tasks")
     .select("user_id, action, task_type, urgency, crop:crop_instance_id(name)")
     .is("completed_at", null)
-    .lte("due_date", today)
-    .not("status", "eq", "expired");
+    .lte("due_date", todayStr)
+    .not("status", "eq", "expired")
+    .not("surface_class", "eq", "insight");
   const tasksByUser = {};
   (dueTasks || []).forEach(t => {
     if (!tasksByUser[t.user_id]) tasksByUser[t.user_id] = [];
     tasksByUser[t.user_id].push(t);
   });
 
-  // Get crops per user for engagement emails
+  // Crops per user for digest copy
   const { data: crops } = await supabase
-    .from("crop_instances")
-    .select("user_id, name")
-    .eq("active", true);
+    .from("crop_instances").select("user_id, name").eq("active", true);
   const cropsByUser = {};
   (crops || []).forEach(c => {
     if (!cropsByUser[c.user_id]) cropsByUser[c.user_id] = [];
@@ -1182,50 +1161,33 @@ async function runDailyEmailFallback(supabase) {
     if (!user?.email) { skipped++; continue; }
     if (profile.email_unsubscribed) { skipped++; continue; }
 
-    // Skip if they have push enabled and a token — push handles them
+    // Push covers this user — skip
     if (hasPush.has(profile.id) && pushEnabled[profile.id] !== false) { skipped++; continue; }
 
-    // Skip if already emailed today
-    if (sentTodayIds.has(profile.id)) { skipped++; continue; }
+    // Already got a digest this week
+    if (sentThisWeekIds.has(profile.id)) { skipped++; continue; }
 
-    // Skip if they opened the app in the last 6 hours
+    // 7-day cooldown — another non-transactional email sent recently
+    if (recentMap[profile.id] && (now - recentMap[profile.id]) < 7 * 24 * 3600000) { skipped++; continue; }
+
+    // Opened the app in the last 24 hours — no need to email
     if (profile.last_seen_at) {
-      const lastSeen = new Date(profile.last_seen_at).getTime();
-      if (now - lastSeen < 6 * 3600000) { skipped++; continue; }
+      if (now - new Date(profile.last_seen_at).getTime() < 24 * 3600000) { skipped++; continue; }
     }
 
-    const userTasks   = tasksByUser[profile.id] || [];
-    const userCrops   = cropsByUser[profile.id]  || [];
-    const lastSeenMs  = profile.last_seen_at ? new Date(profile.last_seen_at).getTime() : 0;
-    const daysSinceSeen = lastSeenMs ? (now - lastSeenMs) / 86400000 : 999;
+    const userTasks = tasksByUser[profile.id] || [];
+    const userCrops = cropsByUser[profile.id]  || [];
 
-    let template;
-    let emailType;
+    // Only send if there are actual due tasks — no nagging when garden is quiet
+    if (userTasks.length === 0) { skipped++; continue; }
 
-    if (userTasks.length > 0) {
-      // Has tasks due — send garden today digest
-      template  = templateGardenToday(profile.name, userTasks, userCrops);
-      emailType = "daily_fallback";
-    } else if (daysSinceSeen >= 3) {
-      // Lapsed 3+ days — emotional re-engagement tone
-      template  = templateGardenLapsed(profile.name, userCrops);
-      emailType = "daily_fallback";
-    } else if (daysSinceSeen >= 1) {
-      // Inactive 1-3 days — gentle engagement
-      template  = templateGardenEngagement(profile.name, userCrops);
-      emailType = "daily_fallback";
-    } else {
-      // Active recently, no tasks — skip
-      skipped++;
-      continue;
-    }
-
-    const result = await sendEmail(user.email, template);
+    const template = templateGardenToday(profile.name, userTasks, userCrops);
+    const result   = await sendEmail(user.email, template);
     if (result.sent) {
       await supabase.from("email_log").insert({
         user_id:    profile.id,
         email:      user.email,
-        email_type: emailType,
+        email_type: "weekly_digest",
         sent_at:    new Date().toISOString(),
       });
       sent++;
@@ -1234,8 +1196,8 @@ async function runDailyEmailFallback(supabase) {
     }
   }
 
-  console.log(`[DailyEmailFallback] Sent: ${sent}, Skipped: ${skipped}`);
+  console.log(`[WeeklyEmailDigest] Sent: ${sent}, Skipped: ${skipped}`);
   return { sent, skipped };
 }
 
-module.exports = { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement, runDailyEmailFallback, runOnboardingRecovery };
+module.exports = { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement, runWeeklyEmailDigest, runOnboardingRecovery };

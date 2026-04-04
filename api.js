@@ -50,7 +50,7 @@ const Stripe = require("stripe");
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const { applyBlockedPeriodAdjustments, reapplyAllBlockedPeriods } = require("./blocked-period-adjustment");
 const { runNotificationsForUser, sendBulkNotifications } = require("./notifications");
-const { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement, runDailyEmailFallback } = require("./emails");
+const { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement, runWeeklyEmailDigest } = require("./emails");
 
 // ── Supabase (service role — server only) ─────────────────────────────────────
 const supabaseService = createClient(
@@ -5325,8 +5325,7 @@ app.post("/cron/push-morning", async (req, res) => {
       sendCounts = await sendBulkNotifications(supabaseService, eligible, "morning", tokenMap, tasksByUser);
       console.log(`[PushMorning] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
     }
-    const emailResult = await runDailyEmailFallback(supabaseService);
-    console.log(`[EmailFallback] Sent: ${emailResult.sent}, Skipped: ${emailResult.skipped}`);
+    // Email fallback removed — now handled by POST /cron/weekly-digest (Sundays only)
     res.json({ ok: true, eligible: eligible.length, ...sendCounts });
   } catch(e) {
     captureError("PushMorning", e);
@@ -5454,6 +5453,22 @@ app.post("/cron/reengagement", async (req, res) => {
     const result = await runReengagement(supabaseService);
     console.log("[Reengagement]", result);
   } catch(e) { captureError("Reengagement", e); }
+});
+
+// POST /cron/weekly-digest — Sunday weekly email digest for no-push users with due tasks
+// Schedule in vercel.json: { "path": "/cron/weekly-digest", "schedule": "0 8 * * 0" }
+// (08:00 UTC every Sunday)
+app.post("/cron/weekly-digest", async (req, res) => {
+  const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
+  if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  try {
+    const result = await runWeeklyEmailDigest(supabaseService);
+    console.log("[WeeklyDigest]", result);
+    res.json({ ok: true, ...result });
+  } catch(e) {
+    captureError("WeeklyDigest", e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // =============================================================================
