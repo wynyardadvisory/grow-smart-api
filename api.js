@@ -313,6 +313,153 @@ app.get("/auth/profile", requireAuth, async (req, res) => {
   res.json(data);
 });
 
+// POST /auth/email-preferences — toggle marketing emails on/off
+// Uses existing email_unsubscribed boolean on profiles (true = unsubscribed)
+app.post("/auth/email-preferences", requireAuth, async (req, res) => {
+  const { marketing_emails_enabled } = req.body;
+  if (typeof marketing_emails_enabled !== "boolean") {
+    return res.status(400).json({ error: "marketing_emails_enabled must be a boolean" });
+  }
+  // email_unsubscribed is the inverse of marketing_emails_enabled
+  const { error } = await req.db.from("profiles")
+    .update({ email_unsubscribed: !marketing_emails_enabled })
+    .eq("id", req.user.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true, marketing_emails_enabled });
+});
+
+// DELETE /auth/account — anonymise and delete user account
+// Retains behavioural data (harvest_log, crop_instances, observation_logs, manual_activity_logs)
+// under a new anonymous ID. Deletes all personal/operational data and auth record.
+app.delete("/auth/account", requireAuth, async (req, res) => {
+  const userId = req.user.id;
+
+  try {
+    // 1. Generate anonymous ID to replace user_id in retained tables
+    const { v4: uuidv4 } = require("uuid");
+    const anonId = uuidv4();
+
+    // 2. Record the anonymisation mapping (for internal audit/GDPR log only — no PII stored)
+    await supabaseService.from("deleted_user_anonymous_map").insert({
+      anonymous_id: anonId,
+      deleted_at: new Date().toISOString(),
+    });
+
+    // 3. Reassign retained behavioural data to anonymous ID
+    // harvest_log — sowing/harvesting history is the core monetisable dataset
+    await supabaseService.from("harvest_log")
+      .update({ user_id: anonId })
+      .eq("user_id", userId);
+
+    // crop_instances — variety selections, sow dates, grow history
+    await supabaseService.from("crop_instances")
+      .update({ user_id: anonId })
+      .eq("user_id", userId);
+
+    // observation_logs — pest/disease/growth observations
+    await supabaseService.from("observation_logs")
+      .update({ user_id: anonId })
+      .eq("user_id", userId);
+
+    // manual_activity_logs — watering, feeding, pruning actions
+    await supabaseService.from("manual_activity_logs")
+      .update({ user_id: anonId })
+      .eq("user_id", userId);
+
+    // 4. Delete operational / account-specific data
+    // Tasks (all — no long-term value vs privacy tradeoff)
+    await supabaseService.from("tasks")
+      .delete().eq("user_id", userId);
+
+    // Push tokens
+    await supabaseService.from("device_push_tokens")
+      .delete().eq("user_id", userId);
+
+    // Notification events and preferences
+    await supabaseService.from("notification_events")
+      .delete().eq("user_id", userId);
+    await supabaseService.from("notification_preferences")
+      .delete().eq("user_id", userId);
+
+    // Active locations, areas (structural — personal, not worth retaining)
+    const { data: areas } = await supabaseService.from("growing_areas")
+      .select("id").in("location_id",
+        (await supabaseService.from("locations").select("id").eq("user_id", userId)).data?.map(l => l.id) || []
+      );
+    if (areas?.length) {
+      await supabaseService.from("growing_areas")
+        .delete().in("id", areas.map(a => a.id));
+    }
+    await supabaseService.from("locations").delete().eq("user_id", userId);
+
+    // Succession groups
+    await supabaseService.from("succession_groups")
+      .delete().eq("user_id", userId);
+
+    // Pending crop AI jobs
+    await supabaseService.from("pending_crops")
+      .delete().eq("user_id", userId);
+
+    // Garden plans
+    await supabaseService.from("garden_plans")
+      .delete().eq("user_id", userId);
+
+    // Planting suggestions
+    await supabaseService.from("planting_suggestions")
+      .delete().eq("user_id", userId);
+
+    // Badge progress and unlocks
+    await supabaseService.from("user_badge_progress")
+      .delete().eq("user_id", userId);
+    await supabaseService.from("badge_unlock_events")
+      .delete().eq("user_id", userId);
+
+    // Activity counters
+    await supabaseService.from("user_activity_counters")
+      .delete().eq("user_id", userId);
+
+    // Funnel events
+    await supabaseService.from("funnel_events")
+      .delete().eq("user_id", userId);
+
+    // Blocked periods / task adjustments
+    await supabaseService.from("blocked_periods")
+      .delete().eq("user_id", userId);
+    await supabaseService.from("task_adjustments")
+      .delete().eq("user_id", userId);
+
+    // Diagnosis log (may contain photos/personal context — delete)
+    await supabaseService.from("diagnosis_log")
+      .delete().eq("user_id", userId);
+
+    // Feedback (personal text — delete)
+    await supabaseService.from("feedback")
+      .delete().eq("user_id", userId);
+
+    // Email log (operational)
+    await supabaseService.from("email_log")
+      .delete().eq("user_id", userId);
+
+    // 5. Delete profile row
+    await supabaseService.from("profiles")
+      .delete().eq("id", userId);
+
+    // 6. Delete auth user — must be last
+    const { error: authError } = await supabaseService.auth.admin.deleteUser(userId);
+    if (authError) {
+      console.error("[DeleteAccount] Auth delete failed:", authError.message);
+      // Don't expose to client — personal data already removed
+    }
+
+    console.log(`[DeleteAccount] User ${userId} anonymised to ${anonId} and deleted`);
+    res.json({ ok: true });
+
+  } catch (err) {
+    console.error("[DeleteAccount] Error:", err.message);
+    res.status(500).json({ error: "Account deletion failed. Please try again or contact support." });
+  }
+});
+
 // =============================================================================
 // LOCATIONS
 // =============================================================================
