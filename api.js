@@ -5474,6 +5474,20 @@ app.post("/cron/weekly-digest", async (req, res) => {
 // =============================================================================
 // CRON — called by Vercel Cron at 06:00 UTC daily
 // Protected by CRON_SECRET header.
+// POST /cron/price-ingestion — weekly Pepesto price refresh
+// Schedule in vercel.json: { "path": "/cron/price-ingestion", "schedule": "0 5 * * 1" }
+app.post("/cron/price-ingestion", async (req, res) => {
+  const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET ||
+                   req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
+  if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  res.json({ ok: true, status: "processing" });
+  try {
+    const { runPriceIngestion } = require("./price-ingestion");
+    const result = await runPriceIngestion();
+    console.log("[PriceIngestion] Complete:", result);
+  } catch(e) { console.error("[PriceIngestion] Error:", e.message); }
+});
+
 // Configure in vercel.json: { "crons": [{ "path": "/cron/daily", "schedule": "0 6 * * *" }] }
 // =============================================================================
 
@@ -6066,6 +6080,83 @@ function _displayName(cropDef, varietyMap) {
 // rotatableAreas: areas classified as "bed" type
 // Returns array of plan option objects
 
+// ── Plan scoring helpers ──────────────────────────────────────────────────────
+
+const CROP_EFFORT_BY_CATEGORY = {
+  salad:4, herb:3, legume:3, allium:4, root:4, brassica:6, fruiting:8, fruit:5, perennial:3, flower:2,
+};
+
+const YIELD_PER_M2_BY_CATEGORY = {
+  salad:3.5, herb:1.5, legume:1.8, allium:3.0, root:4.5,
+  brassica:3.0, fruiting:5.5, fruit:3.5, perennial:2.5, flower:0.5,
+};
+
+const EFFORT_RANK   = { "Easy":0, "Moderate":1, "High":2 };
+const ROTATION_RANK = { "Excellent":3, "Good":2, "Fair":1, "Weak":0 };
+const SPREAD_RANK   = { "Excellent":3, "Good":2, "Short Peak":1, "Heavy Mid-Season":0 };
+
+function _calcEffortLevel(assignments) {
+  if (!assignments.length) return { level:"Easy", index:20 };
+  const totalArea      = assignments.reduce((s,a) => s+(a._area_m2||1), 0);
+  const weightedEffort = assignments.reduce((s,a) => s+(CROP_EFFORT_BY_CATEGORY[a.category]||4)*(a._area_m2||1), 0);
+  const index = totalArea > 0 ? Math.round((weightedEffort/totalArea)*10) : 40;
+  return { level: index<=25?"Easy":index<=55?"Moderate":"High", index };
+}
+
+function _calcRotationScore(assignments, sequenceByArea) {
+  let score=0, count=0;
+  for (const a of assignments) {
+    const prevFamily = sequenceByArea[a.area_id]?.primary?.family || sequenceByArea[a.area_id]?.primary?.category || null;
+    const newFamily  = a.family || a.category || null;
+    if (!prevFamily || !newFamily) { score+=5; count++; continue; }
+    if (prevFamily === newFamily)  { score+=0; }
+    else if ((ROTATION_NEXT[prevFamily]||[]).indexOf(newFamily) >= 0) { score+=8; }
+    else { score+=4; }
+    count++;
+  }
+  const index = count ? Math.round((score/count)*12.5) : 50;
+  return { level: index>=80?"Excellent":index>=60?"Good":index>=40?"Fair":"Weak", index };
+}
+
+function _calcHarvestSpread(assignments) {
+  const coverage = new Array(12).fill(0);
+  for (const a of assignments) {
+    const hs = (a._harvest_month_start||1)-1;
+    const he = (a._harvest_month_end||12)-1;
+    for (let m=hs; m<=he; m++) coverage[m]++;
+  }
+  const activeMonths  = coverage.filter(v=>v>0).length;
+  const maxInAnyMonth = Math.max(...coverage);
+  const glutPenalty   = maxInAnyMonth>5 ? (maxInAnyMonth-5)*3 : 0;
+  const index = Math.min(100, Math.max(0, Math.round((activeMonths/12)*100) - glutPenalty));
+  return { level: index>=75?"Excellent":index>=50?"Good":index>=30?"Short Peak":"Heavy Mid-Season", index, active_months:activeMonths };
+}
+
+function _buildExplanation(archetypeGoal, metrics, vsBaseline) {
+  const harvestUp  = vsBaseline?.harvest_kg_delta > 0;
+  const harvestStr = harvestUp ? ` Expected harvest up ${vsBaseline.harvest_kg_delta.toFixed(1)}kg vs your current layout.` : "";
+  if (archetypeGoal==="rotate_mine"||archetypeGoal==="balanced")
+    return `Best overall balance of harvest, value, effort and crop rotation for your garden.${harvestStr}`;
+  if (archetypeGoal==="max_yield"||archetypeGoal==="max_harvest")
+    return `Highest total harvest and shop value. Makes more productive use of your space, but ${metrics.effort_level==="High"?"needs more work through peak season":"with manageable effort"}.`;
+  if (archetypeGoal==="easy")
+    return `Simplest to manage with lower weekly effort. Fewer demanding crops — still makes good use of your space.`;
+  return "Tailored to your garden.";
+}
+
+function _recommendPlan(scoredOptions) {
+  const balanced = scoredOptions.find(o => o.goal==="rotate_mine"||o.goal==="balanced");
+  const maxYield = scoredOptions.find(o => o.goal==="max_yield"||o.goal==="max_harvest");
+  if (!balanced) return scoredOptions[0]?.id || "balanced";
+  if (maxYield) {
+    const harvestGain  = (maxYield.metrics.harvest_kg||0) - (balanced.metrics.harvest_kg||0);
+    const effortDelta  = (EFFORT_RANK[maxYield.metrics.effort_level]||1) - (EFFORT_RANK[balanced.metrics.effort_level]||1);
+    const rotationDrop = (ROTATION_RANK[balanced.metrics.rotation_level]||2) - (ROTATION_RANK[maxYield.metrics.rotation_level]||2);
+    if (harvestGain > 3 && effortDelta <= 1 && rotationDrop <= 1) return maxYield.id;
+  }
+  return balanced.id || scoredOptions[0]?.id;
+}
+
 function _generatePlanOptions(goal, areas, currentCropsByArea, cropDefs, varietyMap, preferredNames, sequenceByArea = {}) {
   // Separate areas by type
   const bedAreas   = areas.filter(a => _classifyArea(a) === "bed");
@@ -6596,10 +6687,123 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
       if (Array.isArray(parsed.explanations)) explanations = parsed.explanations;
     } catch(e) { console.error("[PlanGenerate] Claude failed:", e.message); }
 
+    // ── Build baseline from current active crops ────────────────────────────
+    const baselineAssignments = areas.map(a => {
+      const crops   = activeCropsByArea[a.id] || [];
+      const primary = crops[0] || null;
+      return primary ? {
+        area_id:              a.id,
+        area_name:            a.name,
+        category:             primary.category,
+        family:               primary.family || primary.category,
+        crop_definition_id:   primary.crop_definition_id || primary.crop_def_id || null,
+        crop_name:            primary.crop_name || primary.name || primary.raw_crop_label || "Crop",
+        _area_m2:             (a.width_m||1.5) * (a.length_m||1.5),
+        _harvest_month_start: null,
+        _harvest_month_end:   null,
+      } : null;
+    }).filter(Boolean);
+
+    const baselineYieldKg = baselineAssignments.reduce((s,a) =>
+      s + (YIELD_PER_M2_BY_CATEGORY[a.category]||3) * (a._area_m2||1), 0);
+
+    // ── Enrich generated option assignments with area_m2, family, harvest window
+    const planIds   = ["balanced","max_harvest","easiest"];
+    const planNames = ["Balanced","Max Harvest","Easiest"];
+
+    const enrichedOptions = options.map((option, oi) => {
+      const enrichedAssignments = (option.assignments||[]).map(a => {
+        const areaObj = areas.find(ar => ar.id === a.area_id);
+        const defObj  = (cropDefs||[]).find(d => d.id === (a.crop_definition_id || a.crop_def_id));
+        return {
+          ...a,
+          family:               defObj?.family || defObj?.category || a.family || a.category,
+          _area_m2:             areaObj ? (areaObj.width_m||1.5)*(areaObj.length_m||1.5) : 1.5,
+          _harvest_month_start: defObj?.harvest_month_start || null,
+          _harvest_month_end:   defObj?.harvest_month_end   || null,
+        };
+      });
+      return {
+        ...option,
+        id:          planIds[oi]   || `plan_${oi}`,
+        name:        planNames[oi] || option.name,
+        assignments: enrichedAssignments,
+      };
+    });
+
+    // ── Score all options ───────────────────────────────────────────────────
+    const { resolveShopValue } = require("./value-resolver");
+    const currentMonth = new Date().getMonth()+1;
+    const currentYear  = new Date().getFullYear();
+
+    const scoredOptions = await Promise.all(enrichedOptions.map(async (option, oi) => {
+      const asgn    = option.assignments || [];
+      const effort   = _calcEffortLevel(asgn);
+      const rotation = _calcRotationScore(asgn, sequenceByArea);
+      const spread   = _calcHarvestSpread(asgn);
+
+      const totalYieldKg = asgn.reduce((s,a) =>
+        s + (YIELD_PER_M2_BY_CATEGORY[a.category]||3) * (a._area_m2||1), 0);
+      const totalAreaM2  = asgn.reduce((s,a) => s + (a._area_m2||1), 0);
+
+      // Resolve shop value per assignment
+      let totalValueGbp = 0;
+      let valueBasis = null;
+      for (const a of asgn) {
+        const cropDefId = a.crop_definition_id || a.crop_def_id;
+        if (!cropDefId) continue;
+        const yieldKg         = (YIELD_PER_M2_BY_CATEGORY[a.category]||3) * (a._area_m2||1);
+        const harvestMonth    = a._harvest_month_start || currentMonth;
+        const harvestYear     = harvestMonth < currentMonth ? currentYear+1 : currentYear;
+        const harvestMonthKey = `${harvestYear}-${String(harvestMonth).padStart(2,"0")}`;
+        const resolved = await resolveShopValue(supabaseService, cropDefId, yieldKg, harvestMonthKey);
+        if (resolved) { totalValueGbp += resolved.value_gbp; valueBasis = resolved; }
+      }
+
+      const metrics = {
+        harvest_kg:            Math.round(totalYieldKg*10)/10,
+        shop_value_gbp:        totalValueGbp > 0 ? Math.round(totalValueGbp) : null,
+        yield_per_m2:          totalAreaM2>0 ? Math.round((totalYieldKg/totalAreaM2)*10)/10 : null,
+        space_use_delta_pct:   Math.round(((totalYieldKg-(baselineYieldKg||totalYieldKg))/Math.max(baselineYieldKg,1))*100),
+        effort_level:          effort.level,
+        effort_index:          effort.index,
+        rotation_level:        rotation.level,
+        rotation_index:        rotation.index,
+        harvest_spread_level:  spread.level,
+        harvest_spread_index:  spread.index,
+      };
+
+      const vsBaseline = {
+        harvest_kg_delta: Math.round((metrics.harvest_kg - baselineYieldKg)*10)/10,
+        effort_change:    effort.index<40?"easier":effort.index>55?"harder":"same",
+        rotation_change:  rotation.index>60?"better":"same",
+      };
+
+      return {
+        ...option,
+        metrics,
+        comparison_vs_baseline: vsBaseline,
+        summary: explanations[oi] || _buildExplanation(option.goal, metrics, vsBaseline),
+        value_basis: valueBasis ? {
+          pricing_region:  "GB",
+          month_key:       valueBasis.month_key,
+          confidence_score:valueBasis.confidence_score,
+          source_note:     "Based on typical UK shop prices for when your crops are likely to be ready.",
+        } : null,
+      };
+    }));
+
+    const recommendedPlanId = _recommendPlan(scoredOptions);
+
     res.json({
       location_id,
       goal,
-      options: options.map((o,i) => ({ ...o, explanation: explanations[i]||"" })),
+      recommended_plan_id: recommendedPlanId,
+      baseline: {
+        label:      "Current layout",
+        harvest_kg: Math.round(baselineYieldKg*10)/10,
+      },
+      options: scoredOptions,
     });
 
   } catch (err) {
