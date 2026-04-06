@@ -6086,6 +6086,25 @@ const EFFORT_RANK   = { "Easy":0, "Moderate":1, "High":2 };
 const ROTATION_RANK = { "Excellent":3, "Good":2, "Fair":1, "Weak":0 };
 const SPREAD_RANK   = { "Excellent":3, "Good":2, "Short Peak":1, "Heavy Mid-Season":0 };
 
+// Crops allowed to appear in multiple full beds
+const MULTI_BED_ALLOWED = ["Potato","Potatoes","Carrot","Carrots","Onion","Onions","Lettuce","Broad Bean","Broad beans","Pea","Peas","Runner Bean","Runner beans"];
+
+// Duplicate penalty applied during plan scoring — soft constraint, not hard block
+function _duplicatePenalty(cropName, usedCropNames) {
+  if (MULTI_BED_ALLOWED.some(n => cropName?.toLowerCase().includes(n.toLowerCase()))) return 0;
+  const count = [...usedCropNames].filter(n => n === cropName).length;
+  return count * 15; // 15 point penalty per duplicate
+}
+
+// Fix 4: value note explaining yield/value mismatch
+function _getValueNote(metrics) {
+  if (!metrics.shop_value_gbp || !metrics.harvest_kg) return null;
+  const valuePerKg = metrics.shop_value_gbp / metrics.harvest_kg;
+  if (valuePerKg < 1.5) return "Higher yield but lower-value crops (e.g. potatoes, roots).";
+  if (valuePerKg > 3.5) return "Includes higher-value crops like berries and salads.";
+  return null;
+}
+
 function _calcEffortLevel(assignments) {
   if (!assignments.length) return { level:"Easy", index:20 };
   const totalArea      = assignments.reduce((s,a) => s+(a._area_m2||1), 0);
@@ -6136,16 +6155,24 @@ function _buildExplanation(archetypeGoal, metrics, vsBaseline) {
 }
 
 function _recommendPlan(scoredOptions) {
-  const balanced = scoredOptions.find(o => o.goal==="rotate_mine"||o.goal==="balanced");
-  const maxYield = scoredOptions.find(o => o.goal==="max_yield"||o.goal==="max_harvest");
+  const balanced = scoredOptions.find(o => o.id==="balanced");
+  const maxYield = scoredOptions.find(o => o.id==="max_harvest");
+  const easiest  = scoredOptions.find(o => o.id==="easiest");
   if (!balanced) return scoredOptions[0]?.id || "balanced";
+  let recommended = balanced;
   if (maxYield) {
-    const harvestGain  = (maxYield.metrics.harvest_kg||0) - (balanced.metrics.harvest_kg||0);
-    const effortDelta  = (EFFORT_RANK[maxYield.metrics.effort_level]||1) - (EFFORT_RANK[balanced.metrics.effort_level]||1);
-    const rotationDrop = (ROTATION_RANK[balanced.metrics.rotation_level]||2) - (ROTATION_RANK[maxYield.metrics.rotation_level]||2);
-    if (harvestGain > 3 && effortDelta <= 1 && rotationDrop <= 1) return maxYield.id;
+    const harvestGain   = (maxYield.metrics.harvest_kg||0)    - (balanced.metrics.harvest_kg||0);
+    const effortDelta   = (EFFORT_RANK[maxYield.metrics.effort_level]||1)    - (EFFORT_RANK[balanced.metrics.effort_level]||1);
+    const rotationDelta = (ROTATION_RANK[maxYield.metrics.rotation_level]||2) - (ROTATION_RANK[balanced.metrics.rotation_level]||2);
+    const valueDelta    = (maxYield.metrics.shop_value_gbp||0) - (balanced.metrics.shop_value_gbp||0);
+    if (harvestGain >= 4 && effortDelta <= 1 && rotationDelta >= -1 && valueDelta >= -10) recommended = maxYield;
   }
-  return balanced.id || scoredOptions[0]?.id;
+  if (easiest && recommended === balanced) {
+    const effortDrop  = (EFFORT_RANK[balanced.metrics.effort_level]||1) - (EFFORT_RANK[easiest.metrics.effort_level]||1);
+    const harvestLoss = (balanced.metrics.harvest_kg||0) - (easiest.metrics.harvest_kg||0);
+    if (effortDrop >= 1 && harvestLoss <= 3) recommended = easiest;
+  }
+  return recommended.id;
 }
 
 function _generatePlanOptions(goal, areas, currentCropsByArea, cropDefs, varietyMap, preferredNames, sequenceByArea = {}) {
@@ -6326,12 +6353,14 @@ function _generatePlanOptions(goal, areas, currentCropsByArea, cropDefs, variety
       const usedIdx = new Set();
       const bedAssignments = bedAreas.map(area => {
         const curCat = currentCatByArea[area.id];
+        const usedCropNames = bedAssignments.map(b => b.cropName).filter(Boolean);
 
         const scored = pool.map((crop, i) => {
           if (usedIdx.has(i)) return { i, score: -1 };
           const rotScore  = _scoreRotation(curCat, crop.category);
           const yieldBias = biasYield ? (YIELD_SCORE[crop.category] || 5) * 0.3 : 0;
-          return { i, crop, score: rotScore * 0.7 + yieldBias };
+          const dupPenalty = _duplicatePenalty(crop.name, usedCropNames);
+          return { i, crop, score: rotScore * 0.7 + yieldBias - dupPenalty };
         }).filter(s => s.score >= 0).sort((a, b) => b.score - a.score);
 
         const best = scored[0];
@@ -6766,7 +6795,6 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
         harvest_kg:            Math.round(totalYieldKg*10)/10,
         shop_value_gbp:        totalValueGbp > 0 ? Math.round(totalValueGbp) : null,
         yield_per_m2:          totalAreaM2>0 ? Math.round((totalYieldKg/totalAreaM2)*10)/10 : null,
-        space_use_delta_pct:   Math.round(((totalYieldKg-(baselineYieldKg||totalYieldKg))/Math.max(baselineYieldKg,1))*100),
         effort_level:          effort.level,
         effort_index:          effort.index,
         rotation_level:        rotation.level,
@@ -6786,6 +6814,7 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
         metrics,
         comparison_vs_baseline: vsBaseline,
         summary: explanations[oi] || _buildExplanation(option.goal, metrics, vsBaseline),
+        value_note: _getValueNote(metrics),
         value_basis: valueBasis ? {
           pricing_region:  "GB",
           month_key:       valueBasis.month_key,
