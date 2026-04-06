@@ -7392,6 +7392,293 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
   }
 });
 
+// =============================================================================
+// INFRASTRUCTURE ROI ENGINE
+// Stateless — computes yield/value/ROI impact of adding infrastructure.
+// No DB write on model. Infrastructure metadata persisted only on plan commit.
+// =============================================================================
+
+app.post("/infrastructure/model", requireAuth, async (req, res) => {
+  try {
+    const {
+      MODIFIER_VERSION,
+      COST_RANGES,
+      YIELD_MULTIPLIERS,
+      SEASON_EXTENSION,
+      EFFORT_CHANGE,
+      CROP_UNLOCKS,
+      THINGS_TO_KNOW,
+      CARD_BENEFIT,
+      COMPATIBLE_AREA_TYPES,
+      INCOMPATIBILITY_NOTES,
+    } = require("./infrastructure-modifiers");
+
+    const { resolveShopValue } = require("./value-resolver");
+
+    const {
+      location_id,
+      infrastructure_type,
+      size           = "medium",
+      target_area_ids = [],   // empty/omitted = whole garden
+      custom_cost_gbp,
+    } = req.body;
+
+    if (!location_id)         return res.status(400).json({ error: "location_id required" });
+    if (!infrastructure_type) return res.status(400).json({ error: "infrastructure_type required" });
+
+    const VALID_TYPES = ["greenhouse","polytunnel","raised_bed","irrigation","water_butt","compost_system"];
+    const VALID_SIZES = ["small","medium","large"];
+    if (!VALID_TYPES.includes(infrastructure_type)) return res.status(400).json({ error: "Invalid infrastructure_type" });
+    if (!VALID_SIZES.includes(size))                return res.status(400).json({ error: "size must be small, medium or large" });
+
+    // ── Fetch location ──────────────────────────────────────────────────────
+    const { data: loc, error: locErr } = await req.db
+      .from("locations").select("id, name").eq("id", location_id).eq("user_id", req.user.id).single();
+    if (locErr || !loc) return res.status(403).json({ error: "Location not found" });
+
+    // ── Fetch all areas for this location ───────────────────────────────────
+    const { data: allAreas, error: areasErr } = await req.db
+      .from("growing_areas").select("id, name, type, width_m, length_m").eq("location_id", location_id);
+    if (areasErr) throw areasErr;
+    if (!allAreas?.length) return res.status(400).json({ error: "No areas found" });
+
+    // ── Filter to target areas ──────────────────────────────────────────────
+    // Empty array or omitted = whole garden
+    const targetIds  = Array.isArray(target_area_ids) && target_area_ids.length > 0
+      ? new Set(target_area_ids)
+      : null;
+    const areas = targetIds
+      ? allAreas.filter(a => targetIds.has(a.id))
+      : allAreas;
+
+    if (!areas.length) return res.status(400).json({ error: "No matching areas found for target_area_ids" });
+
+    const areaIds = areas.map(a => a.id);
+
+    // ── Fetch active crop instances for these areas ─────────────────────────
+    const { data: cropRows } = await supabaseService
+      .from("crop_instances")
+      .select("area_id, crop_def_id, name, active, crop_definitions(name, category, harvest_month_start, harvest_month_end)")
+      .eq("user_id", req.user.id)
+      .in("area_id", areaIds)
+      .eq("active", true);
+
+    // Group active crops by area
+    const cropsByArea = {};
+    for (const crop of (cropRows || [])) {
+      if (!cropsByArea[crop.area_id]) cropsByArea[crop.area_id] = [];
+      cropsByArea[crop.area_id].push({
+        name:                crop.crop_definitions?.name || crop.name,
+        category:            crop.crop_definitions?.category || null,
+        crop_def_id:         crop.crop_def_id,
+        harvest_month_start: crop.crop_definitions?.harvest_month_start || null,
+        harvest_month_end:   crop.crop_definitions?.harvest_month_end   || null,
+      });
+    }
+
+    // ── Incompatibility check ───────────────────────────────────────────────
+    // If none of the target areas are compatible with the chosen infrastructure,
+    // return a graceful incompatibility response rather than zero-value numbers.
+    const compatTypes      = COMPATIBLE_AREA_TYPES[infrastructure_type] || [];
+    const compatibleAreas  = areas.filter(a =>
+      compatTypes.includes(a.type) || compatTypes.includes("new")
+    );
+    const incompatibleOnly = compatibleAreas.length === 0;
+
+    // ── Cost ────────────────────────────────────────────────────────────────
+    const [costLow, costHigh] = (COST_RANGES[infrastructure_type]?.[size]) || [0, 0];
+    const assumedCost = custom_cost_gbp != null
+      ? Number(custom_cost_gbp)
+      : Math.round((costLow + costHigh) / 2);
+    const costRangeLabel = costLow > 0 ? `£${costLow}–£${costHigh}` : "Variable";
+
+    // ── Yield multiplier helpers ────────────────────────────────────────────
+    const multiplierFor = (category) => {
+      const mods = YIELD_MULTIPLIERS[infrastructure_type] || {};
+      return mods[category] || mods["default"] || 1.0;
+    };
+
+    // ── Build baseline and modelled per area ────────────────────────────────
+    const currentYear  = new Date().getFullYear();
+    const currentMonth = new Date().getMonth() + 1;
+
+    let baselineKg   = 0;
+    let modelledKg   = 0;
+    let baselineVal  = 0;
+    let modelledVal  = 0;
+    let totalAreaM2  = 0;
+
+    const affectedAreas = [];
+
+    // Track model quality signals for confidence scoring
+    let areasWithCrops       = 0;
+    let areasWithGoodMatch   = 0;
+    let shopValueResolved    = 0;
+    let shopValueAttempted   = 0;
+
+    for (const area of areas) {
+      const m2    = (area.width_m || 1.5) * (area.length_m || 1.5);
+      const crops = cropsByArea[area.id] || [];
+      totalAreaM2 += m2;
+
+      // Use primary crop category for yield calculation — same approach as _scoreAssignments
+      // If no active crops, use a conservative generic yield
+      const primaryCrop     = crops.find(c => c.category && !["fruit","perennial"].includes(c.category));
+      const category        = primaryCrop?.category || null;
+      const yieldPerM2      = category ? (YIELD_SCORE[category] || 5) * 0.5 : 1.5;
+      const areaBaselineKg  = yieldPerM2 * m2;
+      const multiplier      = multiplierFor(category);
+      const areaModelledKg  = areaBaselineKg * multiplier;
+
+      baselineKg  += areaBaselineKg;
+      modelledKg  += areaModelledKg;
+
+      if (crops.length > 0) areasWithCrops++;
+      if (category && multiplier > (YIELD_MULTIPLIERS[infrastructure_type]?.default || 1.0)) areasWithGoodMatch++;
+
+      // Shop value — baseline and modelled
+      if (primaryCrop?.crop_def_id) {
+        shopValueAttempted++;
+        const hMonth   = primaryCrop.harvest_month_start || currentMonth;
+        const hYear    = hMonth < currentMonth ? currentYear + 1 : currentYear;
+        const monthKey = `${hYear}-${String(hMonth).padStart(2, "0")}`;
+
+        const [bVal, mVal] = await Promise.all([
+          resolveShopValue(supabaseService, primaryCrop.crop_def_id, areaBaselineKg, monthKey),
+          resolveShopValue(supabaseService, primaryCrop.crop_def_id, areaModelledKg, monthKey),
+        ]);
+        if (bVal) { baselineVal += bVal.value_gbp; shopValueResolved++; }
+        if (mVal)   modelledVal += mVal.value_gbp;
+      }
+
+      affectedAreas.push({
+        area_id:            area.id,
+        area_name:          area.name,
+        area_type:          area.type,
+        category:           category || "mixed",
+        baseline_yield_kg:  Math.round(areaBaselineKg * 10) / 10,
+        modelled_yield_kg:  Math.round(areaModelledKg * 10) / 10,
+        multiplier_applied: multiplier,
+      });
+    }
+
+    // ── Confidence scoring ──────────────────────────────────────────────────
+    // Based on overall model quality, not just harvest history.
+    // High:   3+ areas have good category matches, shop value resolved for most gain
+    // Medium: some matching, partial shop value, reasonable modifier fit
+    // Low:    mostly generic assumptions, no meaningful crop/value grounding
+    let confidence;
+    const shopValueCoverage = shopValueAttempted > 0 ? shopValueResolved / shopValueAttempted : 0;
+    if (areasWithGoodMatch >= 3 && shopValueCoverage >= 0.6) {
+      confidence = "high";
+    } else if (areasWithCrops >= 1 && (areasWithGoodMatch >= 1 || shopValueCoverage >= 0.3)) {
+      confidence = "medium";
+    } else {
+      confidence = "low";
+    }
+
+    const confidenceNote = confidence === "high"
+      ? "Based on your actual crops and typical UK shop prices."
+      : confidence === "medium"
+      ? "Based on your crops and typical UK yields. Actual results vary with weather and management."
+      : "Based on typical UK yields — actual results will depend on your specific setup and crops.";
+
+    // ── Season extension ────────────────────────────────────────────────────
+    const seasonExt = SEASON_EXTENSION[infrastructure_type] || { earlier_sow_weeks: 0, later_harvest_weeks: 0 };
+    const totalExtWeeks = seasonExt.earlier_sow_weeks + seasonExt.later_harvest_weeks;
+    const seasonLabel   = totalExtWeeks > 0
+      ? `Up to ${totalExtWeeks} weeks extra growing`
+      : null;
+
+    // ── ROI ─────────────────────────────────────────────────────────────────
+    // Use shop value delta if resolved, otherwise fall back to yield delta × rough price
+    const ROUGH_PRICE_PER_KG = 2.50; // conservative fallback when no shop value data
+    const yieldDelta  = Math.round((modelledKg   - baselineKg)  * 10) / 10;
+    const rawValDelta = modelledVal > 0 && baselineVal > 0
+      ? modelledVal - baselineVal
+      : yieldDelta * ROUGH_PRICE_PER_KG;
+    const valueDelta  = Math.round(rawValDelta);
+    const valueGain1yr = valueDelta > 0 ? valueDelta : 0;
+    const valueGain3yr = valueGain1yr * 3;
+    const net3yr       = valueGain3yr - assumedCost;
+    const paybackSeasons = valueGain1yr > 0
+      ? Math.round((assumedCost / valueGain1yr) * 10) / 10
+      : null;
+    const paybackLabel = paybackSeasons === null
+      ? "Payback period unclear — add crops to this area for a better estimate"
+      : paybackSeasons <= 1
+      ? "Could pay back within a season"
+      : paybackSeasons <= 3
+      ? `Pays back in ~${paybackSeasons} seasons`
+      : `Estimated payback: ${paybackSeasons} seasons`;
+
+    // ── Incompatibility response ────────────────────────────────────────────
+    if (incompatibleOnly) {
+      return res.json({
+        infrastructure_type,
+        size,
+        modifier_version: MODIFIER_VERSION,
+        incompatible:     true,
+        incompatibility_note: INCOMPATIBILITY_NOTES[infrastructure_type] || "This infrastructure may not be well suited to your current setup",
+        card_benefit:     CARD_BENEFIT[infrastructure_type],
+        cost: { range_low: costLow, range_high: costHigh, assumed_gbp: assumedCost, cost_range_label: costRangeLabel },
+      });
+    }
+
+    // ── Response ────────────────────────────────────────────────────────────
+    res.json({
+      infrastructure_type,
+      size,
+      modifier_version:  MODIFIER_VERSION,
+      incompatible:      false,
+      cost: {
+        range_low:       costLow,
+        range_high:      costHigh,
+        assumed_gbp:     assumedCost,
+        cost_range_label: costRangeLabel,
+      },
+      baseline: {
+        harvest_kg:      Math.round(baselineKg * 10) / 10,
+        shop_value_gbp:  baselineVal > 0 ? Math.round(baselineVal) : null,
+        area_m2:         Math.round(totalAreaM2 * 10) / 10,
+      },
+      modelled: {
+        harvest_kg:      Math.round(modelledKg * 10) / 10,
+        shop_value_gbp:  modelledVal > 0 ? Math.round(modelledVal) : null,
+        area_m2:         Math.round(totalAreaM2 * 10) / 10,
+      },
+      gains: {
+        harvest_kg_delta:    yieldDelta,
+        value_gbp_delta:     valueDelta > 0 ? valueDelta : null,
+        yield_per_m2_delta:  totalAreaM2 > 0 ? Math.round((yieldDelta / totalAreaM2) * 10) / 10 : null,
+        season_extension: {
+          earlier_sow_weeks:   seasonExt.earlier_sow_weeks,
+          later_harvest_weeks: seasonExt.later_harvest_weeks,
+          label:               seasonLabel,
+        },
+        effort_change:  EFFORT_CHANGE[infrastructure_type],
+        crop_unlocks:   CROP_UNLOCKS[infrastructure_type] || [],
+        things_to_know: THINGS_TO_KNOW[infrastructure_type] || [],
+      },
+      roi: {
+        payback_seasons:   paybackSeasons,
+        payback_label:     paybackLabel,
+        value_gain_year_1: valueGain1yr > 0 ? valueGain1yr : null,
+        value_gain_3yr:    valueGain3yr > 0 ? valueGain3yr : null,
+        net_3yr:           net3yr,
+        confidence,
+        confidence_note:   confidenceNote,
+      },
+      affected_areas:    affectedAreas,
+      card_benefit:      CARD_BENEFIT[infrastructure_type],
+    });
+
+  } catch (err) {
+    captureError("InfrastructureModel", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Area Plan Assignments ─────────────────────────────────────────────────────
 // Locked future crop assignments per bed per year.
 // Status: draft → locked → ready → active → completed | cancelled | replaced
@@ -7419,10 +7706,25 @@ app.get("/area-plan-assignments", requireAuth, async (req, res) => {
 
 // POST /area-plan-assignments/commit
 // Commits plan assignments as locked for next growing year.
-// Body: { location_id, assignments: [{ area_id, crop_def_id, crop_name, category }], planned_year? }
+// Body: {
+//   location_id,
+//   assignments: [{ area_id, crop_def_id, crop_name, category }],
+//   planned_year?,
+//   infrastructure_type?,      ← optional: set if plan was influenced by ROI scenario
+//   infrastructure_cost_label?, ← e.g. "£300–£600"
+//   roi_summary?,              ← { size, yield_gain_kg, value_gain_gbp, payback_seasons, confidence }
+// }
 app.post("/area-plan-assignments/commit", requireAuth, async (req, res) => {
   try {
-    const { location_id, assignments, planned_year } = req.body;
+    const {
+      location_id,
+      assignments,
+      planned_year,
+      // Optional infrastructure metadata — persisted for traceability
+      infrastructure_type   = null,
+      infrastructure_cost_label = null,
+      roi_summary           = null,
+    } = req.body;
     if (!location_id || !assignments?.length) return res.status(400).json({ error: "location_id and assignments required" });
     const year = planned_year || new Date().getFullYear() + 1;
     const { data: loc } = await req.db
@@ -7437,17 +7739,29 @@ app.post("/area-plan-assignments/commit", requireAuth, async (req, res) => {
       .in("area_id", areaIds)
       .eq("planned_year", year)
       .in("status", ["draft","locked","ready"]);
+
+    // Infrastructure metadata: only attach if infrastructure_type is present
+    // Gives the UI enough to say "This plan assumes a medium greenhouse"
+    const { MODIFIER_VERSION } = infrastructure_type
+      ? require("./infrastructure-modifiers")
+      : { MODIFIER_VERSION: null };
+
     // Insert new locked rows
     const rows = assignments.filter(a => a.area_id && a.crop_name).map(a => ({
-      user_id:      req.user.id,
-      area_id:      a.area_id,
-      crop_def_id:  a.crop_def_id || null,
-      crop_name:    a.crop_name,
-      category:     a.category || null,
-      planned_year: year,
-      status:       "locked",
-      source:       "plan_flow",
-      locked_at:    new Date().toISOString(),
+      user_id:                  req.user.id,
+      area_id:                  a.area_id,
+      crop_def_id:              a.crop_def_id || null,
+      crop_name:                a.crop_name,
+      category:                 a.category || null,
+      planned_year:             year,
+      status:                   "locked",
+      source:                   "plan_flow",
+      locked_at:                new Date().toISOString(),
+      // Infrastructure metadata (all nullable — no impact if not supplied)
+      infrastructure_type:      infrastructure_type || null,
+      infrastructure_cost_label: infrastructure_cost_label || null,
+      roi_summary:              roi_summary ? JSON.stringify(roi_summary) : null,
+      modifier_version:         infrastructure_type ? MODIFIER_VERSION : null,
     }));
     const { data, error } = await supabaseService
       .from("area_plan_assignments").insert(rows).select();
