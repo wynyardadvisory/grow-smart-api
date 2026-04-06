@@ -6001,8 +6001,10 @@ function _buildBaseline({ areas, activeCropsByArea, sequenceByArea, cropDefs, va
     if (groupName === "container") {
       for (const area of groupAreas) {
         const crops   = activeCropsByArea[area.id] || [];
-        const display = crops.filter(c => !FIXED_CATEGORIES.has(c.category))
-                             .map(c => c.name).join(" + ") || "As current";
+        // Show all active crops — don't filter herbs/invasives for containers, that's intentional
+        const display = crops.length
+          ? crops.map(c => c.name).join(" + ")
+          : "As current";
         assignments.push({
           area_id:            area.id,
           area_name:          area.name,
@@ -6027,16 +6029,16 @@ function _buildBaseline({ areas, activeCropsByArea, sequenceByArea, cropDefs, va
 
     for (const area of fixedAreas) {
       const crops   = activeCropsByArea[area.id] || [];
-      const primary = crops[0];
-      if (!primary) continue;
+      if (!crops.length) continue;
+      const display = crops.map(c => c.name).join(" + ");
       assignments.push({
         area_id:            area.id,
         area_name:          area.name,
         area_type:          area.type,
         area_group:         groupName,
-        category:           primary.category,
-        crop_definition_id: primary.crop_def_id || null,
-        crop_name:          primary.name,
+        category:           crops[0].category,
+        crop_definition_id: crops[0].crop_def_id || null,
+        crop_name:          display,
         locked:             true,
         is_fixed:           true,
       });
@@ -7102,6 +7104,7 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
         name, category,
         crop_def_id:         crop.crop_def_id,
         status:              crop.status,
+        sown_date:           crop.sown_date,
         harvest_month_start: crop.crop_definitions?.harvest_month_start || null,
         harvest_month_end:   crop.crop_definitions?.harvest_month_end   || null,
         sow_month:           crop.crop_definitions?.sow_direct_start || crop.crop_definitions?.sow_indoors_start || null,
@@ -7116,21 +7119,28 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
     }
 
     // ── Build sequenceByArea ──────────────────────────────────────────────────
+    // A bed is locked only if its follow-on crops are physically started
+    // (sown_date present, or status is sown/growing). Merely "planned" = free to rotate.
+    const COMMITTED_STATUSES = new Set(["sown_indoors","sown_outdoors","transplanted","growing","harvesting"]);
+    const FIXED_CATS_SEQ = new Set(["fruit","perennial"]);
     const sequenceByArea = {};
     for (const area of areas) {
       const active  = activeCropsByArea[area.id]  || [];
       const planned = plannedCropsByArea[area.id] || [];
-      const uniquePlanned = [];
-      const seenNames = new Set();
-      for (const p of planned) {
-        if (!seenNames.has(p.name)) { uniquePlanned.push(p); seenNames.add(p.name); }
+      const committedFollowOns = planned.filter(p =>
+        !FIXED_CATS_SEQ.has(p.category) &&
+        (p.sown_date || COMMITTED_STATUSES.has(p.status))
+      );
+      const uniqueFollowOns = [];
+      const seenFollowOns = new Set();
+      for (const p of committedFollowOns) {
+        if (!seenFollowOns.has(p.name)) { uniqueFollowOns.push(p); seenFollowOns.add(p.name); }
       }
-      const FIXED_CATS = new Set(["fruit","perennial"]);
-      const primary = active.find(c => !FIXED_CATS.has(c.category)) || active[0] || null;
+      const primary = active.find(c => !FIXED_CATS_SEQ.has(c.category)) || active[0] || null;
       sequenceByArea[area.id] = {
         primary,
         allActive: active,
-        followOns: uniquePlanned.filter(p => !FIXED_CATS.has(p.category)),
+        followOns: uniqueFollowOns,
       };
     }
 
