@@ -6644,7 +6644,18 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
     const currentCropsByArea = activeCropsByArea;
 
     // Generate options — pass sequenceByArea so generator can use existing sequences
-    const options = _generatePlanOptions(goal, areas, currentCropsByArea, cropDefs || [], varietyMap, preferredNames, sequenceByArea);
+    // Generate one plan per archetype — always, regardless of user goal
+    // User goal is used for explanation context only
+    const balancedOptions = _generatePlanOptions("rotate_mine", areas, currentCropsByArea, cropDefs || [], varietyMap, preferredNames, sequenceByArea);
+    const maxYieldOptions  = _generatePlanOptions("max_yield",   areas, currentCropsByArea, cropDefs || [], varietyMap, preferredNames, sequenceByArea);
+    const easyOptions      = _generatePlanOptions("easy",        areas, currentCropsByArea, cropDefs || [], varietyMap, preferredNames, sequenceByArea);
+
+    // Take the best variant from each archetype (first option from each)
+    const options = [
+      { ...balancedOptions[0], goal: "rotate_mine" },
+      { ...maxYieldOptions[0],  goal: "max_yield"   },
+      { ...easyOptions[0],      goal: "easy"         },
+    ];
 
     // Claude explanation cards
     const gardenContext = areas.map(a => {
