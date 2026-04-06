@@ -6351,7 +6351,8 @@ function _generatePlanOptions(goal, areas, currentCropsByArea, cropDefs, variety
       }
 
       const usedIdx = new Set();
-      const bedAssignments = bedAreas.map(area => {
+      const bedAssignments = [];
+      for (const area of bedAreas) {
         const curCat = currentCatByArea[area.id];
         const usedCropNames = bedAssignments.map(b => b.cropName).filter(Boolean);
 
@@ -6364,17 +6365,14 @@ function _generatePlanOptions(goal, areas, currentCropsByArea, cropDefs, variety
         }).filter(s => s.score >= 0).sort((a, b) => b.score - a.score);
 
         const best = scored[0];
-        if (!best) return { area, category: curCat || "root", cropName: null };
+        if (!best) { bedAssignments.push({ area, category: curCat || "root", cropName: null }); continue; }
         usedIdx.add(best.i);
 
-        // Build display name: "Potato → then Peas + Beans" if there's a follow-on
         const followOn = _followOnLabel(best.crop.name, best.crop);
-        const displayName = followOn
-          ? `${best.crop.name} → then ${followOn}`
-          : best.crop.name;
+        const displayName = followOn ? `${best.crop.name} → then ${followOn}` : best.crop.name;
 
-        return { area, category: best.crop.category || "root", cropName: displayName };
-      });
+        bedAssignments.push({ area, category: best.crop.category || "root", cropName: displayName });
+      }
 
       return _buildOption(variantName, bedAssignments, _potAssignments());
     }
