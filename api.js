@@ -3019,6 +3019,218 @@ app.post("/photos/area/:id", requireAuth, async (req, res) => {
 });
 
 // =============================================================================
+// =============================================================================
+// TRANSITION AUTOMATION
+// Triggered on final harvest of a crop in a bed that has a locked plan
+// assignment. Generates:
+//   1. Bed prep task — immediate
+//   2. Sow/plant task — next valid window for the assigned crop
+// Updates assignment status: locked → ready
+// Both tasks use idempotent source_key upserts — safe to re-trigger.
+// =============================================================================
+
+// Returns the next calendar date (as ISO string) on or after `now`
+// when `startMonth` (1-based) is in season.
+function _nextWindowDate(startMonth, now = new Date()) {
+  if (!startMonth) return null;
+  const mi   = startMonth - 1; // 0-based
+  const year = now.getFullYear();
+
+  const thisYear = new Date(year, mi, 1);
+
+  if (now.getMonth() < mi) {
+    // Window hasn't opened yet this year — use this year
+    return thisYear.toISOString().split("T")[0];
+  }
+  if (now.getMonth() === mi) {
+    // We're currently in the window — task is due now
+    return now.toISOString().split("T")[0];
+  }
+  // Window already passed this year — roll to next year
+  return new Date(year + 1, mi, 1).toISOString().split("T")[0];
+}
+
+// Choose the right sow mode and month for a crop definition.
+// Returns { taskType, actionVerb, dueDate, windowLabel }
+function _resolveNextCropTask(cropDef, now = new Date()) {
+  if (!cropDef) return null;
+
+  const est = cropDef.default_establishment || "direct_sow";
+
+  // Non-seed establishment — use plant_out window
+  if (["tuber","crown","runner","cane"].includes(est)) {
+    const month = cropDef.plant_out_start || cropDef.sow_direct_start || cropDef.sow_indoors_start;
+    if (!month) return null;
+    return {
+      taskType:    "transplant",
+      actionVerb:  est === "tuber" ? "Plant" : est === "crown" ? "Plant out" : "Plant",
+      dueDate:     _nextWindowDate(month, now),
+      windowLabel: `${["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][month-1]}`,
+    };
+  }
+
+  // Indoor-started — prefer indoor sow window
+  if (est === "indoors" && cropDef.sow_indoors_start) {
+    return {
+      taskType:    "sow",
+      actionVerb:  "Sow indoors",
+      dueDate:     _nextWindowDate(cropDef.sow_indoors_start, now),
+      windowLabel: `${["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][cropDef.sow_indoors_start-1]}`,
+    };
+  }
+
+  // Direct sow
+  const month = cropDef.sow_direct_start || cropDef.sow_indoors_start;
+  if (!month) return null;
+  return {
+    taskType:    "sow",
+    actionVerb:  "Sow",
+    dueDate:     _nextWindowDate(month, now),
+    windowLabel: `${["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][month-1]}`,
+  };
+}
+
+async function _generateTransitionTasks(supabase, userId, areaId, harvestedAt) {
+  try {
+    // ── Find locked assignment for this bed ──────────────────────────────────
+    const { data: assignments } = await supabase
+      .from("area_plan_assignments")
+      .select("id, crop_def_id, crop_name, category, planned_year, status")
+      .eq("user_id", userId)
+      .eq("area_id", areaId)
+      .in("status", ["locked", "ready"])
+      .order("planned_year", { ascending: true })
+      .limit(1);
+
+    const assignment = assignments?.[0];
+    if (!assignment) return; // no locked plan for this bed — nothing to do
+
+    // ── Fetch area name ──────────────────────────────────────────────────────
+    const { data: area } = await supabase
+      .from("growing_areas")
+      .select("name")
+      .eq("id", areaId)
+      .single();
+    const areaName = area?.name?.replace(/^"|"$/g, "") || "Bed";
+
+    // ── Fetch crop definition ────────────────────────────────────────────────
+    let cropDef = null;
+    if (assignment.crop_def_id) {
+      const { data: def } = await supabase
+        .from("crop_definitions")
+        .select("id, name, default_establishment, sow_indoors_start, sow_indoors_end, sow_direct_start, sow_direct_end, plant_out_start, plant_out_end, category")
+        .eq("id", assignment.crop_def_id)
+        .single();
+      cropDef = def || null;
+    }
+
+    const cropName  = cropDef?.name || assignment.crop_name || "next crop";
+    const now       = new Date();
+    const today     = now.toISOString().split("T")[0];
+
+    // ── Bed prep task — due now ──────────────────────────────────────────────
+    // Visible immediately. Expires in 60 days (plenty of time to act).
+    const prepKey = `u:${userId}|a:${areaId}|r:transition_bed_prep|harvest:${harvestedAt}`;
+    const prepExpiry = new Date(now.getTime() + 60 * 86400000).toISOString();
+
+    await supabase
+      .from("tasks")
+      .upsert({
+        user_id:          userId,
+        crop_instance_id: null,
+        area_id:          areaId,
+        action:           `Prepare ${areaName} for ${cropName}`,
+        task_type:        "other",
+        urgency:          "normal",
+        due_date:         today,
+        scheduled_for:    today,
+        visible_from:     today,
+        expires_at:       prepExpiry,
+        status:           "due",
+        engine_type:      "scheduled",
+        record_type:      "task",
+        source:           "rule_engine",
+        rule_id:          "transition_bed_prep",
+        source_key:       prepKey,
+        date_confidence:  "exact",
+        meta:             JSON.stringify({
+          transition:     true,
+          next_crop:      cropName,
+          assignment_id:  assignment.id,
+          note:           "Clear crop debris, loosen soil, and add compost before sowing your next crop.",
+        }),
+        risk_payload:     null,
+      }, {
+        onConflict:       "source_key",
+        ignoreDuplicates: true,
+      });
+
+    // ── Sow / plant task — next valid window ─────────────────────────────────
+    const nextTask = _resolveNextCropTask(cropDef, now);
+
+    if (nextTask) {
+      // Expires 6 weeks after due date — enough buffer for late sowings
+      const sowExpiry = new Date(new Date(nextTask.dueDate).getTime() + 42 * 86400000).toISOString();
+      // Visible 3 weeks before due so it appears in "Coming up soon"
+      const visibleFrom = new Date(new Date(nextTask.dueDate).getTime() - 21 * 86400000)
+        .toISOString().split("T")[0];
+      const sowKey = `u:${userId}|a:${areaId}|r:transition_sow|assignment:${assignment.id}`;
+
+      await supabase
+        .from("tasks")
+        .upsert({
+          user_id:          userId,
+          crop_instance_id: null,
+          area_id:          areaId,
+          action:           `${nextTask.actionVerb} ${cropName} in ${areaName}`,
+          task_type:        nextTask.taskType,
+          urgency:          "normal",
+          due_date:         nextTask.dueDate,
+          scheduled_for:    nextTask.dueDate,
+          visible_from:     visibleFrom < today ? today : visibleFrom,
+          expires_at:       sowExpiry,
+          status:           nextTask.dueDate <= today ? "due" : "upcoming",
+          engine_type:      "scheduled",
+          record_type:      "task",
+          source:           "rule_engine",
+          rule_id:          "transition_sow",
+          source_key:       sowKey,
+          date_confidence:  "exact",
+          meta:             JSON.stringify({
+            transition:       true,
+            next_crop:        cropName,
+            assignment_id:    assignment.id,
+            sow_window_label: nextTask.windowLabel,
+            establishment:    cropDef?.default_establishment || "direct_sow",
+          }),
+          risk_payload:     null,
+        }, {
+          onConflict:       "source_key",
+          ignoreDuplicates: true,
+        });
+    }
+
+    // ── Advance assignment status: locked → ready ────────────────────────────
+    // "ready" = bed is prepped and sow task has been issued
+    if (assignment.status === "locked") {
+      await supabase
+        .from("area_plan_assignments")
+        .update({
+          status:     "ready",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", assignment.id)
+        .eq("user_id", userId);
+    }
+
+    console.log(`[Transition] ${areaName} → ${cropName}: bed prep + ${nextTask ? nextTask.taskType + " " + nextTask.dueDate : "no sow window"} | assignment ${assignment.id} → ready`);
+
+  } catch (err) {
+    // Non-fatal — harvest has already been recorded, don't fail the response
+    console.error("[Transition] Error generating transition tasks:", err.message);
+  }
+}
+
 // HARVEST LOG
 // Users log harvests from the forecast screen. Photos stored in Supabase Storage.
 // =============================================================================
@@ -3087,6 +3299,11 @@ app.post("/harvest-log", requireAuth,
 
       // Re-run rule engine so tasks for this crop are cleaned up immediately
       await runRuleEngine(req.user.id);
+
+      // Check for a locked plan assignment and generate bed prep + sow tasks
+      if (harvestedCrop?.area_id) {
+        await _generateTransitionTasks(supabaseService, req.user.id, harvestedCrop.area_id, harvestedAt);
+      }
     }
 
     res.status(201).json(data);
