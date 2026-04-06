@@ -6688,88 +6688,87 @@ function _generatePlanOptions(goal, areas, currentCropsByArea, cropDefs, variety
 
 app.post("/plans/generate", requireAuth, async (req, res) => {
   try {
-    const { location_id, goal = "rotate_mine" } = req.body;
+    const {
+      location_id,
+      year_round    = false,
+      improve_count = 0,
+      preference    = "balanced",
+    } = req.body;
     if (!location_id) return res.status(400).json({ error: "location_id required" });
-    const validGoals = ["rotate_mine", "best_rotation", "max_yield", "favourites", "easy", "balanced"];
-    if (!validGoals.includes(goal)) return res.status(400).json({ error: "invalid goal" });
 
+    const { resolveShopValue } = require("./value-resolver");
+
+    // ── Fetch location ────────────────────────────────────────────────────────
     const { data: loc, error: locErr } = await req.db
       .from("locations").select("id, name").eq("id", location_id).eq("user_id", req.user.id).single();
     if (locErr || !loc) return res.status(403).json({ error: "Location not found" });
 
+    // ── Fetch areas (include type) ────────────────────────────────────────────
     const { data: areas, error: areasErr } = await req.db
-      .from("growing_areas").select("id, name, width_m, length_m").eq("location_id", location_id);
+      .from("growing_areas").select("id, name, type, width_m, length_m").eq("location_id", location_id);
     if (areasErr) throw areasErr;
-    if (!areas || !areas.length) return res.status(400).json({ error: "No areas found for this location" });
+    if (!areas || !areas.length) return res.status(400).json({ error: "No areas found" });
 
     const areaIds = areas.map(a => a.id);
 
-    // Fetch ALL crop instances — active AND planned — to understand full bed reality
-    const { data: allCrops, error: cropsErr } = await supabaseService
+    // ── Fetch crop instances ──────────────────────────────────────────────────
+    const { data: allCrops } = await supabaseService
       .from("crop_instances")
-      .select("area_id, crop_def_id, name, active, status, sown_date, crop_definitions(name, category)")
+      .select("area_id, crop_def_id, name, active, status, sown_date, crop_definitions(name, category, harvest_month_start, harvest_month_end, sow_direct_start, sow_indoors_start)")
       .eq("user_id", req.user.id)
       .in("area_id", areaIds);
-    if (cropsErr) throw cropsErr;
 
     const cropRows = allCrops || [];
 
-    // Build per-area state:
-    // activeCropsByArea   — what is currently growing (active=true)
-    // plannedCropsByArea  — what is already planned as follow-ons (active=false, status=planned)
+    // ── Build activeCropsByArea and plannedCropsByArea ────────────────────────
     const activeCropsByArea  = {};
     const plannedCropsByArea = {};
 
     for (const crop of cropRows) {
       const name     = crop.crop_definitions?.name || crop.name || "Unknown";
       const category = crop.crop_definitions?.category || null;
-      const entry    = { name, category, crop_def_id: crop.crop_def_id, status: crop.status };
-
+      const entry    = {
+        name, category,
+        crop_def_id:         crop.crop_def_id,
+        status:              crop.status,
+        harvest_month_start: crop.crop_definitions?.harvest_month_start || null,
+        harvest_month_end:   crop.crop_definitions?.harvest_month_end   || null,
+        sow_month:           crop.crop_definitions?.sow_direct_start || crop.crop_definitions?.sow_indoors_start || null,
+      };
       if (crop.active) {
         if (!activeCropsByArea[crop.area_id])  activeCropsByArea[crop.area_id]  = [];
         activeCropsByArea[crop.area_id].push(entry);
-      } else if (crop.status === "planned") {
+      } else if (crop.status === "planned" && crop.crop_def_id) {
         if (!plannedCropsByArea[crop.area_id]) plannedCropsByArea[crop.area_id] = [];
-        // Only include planned crops with a known crop definition — ignore stale/orphaned entries
-        if (crop.crop_def_id) {
-          plannedCropsByArea[crop.area_id].push(entry);
-        }
+        plannedCropsByArea[crop.area_id].push(entry);
       }
     }
 
-    // Infer follow-on sequences per area:
-    // If an area has planned crops after active crops, capture the sequence
-    // e.g. Bed 5: Garlic (active) → Brussels Sprout + Swede (planned)
-    const sequenceByArea = {}; // area_id → { primary, followOns: [] }
+    // ── Build sequenceByArea ──────────────────────────────────────────────────
+    const sequenceByArea = {};
     for (const area of areas) {
       const active  = activeCropsByArea[area.id]  || [];
       const planned = plannedCropsByArea[area.id] || [];
-
-      // Deduplicate planned crops by name
       const uniquePlanned = [];
       const seenNames = new Set();
       for (const p of planned) {
         if (!seenNames.has(p.name)) { uniquePlanned.push(p); seenNames.add(p.name); }
       }
-
-      // Active: pick dominant crop (most common category, or first)
-      const primaryCrops = active.filter(c => c.category && !["fruit","perennial","herb"].includes(c.category));
-      const primary = primaryCrops.length ? primaryCrops[0] : (active[0] || null);
-
+      const FIXED_CATS = new Set(["fruit","perennial"]);
+      const primary = active.find(c => !FIXED_CATS.has(c.category)) || active[0] || null;
       sequenceByArea[area.id] = {
         primary,
-        allActive:  active,
-        followOns:  uniquePlanned.filter(p => p.category && !["fruit","perennial"].includes(p.category)),
+        allActive: active,
+        followOns: uniquePlanned.filter(p => !FIXED_CATS.has(p.category)),
       };
     }
 
-    // Get crop definitions
+    // ── Fetch crop definitions and varieties ──────────────────────────────────
     const { data: cropDefs } = await supabaseService
       .from("crop_definitions")
-      .select("id, name, category, sow_direct_start, sow_indoors_start")
+      .select("id, name, category, harvest_month_start, harvest_month_end, sow_direct_start, sow_indoors_start")
       .eq("hidden", false);
 
-    // Get varieties
     const { data: allVarieties } = await supabaseService
       .from("varieties").select("id, crop_def_id, name, is_default").eq("active", true);
     const varietyMap = {};
@@ -6778,184 +6777,143 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
       varietyMap[v.crop_def_id].push(v);
     }
 
-    // Names of crops user grows (preferred for crop selection)
-    const preferredNames = [...new Set(cropRows.map(c => c.crop_definitions?.name || c.name).filter(Boolean))];
+    // ── User crop names set (for gap-fill preference) ─────────────────────────
+    const userCropNames = new Set(cropRows.map(c => c.crop_definitions?.name || c.name).filter(Boolean));
 
-    // Also pass activeCropsByArea as currentCropsByArea for backwards compat
-    const currentCropsByArea = activeCropsByArea;
-
-    // Generate options — pass sequenceByArea so generator can use existing sequences
-    // Generate one plan per archetype — always, regardless of user goal
-    // User goal is used for explanation context only
-    const balancedOptions = _generatePlanOptions("rotate_mine", areas, currentCropsByArea, cropDefs || [], varietyMap, preferredNames, sequenceByArea);
-    const maxYieldOptions  = _generatePlanOptions("max_yield",   areas, currentCropsByArea, cropDefs || [], varietyMap, preferredNames, sequenceByArea);
-    const easyOptions      = _generatePlanOptions("easy",        areas, currentCropsByArea, cropDefs || [], varietyMap, preferredNames, sequenceByArea);
-
-    // Take the best variant from each archetype (first option from each)
-    const options = [
-      { ...balancedOptions[0], goal: "rotate_mine" },
-      { ...maxYieldOptions[0],  goal: "max_yield"   },
-      { ...easyOptions[0],      goal: "easy"         },
-    ];
-
-    // Claude explanation cards
-    const gardenContext = areas.map(a => {
-      const seq  = sequenceByArea[a.id];
-      const type = _classifyArea(a);
-      let desc = seq && seq.primary ? seq.primary.name : "empty";
-      if (seq && seq.followOns && seq.followOns.length) {
-        desc += ` → then ${seq.followOns.map(f=>f.name).join(" + ")}`;
-      }
-      return `${a.name} (${type}, ${a.width_m||"?"}x${a.length_m||"?"}m): ${desc}`;
-    }).join("\n");
-
-    const optionsContext = options.map((o,i) =>
-      `Option ${i+1} "${o.name}": ${o.assignments.map(a=>`${a.area_name}→${a.crop_name}`).join(", ")}. Rotation=${o.scores.rotation}/10, Yield=${o.scores.yield}/10, Ease=${o.scores.ease}/10`
-    ).join("\n");
-
-    let explanations = options.map(o => `${o.name} — tailored to your garden.`);
-    try {
-      const cr = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "Content-Type":"application/json", "x-api-key":process.env.ANTHROPIC_API_KEY, "anthropic-version":"2023-06-01" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 600,
-          messages: [{ role:"user", content:`You are a UK vegetable gardening expert.\n\nGarden: ${loc.name}\nCurrent state:\n${gardenContext}\n\nGoal: ${goal.replace(/_/g," ")}\n\nGenerated plans:\n${optionsContext}\n\nWrite a 2-3 sentence explanation for each plan. Focus on WHY this rotation works for THIS specific garden, and the key trade-off vs the other options. Plain, friendly UK English. No jargon.\n\nJSON only, no markdown:\n{"explanations":["...","...","..."]}` }],
-        }),
-      });
-      const cd = await cr.json();
-      const txt = (cd.content&&cd.content[0]&&cd.content[0].text)||"";
-      const parsed = JSON.parse(txt.replace(/```json|```/g,"").trim());
-      if (Array.isArray(parsed.explanations)) explanations = parsed.explanations;
-    } catch(e) { console.error("[PlanGenerate] Claude failed:", e.message); }
-
-    // ── Build baseline from current active crops ────────────────────────────
-    const baselineAssignments = areas.map(a => {
-      const crops   = activeCropsByArea[a.id] || [];
-      const primary = crops[0] || null;
-      return primary ? {
-        area_id:              a.id,
-        area_name:            a.name,
-        category:             primary.category,
-        family:               primary.family || primary.category,
-        crop_definition_id:   primary.crop_definition_id || primary.crop_def_id || null,
-        crop_name:            primary.crop_name || primary.name || primary.raw_crop_label || "Crop",
-        _area_m2:             (a.width_m||1.5) * (a.length_m||1.5),
-        _harvest_month_start: null,
-        _harvest_month_end:   null,
-      } : null;
-    }).filter(Boolean);
-
-    const baselineYieldKg = baselineAssignments.reduce((s,a) =>
-      s + (YIELD_PER_M2_BY_CATEGORY[a.category]||3) * (a._area_m2||1), 0);
-
-    // ── Enrich generated option assignments with area_m2, family, harvest window
-    const planIds   = ["balanced","max_harvest","easiest"];
-    const planNames = ["Balanced","Max Harvest","Easiest"];
-
-    const enrichedOptions = options.map((option, oi) => {
-      const enrichedAssignments = (option.assignments||[]).map(a => {
-        const areaObj = areas.find(ar => ar.id === a.area_id);
-        const defObj  = (cropDefs||[]).find(d => d.id === (a.crop_definition_id || a.crop_def_id));
-        return {
-          ...a,
-          family:               defObj?.family || defObj?.category || a.family || a.category,
-          _area_m2:             areaObj ? (areaObj.width_m||1.5)*(areaObj.length_m||1.5) : 1.5,
-          _harvest_month_start: defObj?.harvest_month_start || null,
-          _harvest_month_end:   defObj?.harvest_month_end   || null,
-        };
-      });
-      return {
-        ...option,
-        id:          planIds[oi]   || `plan_${oi}`,
-        name:        planNames[oi] || option.name,
-        assignments: enrichedAssignments,
-      };
+    // ── Build baseline ────────────────────────────────────────────────────────
+    const baselineAssignments = _buildBaseline({
+      areas, activeCropsByArea, sequenceByArea, cropDefs: cropDefs || [], varietyMap,
     });
 
-    // ── Score all options ───────────────────────────────────────────────────
-    const { resolveShopValue } = require("./value-resolver");
-    const currentMonth = new Date().getMonth()+1;
+    // ── Helper: score and resolve metrics for an assignment list ──────────────
+    const currentMonth = new Date().getMonth() + 1;
     const currentYear  = new Date().getFullYear();
 
-    // Use balanced plan assignments as the diff baseline — options are variations of it
-    const diffBaseline = enrichedOptions[0]?.assignments || baselineAssignments;
-
-    const scoredOptions = await Promise.all(enrichedOptions.map(async (option, oi) => {
-      const asgn    = option.assignments || [];
-      const effort   = _calcEffortLevel(asgn);
-      const rotation = _calcRotationScore(asgn, sequenceByArea);
-      const spread   = _calcHarvestSpread(asgn);
-
-      const totalYieldKg = asgn.reduce((s,a) =>
-        s + (YIELD_PER_M2_BY_CATEGORY[a.category]||3) * (a._area_m2||1), 0);
-      const totalAreaM2  = asgn.reduce((s,a) => s + (a._area_m2||1), 0);
-
-      // Resolve shop value per assignment
-      let totalValueGbp = 0;
-      let valueBasis = null;
+    async function _scoreAssignments(asgn) {
+      let totalYieldKg = 0, totalAreaM2 = 0, totalValueGbp = 0;
       for (const a of asgn) {
-        const cropDefId = a.crop_definition_id || a.crop_def_id;
-        if (!cropDefId) continue;
-        const yieldKg         = (YIELD_PER_M2_BY_CATEGORY[a.category]||3) * (a._area_m2||1);
-        const harvestMonth    = a._harvest_month_start || currentMonth;
-        const harvestYear     = harvestMonth < currentMonth ? currentYear+1 : currentYear;
-        const harvestMonthKey = `${harvestYear}-${String(harvestMonth).padStart(2,"0")}`;
-        const resolved = await resolveShopValue(supabaseService, cropDefId, yieldKg, harvestMonthKey);
-        if (resolved) { totalValueGbp += resolved.value_gbp; valueBasis = resolved; }
+        const areaObj = areas.find(ar => ar.id === a.area_id);
+        const m2      = areaObj ? (areaObj.width_m||1.5) * (areaObj.length_m||1.5) : 1.5;
+        const ypm2    = YIELD_SCORE[a.category] ? YIELD_SCORE[a.category] * 0.5 : 1.5; // rough kg/m²
+        totalYieldKg += ypm2 * m2;
+        totalAreaM2  += m2;
+        if (a.crop_definition_id) {
+          const hMonth    = a.harvest_month_start || currentMonth;
+          const hYear     = hMonth < currentMonth ? currentYear+1 : currentYear;
+          const monthKey  = `${hYear}-${String(hMonth).padStart(2,"0")}`;
+          const resolved  = await resolveShopValue(supabaseService, a.crop_definition_id, ypm2*m2, monthKey);
+          if (resolved) totalValueGbp += resolved.value_gbp;
+        }
       }
-
-      const metrics = {
-        harvest_kg:            Math.round(totalYieldKg*10)/10,
-        shop_value_gbp:        totalValueGbp > 0 ? Math.round(totalValueGbp) : null,
-        yield_per_m2:          totalAreaM2>0 ? Math.round((totalYieldKg/totalAreaM2)*10)/10 : null,
-        effort_level:          effort.level,
-        effort_index:          effort.index,
-        rotation_level:        rotation.level,
-        rotation_index:        rotation.index,
-        harvest_spread_level:  spread.level,
-        harvest_spread_index:  spread.index,
-      };
-
-      const vsBaseline = {
-        harvest_kg_delta: Math.round((metrics.harvest_kg - baselineYieldKg)*10)/10,
-        effort_change:    effort.index<40?"easier":effort.index>55?"harder":"same",
-        rotation_change:  rotation.index>60?"better":"same",
-      };
-
-      // Diff this option against the balanced baseline
-      const diff = _diffFromBaseline(asgn, oi === 0 ? baselineAssignments : diffBaseline, option.goal);
-
       return {
-        ...option,
-        metrics,
-        comparison_vs_baseline: vsBaseline,
-        summary: explanations[oi] || _buildExplanation(option.goal, metrics, vsBaseline),
-        value_note: _getValueNote(metrics),
-        changes:        diff.changes,
-        change_count:   diff.change_count,
-        change_summary: diff.change_summary,
-        value_basis: valueBasis ? {
-          pricing_region:  "GB",
-          month_key:       valueBasis.month_key,
-          confidence_score:valueBasis.confidence_score,
-          source_note:     "Based on typical UK shop prices for when your crops are likely to be ready.",
-        } : null,
+        harvest_kg:    Math.round(totalYieldKg * 10) / 10,
+        shop_value_gbp: totalValueGbp > 0 ? Math.round(totalValueGbp) : null,
+        yield_per_m2:  totalAreaM2 > 0 ? Math.round((totalYieldKg/totalAreaM2)*10)/10 : null,
       };
+    }
+
+    // ── Build enhanced plan (apply year_round and improvements) ───────────────
+    // Start with a copy of baseline
+    let enhancedAssignments = baselineAssignments.map(a => ({ ...a }));
+    const gapFills    = [];
+    const improvements = [];
+
+    // Year-round gap filling
+    if (year_round) {
+      const gaps = _findGaps(baselineAssignments, sequenceByArea);
+      const usedGapNames      = new Set();
+      const usedGapCategories = new Set();
+      for (const gap of gaps) {
+        const def = _pickGapCrop(gap, cropDefs || [], userCropNames, usedGapNames, usedGapCategories);
+        if (!def) continue;
+        usedGapNames.add(def.name);
+        usedGapCategories.add(def.category);
+        const display = (varietyMap[def.id]?.[0]) ? `${def.name} (${varietyMap[def.id][0].name})` : def.name;
+        gapFills.push({
+          area_id:            gap.area_id,
+          area_name:          gap.area_name,
+          crop_name:          display,
+          crop_definition_id: def.id,
+          gap_start_month:    gap.gap_start_month,
+          gap_end_month:      gap.gap_end_month,
+          after_crop:         gap.after_crop,
+          note:               `Fills the gap between ${gap.after_crop} harvest and spring sowing`,
+        });
+      }
+    }
+
+    // Targeted improvements
+    if (improve_count > 0) {
+      const imps = _generateImprovements({
+        baselineAssignments,
+        cropDefs:    cropDefs || [],
+        varietyMap,
+        userCropNames,
+        preference,
+        improveCount: improve_count,
+      });
+      // Apply improvements to enhanced assignments
+      for (const imp of imps) {
+        const idx = enhancedAssignments.findIndex(a => a.area_id === imp.area_id);
+        if (idx >= 0) {
+          enhancedAssignments[idx] = {
+            ...enhancedAssignments[idx],
+            category:           imp.to_category,
+            crop_definition_id: imp.crop_definition_id,
+            crop_name:          imp.to_crop,
+            harvest_month_start: imp.harvest_month_start,
+            harvest_month_end:   imp.harvest_month_end,
+          };
+        }
+        improvements.push(imp);
+      }
+    }
+
+    // ── Score baseline and enhanced ───────────────────────────────────────────
+    const [baselineMetrics, enhancedMetrics] = await Promise.all([
+      _scoreAssignments(baselineAssignments),
+      _scoreAssignments(enhancedAssignments),
+    ]);
+
+    // ── Tip (passive suggestion when no enhancements) ─────────────────────────
+    const tip = (!year_round && improve_count === 0)
+      ? _buildTip(baselineAssignments, cropDefs || [], varietyMap)
+      : null;
+
+    // ── Build change summary for enhanced plan ────────────────────────────────
+    const changes = improvements.map(imp => ({
+      area_id:     imp.area_id,
+      area_name:   imp.area_name,
+      change_type: "crop_swap",
+      from_label:  imp.from_crop,
+      to_label:    imp.to_crop,
+      reason_text: imp.reason,
     }));
 
-    const recommendedPlanId = _recommendPlan(scoredOptions);
+    const hasEnhancements = year_round || improve_count > 0;
+    const changeCount = changes.length + gapFills.length;
+    const changeSummary = changeCount === 0 ? null
+      : changeCount === 1 ? "1 change from your rotated baseline"
+      : `${changeCount} changes from your rotated baseline`;
 
     res.json({
       location_id,
-      goal,
-      recommended_plan_id: recommendedPlanId,
       baseline: {
-        label:      "Current layout",
-        harvest_kg: Math.round(baselineYieldKg*10)/10,
+        label:       "Your rotated garden",
+        assignments: baselineAssignments,
+        metrics:     baselineMetrics,
       },
-      options: scoredOptions,
+      plan: {
+        label:          hasEnhancements ? "Enhanced plan" : "Your rotated garden",
+        assignments:    enhancedAssignments,
+        metrics:        enhancedMetrics,
+        gap_fills:      gapFills,
+        improvements,
+        changes,
+        change_count:   changeCount,
+        change_summary: changeSummary,
+      },
+      tip,
     });
 
   } catch (err) {
