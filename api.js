@@ -6072,15 +6072,24 @@ function _buildBaseline({ areas, activeCropsByArea, sequenceByArea, cropDefs, va
     // Free beds — rotate crops within the group
     const freeBeds = rotatableAreas.filter(a => !lockedIds.has(a.id));
 
-    // Build crop pool from all free beds in this group
+    // Build crop pool from ALL rotatable beds — locked and free
+    // Exclude only crops already consumed by a locked bed's primary assignment
+    const lockedCropNames = new Set();
+    for (const area of rotatableAreas) {
+      if (lockedIds.has(area.id)) {
+        const seq = sequenceByArea[area.id];
+        if (seq?.primary) lockedCropNames.add(seq.primary.name);
+      }
+    }
     const cropPool  = [];
     const seenNames = new Set();
-    for (const area of freeBeds) {
+    for (const area of rotatableAreas) {
       const crops = activeCropsByArea[area.id] || [];
       for (const c of crops) {
         if (FIXED_CATEGORIES.has(c.category))    continue;
         if (INVASIVE_CATEGORIES.has(c.category)) continue;
         if (seenNames.has(c.name))               continue;
+        if (lockedCropNames.has(c.name))         continue;
         seenNames.add(c.name);
         cropPool.push({ ...c, source_area_id: area.id });
       }
@@ -7112,7 +7121,9 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
       if (crop.active) {
         if (!activeCropsByArea[crop.area_id])  activeCropsByArea[crop.area_id]  = [];
         activeCropsByArea[crop.area_id].push(entry);
-      } else if (crop.status === "planned" && crop.crop_def_id) {
+      } else if (crop.crop_def_id) {
+        // Include all non-active crops with a known definition as potential follow-ons
+        // (whether status is "planned", "sown_indoors", "sown_outdoors", etc.)
         if (!plannedCropsByArea[crop.area_id]) plannedCropsByArea[crop.area_id] = [];
         plannedCropsByArea[crop.area_id].push(entry);
       }
