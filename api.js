@@ -5982,13 +5982,10 @@ function _displayName(cropDef, varietyMap) {
 
 // ── Build baseline — same crops, rotated within same area group ────────────────
 function _buildBaseline({ areas, activeCropsByArea, sequenceByArea, cropDefs, varietyMap }) {
-  const FIXED_CATEGORIES    = new Set(["fruit","perennial"]);
-  const INVASIVE_CATEGORIES = new Set(["herb","flower","perennial","fruit"]);
-  const COMMITTED           = new Set(["sown_indoors","sown_outdoors","transplanted","growing","harvesting"]);
+  const FIXED_CATEGORIES = new Set(["fruit","perennial"]);
 
   const assignments = [];
 
-  // Group areas by type — only rotate within same group
   const groups = {};
   for (const area of areas) {
     const g = _areaGroup(area);
@@ -5998,7 +5995,7 @@ function _buildBaseline({ areas, activeCropsByArea, sequenceByArea, cropDefs, va
 
   for (const [groupName, groupAreas] of Object.entries(groups)) {
 
-    // ── Containers — keep all active crops as-is ─────────────────────────────
+    // ── Containers — keep as-is ───────────────────────────────────────────────
     if (groupName === "container") {
       for (const area of groupAreas) {
         const crops   = activeCropsByArea[area.id] || [];
@@ -6012,7 +6009,7 @@ function _buildBaseline({ areas, activeCropsByArea, sequenceByArea, cropDefs, va
       continue;
     }
 
-    // ── Fixed areas (all crops are fruit/perennial) — never move ─────────────
+    // ── Fixed areas (all fruit/perennial) — never move ────────────────────────
     const fixedAreas     = groupAreas.filter(a => {
       const crops = activeCropsByArea[a.id] || [];
       return crops.length > 0 && crops.every(c => FIXED_CATEGORIES.has(c.category));
@@ -6020,108 +6017,98 @@ function _buildBaseline({ areas, activeCropsByArea, sequenceByArea, cropDefs, va
     const rotatableAreas = groupAreas.filter(a => !fixedAreas.includes(a));
 
     for (const area of fixedAreas) {
-      const crops   = activeCropsByArea[area.id] || [];
-      const display = crops.map(c => c.name).join(" + ");
+      const crops = activeCropsByArea[area.id] || [];
       assignments.push({
         area_id: area.id, area_name: area.name, area_type: area.type, area_group: groupName,
         category: crops[0].category, crop_definition_id: crops[0].crop_def_id || null,
-        crop_name: display, locked: true, is_fixed: true,
+        crop_name: crops.map(c => c.name).join(" + "), locked: true, is_fixed: true,
       });
     }
 
-    // ── Build crop slots — one per rotatable bed ──────────────────────────────
-    // Each slot = what's in that bed right now (primary crop + any committed follow-ons)
-    // The whole slot travels together to a new bed during rotation.
-    const cropSlots = rotatableAreas.map(area => {
-      const allActive = activeCropsByArea[area.id] || [];
+    if (!rotatableAreas.length) continue;
 
-      // Primary = first active crop with a valid crop_def_id and non-fixed/non-invasive category
-      const primary = allActive.find(c =>
-        c.crop_def_id &&
-        c.category &&
-        !FIXED_CATEGORIES.has(c.category) &&
-        !INVASIVE_CATEGORIES.has(c.category)
-      ) || null;
+    // ── Build one slot per rotatable bed from sequenceByArea ─────────────────
+    // sequenceByArea is the authoritative source — it has already resolved
+    // primary crops and committed follow-ons correctly.
+    const slots = rotatableAreas.map(area => {
+      const seq     = sequenceByArea[area.id] || {};
+      const primary = seq.primary || null;
 
-      if (!primary) return {
-        area, primary: null, displayName: "To be decided",
-        category: null, cropDefId: null, harvestStart: null, harvestEnd: null,
-      };
+      if (!primary) {
+        return {
+          sourceAreaId: area.id,
+          primary:      null,
+          followOns:    [],
+          displayName:  "To be decided",
+          category:     null,
+          cropDefId:    null,
+          harvestStart: null,
+          harvestEnd:   null,
+        };
+      }
 
-      // Committed follow-ons: other active crops in this bed that aren't the primary
-      // (e.g. Swede + Brussels Sprout sown_indoors alongside Garlic)
-      const followOns = allActive.filter(c =>
-        c.crop_def_id &&
-        c.category &&
-        !FIXED_CATEGORIES.has(c.category) &&
-        c.crop_def_id !== primary.crop_def_id &&
-        c.name !== primary.name &&
-        (c.sown_date || COMMITTED.has(c.status))
-      );
-
-      // Deduplicate follow-ons by name
-      const seenFollowNames = new Set();
-      const uniqueFollowOns = followOns.filter(f => {
-        if (seenFollowNames.has(f.name)) return false;
-        seenFollowNames.add(f.name);
-        return true;
-      });
-
-      const cropDef    = cropDefs.find(d => d.id === primary.crop_def_id);
-      const baseName   = _displayName(cropDef, varietyMap) || primary.name;
-      const followLabel = uniqueFollowOns.length
-        ? uniqueFollowOns.map(f => f.name).join(" + ")
-        : null;
-      const displayName = followLabel ? `${primary.name} → then ${followLabel}` : baseName;
+      const followOns   = seq.followOns || [];
+      const cropDef     = cropDefs.find(d => d.id === primary.crop_def_id);
+      const baseName    = _displayName(cropDef, varietyMap) || primary.name;
+      const followLabel = followOns.length ? followOns.map(f => f.name).join(" + ") : null;
 
       return {
-        area,
+        sourceAreaId: area.id,
         primary,
-        displayName,
-        category:    primary.category,
-        cropDefId:   cropDef?.id || null,
+        followOns,
+        displayName:  followLabel ? `${primary.name} → then ${followLabel}` : baseName,
+        category:     primary.category,
+        cropDefId:    cropDef?.id || null,
         harvestStart: cropDef?.harvest_month_start || null,
         harvestEnd:   cropDef?.harvest_month_end   || null,
       };
     });
 
-    // ── Assign slots to beds using rotation scoring ───────────────────────────
-    // Goal: move every crop to a different bed. Prefer beds where the category
-    // hasn't been grown before (rotation benefit).
-    const usedSlotIdx = new Set();
+    const n = rotatableAreas.length;
 
-    for (let bi = 0; bi < rotatableAreas.length; bi++) {
-      const bed = rotatableAreas[bi];
-
+    // ── Build score matrix: score[bi][si] = goodness of slot si in bed bi ────
+    const score = rotatableAreas.map((bed, bi) => {
       // What category is currently in this bed?
-      const curCat = (() => {
-        const crops = activeCropsByArea[bed.id] || [];
-        const c = crops.find(cr => cr.crop_def_id && cr.category && !FIXED_CATEGORIES.has(cr.category));
-        return c?.category || null;
-      })();
+      const curCat = sequenceByArea[bed.id]?.primary?.category || null;
 
-      const scored = cropSlots.map((slot, si) => {
-        if (usedSlotIdx.has(si)) return { si, score: -1 };
-        if (!slot.primary)       return { si, slot, score: 1 }; // empty slot, low priority
-
-        // Strongly avoid staying in the same bed — that's not rotation
-        const sameBed    = slot.area.id === bed.id ? -20 : 0;
-        // Avoid same category as what was here (key rotation rule)
-        const catPenalty = slot.category === curCat ? -10 : 0;
-        // Rotation bonus for good following families
+      return slots.map((slot, si) => {
+        if (!slot.primary) return 1;
+        const sameBed    = slot.sourceAreaId === bed.id ? -20 : 0;
+        const catPenalty = slot.category === curCat      ? -10 : 0;
         const rotBonus   = (ROTATION_NEXT[curCat] || []).indexOf(slot.category) >= 0 ? 6 : 0;
+        return 5 + sameBed + catPenalty + rotBonus;
+      });
+    });
 
-        return { si, slot, score: 5 + sameBed + catPenalty + rotBonus };
-      }).filter(s => s.score >= 0).sort((a, b) => b.score - a.score);
+    // ── 1-to-1 assignment: each slot → exactly one bed, each bed → one slot ──
+    const pairs = [];
+    for (let bi = 0; bi < n; bi++)
+      for (let si = 0; si < n; si++)
+        pairs.push({ bi, si, sc: score[bi][si] });
+    pairs.sort((a, b) => b.sc - a.sc);
 
-      const best = scored[0];
-      if (!best) continue;
-      usedSlotIdx.add(best.si);
+    const assignedBeds  = new Set();
+    const assignedSlots = new Set();
+    const bedToSlot     = new Array(n).fill(null);
 
-      if (!best.slot?.primary) {
+    for (const { bi, si } of pairs) {
+      if (assignedBeds.has(bi) || assignedSlots.has(si)) continue;
+      bedToSlot[bi] = si;
+      assignedBeds.add(bi);
+      assignedSlots.add(si);
+      if (assignedBeds.size === n) break;
+    }
+
+    // ── Emit assignments ──────────────────────────────────────────────────────
+    for (let bi = 0; bi < n; bi++) {
+      const bed  = rotatableAreas[bi];
+      const si   = bedToSlot[bi];
+      const slot = si !== null ? slots[si] : null;
+
+      if (!slot || !slot.primary) {
         assignments.push({
           area_id: bed.id, area_name: bed.name, area_type: bed.type, area_group: groupName,
-          category: curCat || "root", crop_definition_id: null,
+          category: null, crop_definition_id: null,
           crop_name: "To be decided", locked: false, is_fixed: false, _empty: true,
         });
         continue;
@@ -6132,11 +6119,13 @@ function _buildBaseline({ areas, activeCropsByArea, sequenceByArea, cropDefs, va
         area_name:           bed.name,
         area_type:           bed.type,
         area_group:          groupName,
-        category:            best.slot.category,
-        crop_definition_id:  best.slot.cropDefId,
-        crop_name:           best.slot.displayName,
-        harvest_month_start: best.slot.harvestStart,
-        harvest_month_end:   best.slot.harvestEnd,
+        category:            slot.category,
+        crop_definition_id:  slot.cropDefId,
+        crop_name:           slot.displayName,
+        harvest_month_start: slot.harvestStart,
+        harvest_month_end:   slot.harvestEnd,
+        // Carry structured follow-ons for gap-fill and improvement logic
+        followOns:           slot.followOns,
         locked:              false,
         is_fixed:            false,
       });
@@ -7110,24 +7099,49 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
     }
 
     // ── Build sequenceByArea ──────────────────────────────────────────────────
-    // A bed is locked only if its follow-on crops are physically started
-    // (sown_date present, or status is sown/growing). Merely "planned" = free to rotate.
+    // primary  = the main active crop in the bed (non-fixed, non-invasive)
+    // followOns = committed follow-on crops, from two sources:
+    //   1. Other active crops in same bed (e.g. Swede/Sprouts sown alongside Garlic)
+    //   2. Planned crops that are physically started (sown_date or committed status)
     const COMMITTED_STATUSES = new Set(["sown_indoors","sown_outdoors","transplanted","growing","harvesting"]);
-    const FIXED_CATS_SEQ = new Set(["fruit","perennial"]);
+    const FIXED_CATS_SEQ     = new Set(["fruit","perennial"]);
+    const INV_CATS_SEQ       = new Set(["herb","flower","perennial","fruit"]);
     const sequenceByArea = {};
     for (const area of areas) {
       const active  = activeCropsByArea[area.id]  || [];
       const planned = plannedCropsByArea[area.id] || [];
-      const committedFollowOns = planned.filter(p =>
+
+      // Primary = first active crop with valid crop_def_id, not fixed/invasive
+      const primary = active.find(c =>
+        c.crop_def_id && c.category &&
+        !FIXED_CATS_SEQ.has(c.category) &&
+        !INV_CATS_SEQ.has(c.category)
+      ) || active[0] || null;
+
+      // Follow-ons from active crops (same bed, different crop from primary)
+      const activeFollowOns = primary ? active.filter(c =>
+        c.crop_def_id && c.category &&
+        !FIXED_CATS_SEQ.has(c.category) &&
+        c.crop_def_id !== primary.crop_def_id &&
+        c.name !== primary.name
+      ) : [];
+
+      // Follow-ons from planned/committed crops
+      const plannedFollowOns = planned.filter(p =>
         !FIXED_CATS_SEQ.has(p.category) &&
         (p.sown_date || COMMITTED_STATUSES.has(p.status))
       );
+
+      // Merge, deduplicate by name
+      const seenNames   = new Set(primary ? [primary.name] : []);
       const uniqueFollowOns = [];
-      const seenFollowOns = new Set();
-      for (const p of committedFollowOns) {
-        if (!seenFollowOns.has(p.name)) { uniqueFollowOns.push(p); seenFollowOns.add(p.name); }
+      for (const f of [...activeFollowOns, ...plannedFollowOns]) {
+        if (!seenNames.has(f.name)) {
+          seenNames.add(f.name);
+          uniqueFollowOns.push(f);
+        }
       }
-      const primary = active.find(c => !FIXED_CATS_SEQ.has(c.category)) || active[0] || null;
+
       sequenceByArea[area.id] = {
         primary,
         allActive: active,
