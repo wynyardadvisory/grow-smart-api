@@ -136,8 +136,8 @@ async function runPriceIngestion() {
     console.log(`[PriceIngestion] Fetching catalog: ${retailer}`);
     const catalog = await fetchCatalog(retailer);
 
-    // catalog is an object keyed by product URL — iterate values
-    const products = Object.values(catalog);
+    // Pepesto wraps products under parsed_products key
+    const products = Object.values(catalog.parsed_products || catalog || {});
     console.log(`[PriceIngestion] ${retailer}: ${products.length} products in catalog`);
 
     for (const product of products) {
