@@ -1042,6 +1042,60 @@ app.get("/crops", requireAuth, async (req, res) => {
   res.json(data);
 });
 
+// GET /crops/history?location_id=xxx
+// Returns the most recent harvested crop_instance per area for a location.
+// Used by AreaTimelineBlock to show "Last season" in the area detail sheet.
+// Only harvested crops with harvested_at are included.
+app.get("/crops/history", requireAuth, async (req, res) => {
+  try {
+    const { location_id } = req.query;
+    if (!location_id) return res.status(400).json({ error: "location_id required" });
+
+    // Verify location belongs to user
+    const { data: loc } = await req.db
+      .from("locations").select("id").eq("id", location_id).eq("user_id", req.user.id).single();
+    if (!loc) return res.status(403).json({ error: "Location not found" });
+
+    // Get all area IDs for this location
+    const { data: areas } = await req.db
+      .from("growing_areas").select("id").eq("location_id", location_id);
+    if (!areas?.length) return res.json([]);
+
+    const areaIds = areas.map(a => a.id);
+
+    // Fetch all harvested crops for these areas — one per area (most recent)
+    const { data: crops, error } = await supabaseService
+      .from("crop_instances")
+      .select("id, area_id, name, status, harvested_at, crop_def_id, variety_id, crop_definitions(name, category)")
+      .eq("user_id", req.user.id)
+      .in("area_id", areaIds)
+      .eq("status", "harvested")
+      .not("harvested_at", "is", null)
+      .order("harvested_at", { ascending: false });
+
+    if (error) throw error;
+
+    // Deduplicate — keep only the most recent per area
+    const byArea = {};
+    for (const c of (crops || [])) {
+      if (!byArea[c.area_id]) {
+        byArea[c.area_id] = {
+          id:           c.id,
+          area_id:      c.area_id,
+          name:         c.crop_definitions?.name || c.name,
+          category:     c.crop_definitions?.category || null,
+          harvested_at: c.harvested_at,
+        };
+      }
+    }
+
+    res.json(Object.values(byArea));
+  } catch (err) {
+    captureError("CropsHistory", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/crops/:id", requireAuth, async (req, res) => {
   const { data, error } = await req.db.from("crop_instances")
     .select("*, area:area_id(*), crop_def:crop_def_id(*), variety:variety_id(*), tasks(*)")
