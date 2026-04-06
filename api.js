@@ -5981,8 +5981,32 @@ function _displayName(cropDef, varietyMap) {
 }
 
 // ── Build baseline — same crops, rotated within same area group ────────────────
-function _buildBaseline({ areas, activeCropsByArea, sequenceByArea, cropDefs, varietyMap }) {
+function _buildBaseline({ areas, activeCropsByArea, sequenceByArea, cropDefs, varietyMap, historyByArea = {}, planYear = null }) {
   const FIXED_CATEGORIES = new Set(["fruit","perennial"]);
+
+  // Reference year for 3-year history: the year being planned for (next season)
+  const refYear = planYear || (new Date().getFullYear() + 1);
+
+  // History penalty: how badly we want to avoid repeating a category in a bed
+  // that had that same category N years before the planned season.
+  // year-1 = most recent = strongest penalty; falls off over 3 years.
+  const HISTORY_PENALTIES = { 1: -12, 2: -6, 3: -3 };
+
+  function _historyPenalty(bedId, slotCategory) {
+    if (!slotCategory) return 0;
+    const history = historyByArea[bedId] || [];
+    let penalty = 0;
+    for (const h of history) {
+      if (h.category !== slotCategory) continue;
+      const yearsAgo = refYear - h.year;
+      if (yearsAgo >= 1 && yearsAgo <= 3) {
+        // Take the worst (most negative) penalty if multiple entries match the same distance
+        const p = HISTORY_PENALTIES[yearsAgo] || 0;
+        if (p < penalty) penalty = p;
+      }
+    }
+    return penalty;
+  }
 
   const assignments = [];
 
@@ -6077,10 +6101,12 @@ function _buildBaseline({ areas, activeCropsByArea, sequenceByArea, cropDefs, va
 
       return slots.map((slot, si) => {
         if (!slot.primary) return 1;
-        const sameBed    = slot.sourceAreaId === bed.id ? -20 : 0;
-        const catPenalty = slot.category === curCat      ? -10 : 0;
-        const rotBonus   = (ROTATION_NEXT[curCat] || []).indexOf(slot.category) >= 0 ? 6 : 0;
-        return 5 + sameBed + catPenalty + rotBonus;
+        const sameBed      = slot.sourceAreaId === bed.id ? -20 : 0;
+        const catPenalty   = slot.category === curCat      ? -10 : 0;
+        const rotBonus     = (ROTATION_NEXT[curCat] || []).indexOf(slot.category) >= 0 ? 6 : 0;
+        // 3-year history: penalise repeating the same category in the destination bed
+        const histPenalty  = _historyPenalty(bed.id, slot.category);
+        return 5 + sameBed + catPenalty + rotBonus + histPenalty;
       });
     });
 
@@ -7195,9 +7221,38 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
     // ── User crop names set (for gap-fill preference) ─────────────────────────
     const userCropNames = new Set(cropRows.map(c => c.crop_definitions?.name || c.name).filter(Boolean));
 
+    // ── Build 3-year rotation history per bed ────────────────────────────────
+    // Query harvested crop_instances for this user's areas within the last 3 seasons.
+    // Used to penalise repeating the same crop category in the same bed.
+    const planYear      = new Date().getFullYear() + 1;
+    const historyFromYr = planYear - 3;
+
+    const { data: historyRows } = await supabaseService
+      .from("crop_instances")
+      .select("area_id, harvested_at, crop_definitions(category)")
+      .eq("user_id", req.user.id)
+      .in("area_id", areaIds)
+      .not("harvested_at", "is", null)
+      .gte("harvested_at", `${historyFromYr}-01-01`);
+
+    // Build historyByArea: area_id -> [{ category, year }] deduplicated by area+year+category
+    const historyByArea = {};
+    const _histSeen     = new Set();
+    for (const row of (historyRows || [])) {
+      const category = row.crop_definitions?.category;
+      if (!category || !row.area_id || !row.harvested_at) continue;
+      const year = new Date(row.harvested_at).getFullYear();
+      const key  = `${row.area_id}:${year}:${category}`;
+      if (_histSeen.has(key)) continue;
+      _histSeen.add(key);
+      if (!historyByArea[row.area_id]) historyByArea[row.area_id] = [];
+      historyByArea[row.area_id].push({ category, year });
+    }
+
     // ── Build baseline ────────────────────────────────────────────────────────
     const baselineAssignments = _buildBaseline({
       areas, activeCropsByArea, sequenceByArea, cropDefs: cropDefs || [], varietyMap,
+      historyByArea, planYear,
     });
 
     // ── Helper: score and resolve metrics for an assignment list ──────────────
