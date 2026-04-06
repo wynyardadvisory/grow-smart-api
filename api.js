@@ -6158,6 +6158,74 @@ function _buildExplanation(archetypeGoal, metrics, vsBaseline) {
   return "Tailored to your garden.";
 }
 
+// ── Diff helper — compare option assignments against baseline ─────────────────
+const REASON_TAGS = {
+  "rotate_mine":    { crop_swap: "better_rotation",  sequence_adjustment: "better_rotation"  },
+  "max_yield":      { crop_swap: "higher_yield",      sequence_adjustment: "better_space_use" },
+  "easy":           { crop_swap: "lower_effort",      sequence_adjustment: "simpler_layout"   },
+  "best_rotation":  { crop_swap: "healthier_soil",    sequence_adjustment: "better_rotation"  },
+  "balanced":       { crop_swap: "better_balance",    sequence_adjustment: "maintains_rotation"},
+  "favourites":     { crop_swap: "keeps_favourites",  sequence_adjustment: "preference_match" },
+};
+const REASON_TEXT = {
+  higher_yield:       "Higher yield in this bed",
+  better_space_use:   "Better use of growing space",
+  lower_effort:       "Lower maintenance crop",
+  simpler_layout:     "Simpler follow-on crop",
+  better_rotation:    "Improves crop rotation",
+  healthier_soil:     "Better for soil health",
+  better_balance:     "Improves overall balance",
+  maintains_rotation: "Keeps rotation on track",
+  keeps_favourites:   "Matches your preferences",
+  preference_match:   "Matches your preferences",
+};
+
+function _diffFromBaseline(optionAssignments, baselineAssignments, planGoal) {
+  const reasonMap = REASON_TAGS[planGoal] || REASON_TAGS["balanced"];
+  const changes   = [];
+
+  // Build baseline lookup by area_id
+  const baselineByArea = {};
+  for (const a of baselineAssignments) baselineByArea[a.area_id] = a;
+
+  for (const a of optionAssignments) {
+    const base = baselineByArea[a.area_id];
+    if (!base) continue; // new area, skip
+
+    // Normalise crop name for comparison — strip parentheticals and variety suffixes
+    const normBase   = (base.crop_name   || "").replace(/\s*\(.*?\)/g,"").replace(/\s*→.*/,"").trim().toLowerCase();
+    const normOption = (a.crop_name      || "").replace(/\s*\(.*?\)/g,"").replace(/\s*→.*/,"").trim().toLowerCase();
+
+    if (normBase === normOption) continue; // no change
+
+    // Determine change type
+    const hasSequence = (a.crop_name || "").includes("→") || (base.crop_name || "").includes("→");
+    const changeType  = hasSequence ? "sequence_adjustment" : "crop_swap";
+    const tag         = reasonMap[changeType] || "better_balance";
+
+    changes.push({
+      area_id:    a.area_id,
+      area_name:  a.area_name,
+      change_type: changeType,
+      from_label: base.crop_name   || base.category  || "—",
+      to_label:   a.crop_name      || a.category     || "—",
+      reason_tag:  tag,
+      reason_text: REASON_TEXT[tag] || "Adjusted for your goal",
+    });
+  }
+
+  const changeCount = changes.length;
+  const goalLabel   = planGoal === "max_yield" ? "more food" :
+                      planGoal === "easy"       ? "less work" :
+                      planGoal === "best_rotation" ? "healthier soil" : "better balance";
+
+  const changeSummary = changeCount === 0 ? "No layout changes — keeps your rotated baseline" :
+                        changeCount === 1 ? `Changes 1 area for ${goalLabel}` :
+                        `Changes ${changeCount} areas for ${goalLabel}`;
+
+  return { changes, change_count: changeCount, change_summary: changeSummary };
+}
+
 function _recommendPlan(scoredOptions) {
   const balanced = scoredOptions.find(o => o.id==="balanced");
   const maxYield = scoredOptions.find(o => o.id==="max_harvest");
@@ -6811,6 +6879,9 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
     const currentMonth = new Date().getMonth()+1;
     const currentYear  = new Date().getFullYear();
 
+    // Use balanced plan assignments as the diff baseline — options are variations of it
+    const diffBaseline = enrichedOptions[0]?.assignments || baselineAssignments;
+
     const scoredOptions = await Promise.all(enrichedOptions.map(async (option, oi) => {
       const asgn    = option.assignments || [];
       const effort   = _calcEffortLevel(asgn);
@@ -6853,12 +6924,18 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
         rotation_change:  rotation.index>60?"better":"same",
       };
 
+      // Diff this option against the balanced baseline
+      const diff = _diffFromBaseline(asgn, oi === 0 ? baselineAssignments : diffBaseline, option.goal);
+
       return {
         ...option,
         metrics,
         comparison_vs_baseline: vsBaseline,
         summary: explanations[oi] || _buildExplanation(option.goal, metrics, vsBaseline),
         value_note: _getValueNote(metrics),
+        changes:        diff.changes,
+        change_count:   diff.change_count,
+        change_summary: diff.change_summary,
         value_basis: valueBasis ? {
           pricing_region:  "GB",
           month_key:       valueBasis.month_key,
