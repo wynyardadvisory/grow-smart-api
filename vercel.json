@@ -18,7 +18,6 @@
     { "path": "/cron/waitlist-nudges-2",  "schedule": "0 8 * * *"  },
     { "path": "/cron/waitlist-nudges-3",  "schedule": "0 8 * * *"  },
     { "path": "/cron/reengagement",       "schedule": "0 9 * * *"  },
-    { "path": "/cron/weekly-digest",      "schedule": "0 8 * * 0"  },
-    { "path": "/cron/price-ingestion",    "schedule": "0 5 * * 1"  }
+    { "path": "/cron/weekly-digest",      "schedule": "0 8 * * 0"  }
   ]
 }

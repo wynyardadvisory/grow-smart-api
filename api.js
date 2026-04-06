@@ -5474,18 +5474,9 @@ app.post("/cron/weekly-digest", async (req, res) => {
 // =============================================================================
 // CRON — called by Vercel Cron at 06:00 UTC daily
 // Protected by CRON_SECRET header.
-// POST /cron/price-ingestion — weekly Pepesto price refresh
-// Schedule in vercel.json: { "path": "/cron/price-ingestion", "schedule": "0 5 * * 1" }
+// POST /cron/price-ingestion — disabled, prices managed via static seed in produce_price_aggregates
 app.post("/cron/price-ingestion", async (req, res) => {
-  const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET ||
-                   req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
-  if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-  res.json({ ok: true, status: "processing" });
-  try {
-    const { runPriceIngestion } = require("./price-ingestion");
-    const result = await runPriceIngestion();
-    console.log("[PriceIngestion] Complete:", result);
-  } catch(e) { console.error("[PriceIngestion] Error:", e.message); }
+  return res.json({ ok: true, status: "disabled — using static price table" });
 });
 
 // Configure in vercel.json: { "crons": [{ "path": "/cron/daily", "schedule": "0 6 * * *" }] }
