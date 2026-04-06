@@ -5941,6 +5941,389 @@ app.delete("/plans/:id/assignments/:assignmentId", requireAuth, async (req, res)
   } catch (err) { captureError("DeletePlanAssignment", err); res.status(500).json({ error: err.message }); }
 });
 
+// ── Plan Engine helpers ──────────────────────────────────────────────────────
+// ── Popular UK crops by category — used when user has no suitable gap crop ─────
+const POPULAR_BY_CATEGORY = {
+  root:     ["Carrot","Parsnip","Beetroot","Radish"],
+  brassica: ["Kale","Cabbage","Broccoli","Cauliflower"],
+  allium:   ["Onion","Leek","Spring Onion","Garlic"],
+  legume:   ["Pea","Broad Bean","French Bean","Runner Bean"],
+  fruiting: ["Tomato","Courgette","Pepper","Cucumber"],
+  salad:    ["Lettuce","Spinach","Rocket","Mixed Salad Leaves"],
+};
+
+const ROTATION_NEXT = {
+  brassica: ["legume","root","allium","fruiting"],
+  fruiting: ["legume","brassica","root","allium"],
+  root:     ["legume","allium","fruiting","brassica"],
+  allium:   ["legume","fruiting","root","brassica"],
+  legume:   ["brassica","fruiting","root","allium"],
+  salad:    ["legume","root","allium","fruiting"],
+};
+
+const YIELD_SCORE = { fruiting:9, brassica:7, root:7, legume:6, allium:5, salad:5, herb:3, flower:1, fruit:4, perennial:2 };
+const EASE_SCORE  = { salad:9, herb:8, legume:8, allium:7, root:6, brassica:5, fruiting:5, flower:7, fruit:5, perennial:6 };
+
+// ── Area type grouping ─────────────────────────────────────────────────────────
+function _areaGroup(area) {
+  if (area.type === "container")                              return "container";
+  if (area.type === "greenhouse" || area.type === "polytunnel") return "protected";
+  if (area.type === "open_ground")                            return "open_ground";
+  return "raised_bed";
+}
+
+// ── Build display name with variety ───────────────────────────────────────────
+function _displayName(cropDef, varietyMap) {
+  if (!cropDef) return null;
+  const vars   = varietyMap[cropDef.id] || [];
+  const defVar = vars.find(v => v.is_default) || vars[0] || null;
+  return defVar ? `${cropDef.name} (${defVar.name})` : cropDef.name;
+}
+
+// ── Build baseline — same crops, rotated within same area group ────────────────
+function _buildBaseline({ areas, activeCropsByArea, sequenceByArea, cropDefs, varietyMap }) {
+  const FIXED_CATEGORIES    = new Set(["fruit","perennial"]);
+  const INVASIVE_CATEGORIES = new Set(["herb","flower","perennial","fruit"]);
+
+  // Group areas by type — only rotate within same group
+  const groups = {};
+  for (const area of areas) {
+    const g = _areaGroup(area);
+    if (!groups[g]) groups[g] = [];
+    groups[g].push(area);
+  }
+
+  const assignments = [];
+
+  for (const [groupName, groupAreas] of Object.entries(groups)) {
+
+    // Container — keep exactly as-is, never rotate
+    if (groupName === "container") {
+      for (const area of groupAreas) {
+        const crops   = activeCropsByArea[area.id] || [];
+        const display = crops.filter(c => !FIXED_CATEGORIES.has(c.category))
+                             .map(c => c.name).join(" + ") || "As current";
+        assignments.push({
+          area_id:            area.id,
+          area_name:          area.name,
+          area_type:          area.type,
+          area_group:         groupName,
+          category:           crops[0]?.category || "herb",
+          crop_definition_id: crops[0]?.crop_def_id || null,
+          crop_name:          display,
+          locked:             true,
+          is_fixed:           false,
+        });
+      }
+      continue;
+    }
+
+    // Fixed areas (perennials/trees) — never moved
+    const fixedAreas    = groupAreas.filter(a => {
+      const crops = activeCropsByArea[a.id] || [];
+      return crops.length > 0 && crops.every(c => FIXED_CATEGORIES.has(c.category));
+    });
+    const rotatableAreas = groupAreas.filter(a => !fixedAreas.includes(a));
+
+    for (const area of fixedAreas) {
+      const crops   = activeCropsByArea[area.id] || [];
+      const primary = crops[0];
+      if (!primary) continue;
+      assignments.push({
+        area_id:            area.id,
+        area_name:          area.name,
+        area_type:          area.type,
+        area_group:         groupName,
+        category:           primary.category,
+        crop_definition_id: primary.crop_def_id || null,
+        crop_name:          primary.name,
+        locked:             true,
+        is_fixed:           true,
+      });
+    }
+
+    // Locked beds — existing planned succession sequences
+    const lockedIds = new Set();
+    for (const area of rotatableAreas) {
+      const seq = sequenceByArea[area.id];
+      if (seq && seq.primary && seq.followOns && seq.followOns.length > 0) {
+        lockedIds.add(area.id);
+        const primary     = seq.primary;
+        const followLabel = seq.followOns.map(f => f.name).join(" + ");
+        const cropDef     = cropDefs.find(d => d.id === primary.crop_def_id || d.name === primary.name);
+        assignments.push({
+          area_id:              area.id,
+          area_name:            area.name,
+          area_type:            area.type,
+          area_group:           groupName,
+          category:             primary.category,
+          crop_definition_id:   cropDef?.id || null,
+          crop_name:            `${primary.name} → then ${followLabel}`,
+          harvest_month_start:  cropDef?.harvest_month_start || null,
+          harvest_month_end:    cropDef?.harvest_month_end   || null,
+          locked:               true,
+          is_fixed:             false,
+        });
+      }
+    }
+
+    // Free beds — rotate crops within the group
+    const freeBeds = rotatableAreas.filter(a => !lockedIds.has(a.id));
+
+    // Build crop pool from all free beds in this group
+    const cropPool  = [];
+    const seenNames = new Set();
+    for (const area of freeBeds) {
+      const crops = activeCropsByArea[area.id] || [];
+      for (const c of crops) {
+        if (FIXED_CATEGORIES.has(c.category))    continue;
+        if (INVASIVE_CATEGORIES.has(c.category)) continue;
+        if (seenNames.has(c.name))               continue;
+        seenNames.add(c.name);
+        cropPool.push({ ...c, source_area_id: area.id });
+      }
+    }
+
+    // Current category per free bed
+    const curCatByArea = {};
+    for (const area of freeBeds) {
+      const crops = activeCropsByArea[area.id] || [];
+      const cats  = crops.map(c => c.category).filter(c => c && !FIXED_CATEGORIES.has(c));
+      if (cats.length) {
+        const counts = {};
+        cats.forEach(c => counts[c] = (counts[c]||0)+1);
+        curCatByArea[area.id] = Object.entries(counts).sort((a,b)=>b[1]-a[1])[0][0];
+      }
+    }
+
+    // Assign — rotate away from current category, no duplicate crop names
+    const usedCropNames  = new Set();
+    const usedCategories = new Set();
+
+    for (const area of freeBeds) {
+      const curCat = curCatByArea[area.id];
+
+      const scored = cropPool
+        .filter(c => !usedCropNames.has(c.name))
+        .map(c => {
+          const catPenalty  = c.category === curCat ? -8 : 0;
+          const divPenalty  = usedCategories.has(c.category) ? -5 : 0;
+          const rotBonus    = (ROTATION_NEXT[curCat]||[]).indexOf(c.category) >= 0 ? 6 : 0;
+          return { crop: c, score: 5 + catPenalty + divPenalty + rotBonus };
+        })
+        .sort((a,b) => b.score - a.score);
+
+      const best = scored[0];
+      if (!best) {
+        assignments.push({
+          area_id:    area.id,
+          area_name:  area.name,
+          area_type:  area.type,
+          area_group: groupName,
+          category:   curCat || "root",
+          crop_definition_id: null,
+          crop_name:  "To be decided",
+          locked:     false,
+          is_fixed:   false,
+          _empty:     true,
+        });
+        continue;
+      }
+
+      usedCropNames.add(best.crop.name);
+      usedCategories.add(best.crop.category);
+
+      const cropDef = cropDefs.find(d => d.id === best.crop.crop_def_id || d.name === best.crop.name);
+      const display = _displayName(cropDef, varietyMap) || best.crop.name;
+
+      assignments.push({
+        area_id:              area.id,
+        area_name:            area.name,
+        area_type:            area.type,
+        area_group:           groupName,
+        category:             best.crop.category,
+        crop_definition_id:   cropDef?.id || null,
+        crop_name:            display,
+        harvest_month_start:  cropDef?.harvest_month_start || null,
+        harvest_month_end:    cropDef?.harvest_month_end   || null,
+        locked:               false,
+        is_fixed:             false,
+      });
+    }
+  }
+
+  return assignments;
+}
+
+// ── Gap finder ─────────────────────────────────────────────────────────────────
+function _findGaps(baselineAssignments, sequenceByArea) {
+  const gaps = [];
+  for (const a of baselineAssignments) {
+    if (a.locked || a.is_fixed || a._empty) continue;
+    if (a.area_group === "container")       continue;
+    const harvestEnd = a.harvest_month_end;
+    if (!harvestEnd) continue;
+    const seq     = sequenceByArea[a.area_id];
+    const nextSow = seq?.followOns?.[0]?.sow_month || null;
+    const gapStart = harvestEnd > 12 ? 1 : harvestEnd + 1;
+    const gapEnd   = nextSow ? nextSow - 1 : 3;
+    if (gapEnd >= gapStart && (gapEnd - gapStart) >= 1) {
+      gaps.push({
+        area_id:          a.area_id,
+        area_name:        a.area_name,
+        area_type:        a.area_type,
+        area_group:       a.area_group,
+        gap_start_month:  gapStart,
+        gap_end_month:    gapEnd,
+        after_crop:       a.crop_name,
+        current_category: a.category,
+      });
+    }
+  }
+  return gaps;
+}
+
+// ── Pick a gap-fill crop ───────────────────────────────────────────────────────
+function _pickGapCrop(gap, cropDefs, userCropNames, usedGapNames, usedGapCategories) {
+  const eligible = cropDefs.filter(d => {
+    if (!d.harvest_month_start || !d.harvest_month_end) return false;
+    if (d.harvest_month_start < gap.gap_start_month)   return false;
+    if (d.harvest_month_end   > gap.gap_end_month)     return false;
+    if (usedGapNames.has(d.name))                      return false;
+    if (usedGapCategories.has(d.category))             return false;
+    if (d.category === gap.current_category)           return false;
+    return true;
+  });
+  if (!eligible.length) return null;
+  const fromUser = eligible.filter(d => userCropNames.has(d.name));
+  if (fromUser.length) return fromUser[0];
+  for (const names of Object.values(POPULAR_BY_CATEGORY)) {
+    for (const name of names) {
+      const found = eligible.find(d => d.name === name);
+      if (found) return found;
+    }
+  }
+  return eligible[0];
+}
+
+// ── Generate targeted improvements ────────────────────────────────────────────
+function _generateImprovements({ baselineAssignments, cropDefs, varietyMap, userCropNames, preference, improveCount }) {
+  if (!improveCount || improveCount < 1) return [];
+
+  const candidates = baselineAssignments.filter(a =>
+    !a.locked && !a.is_fixed && !a._empty && a.area_group !== "container"
+  );
+  if (!candidates.length) return [];
+
+  const scored = candidates.map(a => {
+    const s = preference === "yield" ? (YIELD_SCORE[a.category]||5)
+            : preference === "easy"  ? (EASE_SCORE[a.category]||5)
+            : (YIELD_SCORE[a.category]||5) * 0.5 + (EASE_SCORE[a.category]||5) * 0.5;
+    return { a, currentScore: s };
+  }).sort((a,b) => a.currentScore - b.currentScore);
+
+  const improvements     = [];
+  const usedCategories   = new Set(baselineAssignments.map(a => a.category));
+  const usedCropNames    = new Set(baselineAssignments.map(a => (a.crop_name||"").split(" (")[0].trim()));
+
+  for (const { a } of scored) {
+    if (improvements.length >= improveCount) break;
+
+    const targetCats = preference === "yield"
+      ? ["fruiting","root","brassica","legume","allium","salad"]
+      : preference === "easy"
+      ? ["salad","legume","allium","root","brassica","fruiting"]
+      : ["legume","root","allium","brassica","fruiting","salad"];
+
+    let bestDef = null;
+    for (const targetCat of targetCats) {
+      if (targetCat === a.category)       continue;
+      if (usedCategories.has(targetCat))  continue;
+
+      // Prefer user's crops
+      const userCrop = cropDefs.find(d =>
+        d.category === targetCat &&
+        userCropNames.has(d.name) &&
+        !usedCropNames.has(d.name)
+      );
+      if (userCrop) { bestDef = userCrop; break; }
+
+      // Popular crops
+      for (const name of (POPULAR_BY_CATEGORY[targetCat]||[])) {
+        const found = cropDefs.find(d => d.name === name && !usedCropNames.has(d.name));
+        if (found) { bestDef = found; break; }
+      }
+      if (bestDef) break;
+    }
+
+    if (!bestDef) continue;
+
+    const display = _displayName(bestDef, varietyMap) || bestDef.name;
+
+    // Reason string
+    let reason;
+    if (preference === "yield") {
+      const gain = (YIELD_SCORE[bestDef.category]||5) - (YIELD_SCORE[a.category]||5);
+      reason = gain > 0
+        ? `Higher yield — roughly ${gain * 12}% more food from this bed`
+        : "Better use of this growing space";
+    } else if (preference === "easy") {
+      const easierBy = (EASE_SCORE[bestDef.category]||5) - (EASE_SCORE[a.category]||5);
+      reason = easierBy > 0
+        ? `Easier to manage — less work than ${a.category}`
+        : "Lower effort crop for this bed";
+    } else {
+      reason = "Improves rotation and overall garden balance";
+    }
+
+    usedCategories.add(bestDef.category);
+    usedCropNames.add(bestDef.name);
+
+    improvements.push({
+      area_id:            a.area_id,
+      area_name:          a.area_name,
+      from_crop:          a.crop_name,
+      from_category:      a.category,
+      to_crop:            display,
+      to_category:        bestDef.category,
+      crop_definition_id: bestDef.id,
+      harvest_month_start: bestDef.harvest_month_start || null,
+      harvest_month_end:   bestDef.harvest_month_end   || null,
+      reason,
+    });
+  }
+
+  return improvements;
+}
+
+// ── Build passive tip ──────────────────────────────────────────────────────────
+function _buildTip(baselineAssignments, cropDefs, varietyMap) {
+  const candidates = baselineAssignments.filter(a =>
+    !a.locked && !a.is_fixed && !a._empty && a.area_group !== "container"
+  );
+  if (!candidates.length) return null;
+
+  const usedCats  = new Set(baselineAssignments.map(a => a.category));
+  const usedNames = new Set(baselineAssignments.map(a => (a.crop_name||"").split(" (")[0].trim()));
+
+  const worst = [...candidates].sort((a,b) =>
+    (YIELD_SCORE[a.category]||5) - (YIELD_SCORE[b.category]||5)
+  )[0];
+
+  for (const cat of ["fruiting","root","brassica","legume"]) {
+    if (cat === worst.category || usedCats.has(cat)) continue;
+    const def = cropDefs.find(d => d.category === cat && !usedNames.has(d.name));
+    if (!def) continue;
+    const display = _displayName(def, varietyMap) || def.name;
+    const gain    = ((YIELD_SCORE[cat]||5) - (YIELD_SCORE[worst.category]||5)) * 12;
+    if (gain > 0) {
+      return `Swapping ${worst.area_name} to ${display} could increase yield by around ${gain}%.`;
+    }
+  }
+  return null;
+}
+
+
 // ── Plan Generation ───────────────────────────────────────────────────────────
 // POST /plans/generate
 // Core principle: DEFAULT = rotate current crops, not invent a new garden.
@@ -6007,18 +6390,6 @@ const ROTATION_PREFER_AFTER = {
   legume:   ["brassica", "fruiting", "root", "allium"],
   salad:    ["legume", "root"],
 };
-
-const ROTATION_NEXT = {
-  brassica: ["legume", "root", "salad", "allium", "fruiting"],
-  fruiting: ["legume", "brassica", "root", "salad", "allium"],
-  root:     ["legume", "salad", "allium", "fruiting", "brassica"],
-  allium:   ["legume", "fruiting", "root", "salad", "brassica"],
-  legume:   ["brassica", "fruiting", "root", "allium", "salad"],
-  salad:    ["legume", "root", "allium", "fruiting", "brassica"],
-};
-
-const YIELD_SCORE = { fruiting:9, brassica:7, root:7, legume:6, allium:5, salad:5, herb:3, flower:1, fruit:4, perennial:2 };
-const EASE_SCORE  = { salad:9, herb:8, legume:8, allium:7, root:6, brassica:5, fruiting:5, flower:7, fruit:5, perennial:6 };
 
 function _scoreRotation(curCat, nextCat) {
   if (!curCat) return 5;
