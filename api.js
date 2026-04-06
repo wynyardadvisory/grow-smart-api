@@ -7337,6 +7337,102 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
   }
 });
 
+// ── Area Plan Assignments ─────────────────────────────────────────────────────
+// Locked future crop assignments per bed per year.
+// Status: draft → locked → ready → active → completed | cancelled | replaced
+
+// GET /area-plan-assignments?location_id=xxx
+app.get("/area-plan-assignments", requireAuth, async (req, res) => {
+  try {
+    const { location_id } = req.query;
+    if (!location_id) return res.status(400).json({ error: "location_id required" });
+    const { data: areas } = await req.db
+      .from("growing_areas").select("id").eq("location_id", location_id);
+    if (!areas?.length) return res.json([]);
+    const areaIds = areas.map(a => a.id);
+    const { data, error } = await supabaseService
+      .from("area_plan_assignments")
+      .select("*, crop_definitions(name, category)")
+      .eq("user_id", req.user.id)
+      .in("area_id", areaIds)
+      .in("status", ["locked","ready","active"])
+      .order("planned_year", { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) { captureError("GetAreaPlanAssignments", err); res.status(500).json({ error: err.message }); }
+});
+
+// POST /area-plan-assignments/commit
+// Commits plan assignments as locked for next growing year.
+// Body: { location_id, assignments: [{ area_id, crop_def_id, crop_name, category }], planned_year? }
+app.post("/area-plan-assignments/commit", requireAuth, async (req, res) => {
+  try {
+    const { location_id, assignments, planned_year } = req.body;
+    if (!location_id || !assignments?.length) return res.status(400).json({ error: "location_id and assignments required" });
+    const year = planned_year || new Date().getFullYear() + 1;
+    const { data: loc } = await req.db
+      .from("locations").select("id").eq("id", location_id).eq("user_id", req.user.id).single();
+    if (!loc) return res.status(403).json({ error: "Location not found" });
+    // Mark any existing draft/locked/ready for these areas+year as replaced
+    const areaIds = assignments.map(a => a.area_id);
+    await supabaseService
+      .from("area_plan_assignments")
+      .update({ status: "replaced", updated_at: new Date().toISOString() })
+      .eq("user_id", req.user.id)
+      .in("area_id", areaIds)
+      .eq("planned_year", year)
+      .in("status", ["draft","locked","ready"]);
+    // Insert new locked rows
+    const rows = assignments.filter(a => a.area_id && a.crop_name).map(a => ({
+      user_id:      req.user.id,
+      area_id:      a.area_id,
+      crop_def_id:  a.crop_def_id || null,
+      crop_name:    a.crop_name,
+      category:     a.category || null,
+      planned_year: year,
+      status:       "locked",
+      source:       "plan_flow",
+      locked_at:    new Date().toISOString(),
+    }));
+    const { data, error } = await supabaseService
+      .from("area_plan_assignments").insert(rows).select();
+    if (error) throw error;
+    res.json({ ok: true, committed: data.length, year, assignments: data });
+  } catch (err) { captureError("CommitAreaPlanAssignments", err); res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /area-plan-assignments/:id  — update status
+app.patch("/area-plan-assignments/:id", requireAuth, async (req, res) => {
+  try {
+    const { status, notes } = req.body;
+    const valid = ["draft","locked","ready","active","completed","cancelled","replaced"];
+    if (status && !valid.includes(status)) return res.status(400).json({ error: "Invalid status" });
+    const updates = { updated_at: new Date().toISOString() };
+    if (status) updates.status = status;
+    if (notes)  updates.notes  = notes;
+    if (status === "active")    updates.activated_at  = new Date().toISOString();
+    if (status === "completed") updates.completed_at  = new Date().toISOString();
+    const { data, error } = await supabaseService
+      .from("area_plan_assignments")
+      .update(updates).eq("id", req.params.id).eq("user_id", req.user.id)
+      .select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) { captureError("PatchAreaPlanAssignment", err); res.status(500).json({ error: err.message }); }
+});
+
+// DELETE /area-plan-assignments/:id  (soft delete)
+app.delete("/area-plan-assignments/:id", requireAuth, async (req, res) => {
+  try {
+    const { error } = await supabaseService
+      .from("area_plan_assignments")
+      .update({ status: "cancelled", updated_at: new Date().toISOString() })
+      .eq("id", req.params.id).eq("user_id", req.user.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (err) { captureError("DeleteAreaPlanAssignment", err); res.status(500).json({ error: err.message }); }
+});
+
 // ── Sentry error handler — must be before any other error middleware ──────────
 Sentry.setupExpressErrorHandler(app);
 
