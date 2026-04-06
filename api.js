@@ -6049,7 +6049,11 @@ function _buildBaseline({ areas, activeCropsByArea, sequenceByArea, cropDefs, va
 
       const followOns   = seq.followOns || [];
       const cropDef     = cropDefs.find(d => d.id === primary.crop_def_id);
-      const baseName    = _displayName(cropDef, varietyMap) || primary.name;
+      // Use variety from the instance itself — not varietyMap default — to preserve distinct varieties
+      const instanceVariety = primary.variety_name || null;
+      const baseName    = instanceVariety
+        ? `${primary.name} (${instanceVariety})`
+        : (_displayName(cropDef, varietyMap) || primary.name);
       const followLabel = followOns.length ? followOns.map(f => f.name).join(" + ") : null;
 
       return {
@@ -6097,6 +6101,29 @@ function _buildBaseline({ areas, activeCropsByArea, sequenceByArea, cropDefs, va
       assignedBeds.add(bi);
       assignedSlots.add(si);
       if (assignedBeds.size === n) break;
+    }
+
+    // ── Force rotation: if any slot ended up in its source bed, swap it ──────
+    // This guarantees every crop moves, even when scoring produces no better option.
+    let swapAttempts = 0;
+    let madeSwap = true;
+    while (madeSwap && swapAttempts < n) {
+      madeSwap = false;
+      swapAttempts++;
+      for (let bi = 0; bi < n; bi++) {
+        const si = bedToSlot[bi];
+        if (si === null) continue;
+        const slot = slots[si];
+        if (!slot.primary) continue;
+        if (slot.sourceAreaId !== rotatableAreas[bi].id) continue;
+        // This slot is still in its source bed — swap with any neighbour
+        const swapTarget = (bi + 1) % n;
+        const swapSi = bedToSlot[swapTarget];
+        bedToSlot[bi]         = swapSi;
+        bedToSlot[swapTarget] = si;
+        madeSwap = true;
+        break;
+      }
     }
 
     // ── Emit assignments ──────────────────────────────────────────────────────
@@ -7065,7 +7092,7 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
     // ── Fetch crop instances ──────────────────────────────────────────────────
     const { data: allCrops } = await supabaseService
       .from("crop_instances")
-      .select("area_id, crop_def_id, name, active, status, sown_date, crop_definitions(name, category, harvest_month_start, harvest_month_end, sow_direct_start, sow_indoors_start)")
+      .select("area_id, crop_def_id, variety_id, name, active, status, sown_date, varieties(name), crop_definitions(name, category, harvest_month_start, harvest_month_end, sow_direct_start, sow_indoors_start)")
       .eq("user_id", req.user.id)
       .in("area_id", areaIds);
 
@@ -7081,6 +7108,8 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
       const entry    = {
         name, category,
         crop_def_id:         crop.crop_def_id,
+        variety_id:          crop.variety_id || null,
+        variety_name:        crop.varieties?.name || null,
         status:              crop.status,
         sown_date:           crop.sown_date,
         harvest_month_start: crop.crop_definitions?.harvest_month_start || null,
