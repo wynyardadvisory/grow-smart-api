@@ -1377,9 +1377,29 @@ class RuleEngine {
 
     const today = todayISO();
 
+    const MOISTURE_WINDOW_DAYS = 7;
+
     for (const [areaId, area] of areaMap.entries()) {
       const { crops: areaCrops, areaType, areaName, weather } = area;
       const rainMm = weather?.rain_mm ?? null;
+
+      // ── Soil moisture gate (if logged within 7 days) ───────────────────────
+      // Reads soil_moisture and soil_moisture_logged_at from the area record.
+      // wet  → suppress watering task entirely (soil is already moist)
+      // dry  → reduce DRY_DAY_THRESHOLD by 1 and force high urgency
+      // ok   → no change to current behaviour
+      // no reading or reading older than 7 days → fall through to normal logic
+      const firstCropArea = areaCrops[0]?.area;
+      const soilMoisture       = firstCropArea?.soil_moisture       || null;
+      const soilMoistureLoggedAt = firstCropArea?.soil_moisture_logged_at || null;
+      let moistureActive = false;
+      if (soilMoisture && soilMoistureLoggedAt) {
+        const daysSinceMoisture = Math.floor(
+          (Date.now() - new Date(soilMoistureLoggedAt).getTime()) / 86400000
+        );
+        moistureActive = daysSinceMoisture <= MOISTURE_WINDOW_DAYS;
+      }
+      if (moistureActive && soilMoisture === "wet") continue; // soil wet — skip watering
 
       // Suppress if it rained more than 5mm today
       if (rainMm !== null && rainMm >= 5) continue;
@@ -1397,7 +1417,11 @@ class RuleEngine {
         const stage = cropCtx?.stage || c.stage;
         return ["flowering", "fruiting", "harvesting"].includes(stage);
       });
-      const DRY_DAY_THRESHOLD = hasHighRiskCrop && BASE_THRESHOLD > 1 ? BASE_THRESHOLD - 1 : BASE_THRESHOLD;
+      // Apply soil moisture modifier — dry reading reduces threshold (water sooner)
+      const baseDryThreshold = hasHighRiskCrop && BASE_THRESHOLD > 1 ? BASE_THRESHOLD - 1 : BASE_THRESHOLD;
+      const DRY_DAY_THRESHOLD = (moistureActive && soilMoisture === "dry" && baseDryThreshold > 1)
+        ? baseDryThreshold - 1
+        : baseDryThreshold;
 
       // Find the most recent watering signal across all crops in this area.
       // Uses ctx.lastWateredAt which already applies tiered inheritance:
@@ -1433,7 +1457,10 @@ class RuleEngine {
       const atRiskText = atRiskCrops.length > 0 ? " — pay particular attention to: " + atRiskCrops.join(", ") : "";
 
       const daysText = daysSinceWatered !== null ? " (" + daysSinceWatered + " days since last watered)" : "";
-      const urgency = daysSinceWatered !== null && daysSinceWatered >= DRY_DAY_THRESHOLD + 2 ? "high" : "medium";
+      // Dry soil reading → always high urgency; otherwise escalate at threshold+2
+      const urgency = (moistureActive && soilMoisture === "dry")
+        ? "high"
+        : daysSinceWatered !== null && daysSinceWatered >= DRY_DAY_THRESHOLD + 2 ? "high" : "medium";
 
       // Use first crop in area for context (area_id, user_id)
       const refCrop = areaCrops[0];
@@ -1462,7 +1489,7 @@ class RuleEngine {
         rule_id:          "watering_due",
         source_key:       sourceKey({ u: userId, a: areaId, r: "watering_due", d: today }),
         date_confidence:  "exact",
-        meta:             JSON.stringify({ dry_days: daysSinceWatered, area_type: areaType }),
+        meta:             JSON.stringify({ dry_days: daysSinceWatered, area_type: areaType, soil_moisture: moistureActive ? soilMoisture : null }),
         risk_payload:     null,
       });
     }
@@ -1817,7 +1844,7 @@ class RuleEngine {
       .from("crop_instances")
       .select(`
         *,
-        area:area_id ( type, location_id, name, last_watered_at,
+        area:area_id ( type, location_id, name, last_watered_at, soil_moisture, soil_moisture_logged_at,
           location:location_id ( last_watered_at )
         ),
         crop_def:crop_def_id (

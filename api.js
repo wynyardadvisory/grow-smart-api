@@ -588,7 +588,7 @@ app.post("/areas", requireAuth,
 );
 
 app.put("/areas/:id", requireAuth, async (req, res) => {
-  const allowed = ["name","type","width_m","length_m","sun_exposure","notes","soil_ph","soil_temperature_c","layout_x","layout_y","rotation","shape_type"];
+  const allowed = ["name","type","width_m","length_m","sun_exposure","notes","soil_ph","soil_temperature_c","layout_x","layout_y","rotation","shape_type","soil_moisture"];
   const updates = Object.fromEntries(Object.entries(req.body).filter(([k]) => allowed.includes(k)));
   // Normalise numeric fields — empty string → null, validate ranges
   for (const field of ["width_m","length_m","soil_ph","soil_temperature_c"]) {
@@ -603,6 +603,18 @@ app.put("/areas/:id", requireAuth, async (req, res) => {
         if (field === "soil_temperature_c" && (n < -20 || n > 60)) return res.status(400).json({ error: "soil_temperature_c must be between -20 and 60" });
         updates[field] = n;
       }
+    }
+  }
+  // soil_moisture: validate enum, auto-stamp logged_at
+  if ("soil_moisture" in updates) {
+    const VALID = ["dry", "ok", "wet"];
+    if (updates.soil_moisture === "" || updates.soil_moisture == null) {
+      updates.soil_moisture = null;
+      updates.soil_moisture_logged_at = null;
+    } else if (!VALID.includes(updates.soil_moisture)) {
+      return res.status(400).json({ error: "soil_moisture must be dry, ok, or wet" });
+    } else {
+      updates.soil_moisture_logged_at = new Date().toISOString();
     }
   }
   const { data, error } = await req.db.from("growing_areas")
