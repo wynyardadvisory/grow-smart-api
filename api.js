@@ -1464,6 +1464,91 @@ app.post("/succession-groups/:id/sowings", requireAuth, async (req, res) => {
   res.status(201).json(sowing);
 });
 
+// POST /crops/:id/convert-to-succession — convert a standalone crop into a succession group
+app.post("/crops/:id/convert-to-succession", requireAuth, async (req, res) => {
+  const cropId = req.params.id;
+  const { target_sowings = 3, interval_days = 14 } = req.body;
+
+  // Fetch the existing crop — ownership check
+  const { data: crop, error: cropErr } = await supabaseService
+    .from("crop_instances")
+    .select("*")
+    .eq("id", cropId)
+    .eq("user_id", req.user.id)
+    .single();
+  if (cropErr || !crop) return res.status(404).json({ error: "Crop not found" });
+
+  // Already in a succession group — don't double-convert
+  if (crop.succession_group_id) {
+    return res.status(400).json({ error: "Crop is already part of a succession group" });
+  }
+
+  // Create the succession group
+  const { data: group, error: groupErr } = await supabaseService
+    .from("succession_groups")
+    .insert({
+      user_id:        req.user.id,
+      crop_name:      crop.name,
+      variety_name:   crop.variety    || null,
+      variety_id:     crop.variety_id  || null,
+      crop_def_id:    crop.crop_def_id || null,
+      area_id:        crop.area_id,
+      target_sowings: Number(target_sowings),
+      interval_days:  Number(interval_days),
+    })
+    .select()
+    .single();
+  if (groupErr || !group) return res.status(500).json({ error: groupErr?.message || "Failed to create group" });
+
+  // Update the existing crop to be sowing #1
+  const { error: updateErr } = await supabaseService
+    .from("crop_instances")
+    .update({ succession_group_id: group.id, succession_index: 1 })
+    .eq("id", cropId)
+    .eq("user_id", req.user.id);
+
+  if (updateErr) {
+    // Roll back the group
+    await supabaseService.from("succession_groups").delete().eq("id", group.id);
+    return res.status(500).json({ error: updateErr.message });
+  }
+
+  // Create planned follow-on sowings (indices 2 → target_sowings)
+  const baseDate = crop.sown_date ? new Date(crop.sown_date) : null;
+  const followOns = [];
+  for (let i = 2; i <= Math.max(2, Number(target_sowings)); i++) {
+    let plannedDate = null;
+    if (baseDate) {
+      const d = new Date(baseDate);
+      d.setDate(d.getDate() + (i - 1) * Number(interval_days));
+      plannedDate = d.toISOString().slice(0, 10);
+    }
+    followOns.push({
+      user_id:             req.user.id,
+      location_id:         crop.location_id || null,
+      area_id:             crop.area_id,
+      name:                crop.name,
+      variety:             crop.variety      || null,
+      variety_id:          crop.variety_id   || null,
+      crop_def_id:         crop.crop_def_id  || null,
+      status:              "planned",
+      sown_date:           plannedDate,
+      quantity:            1,
+      source:              "manual",
+      succession_group_id: group.id,
+      succession_index:    i,
+    });
+  }
+
+  if (followOns.length) {
+    const { error: sowErr } = await supabaseService.from("crop_instances").insert(followOns);
+    if (sowErr) console.error("[convert-to-succession] Follow-on insert error:", sowErr.message);
+  }
+
+  await runRuleEngine(req.user.id);
+  res.status(201).json({ group_id: group.id, message: "Converted successfully" });
+});
+
 // =============================================================================
 // TASKS
 // =============================================================================
