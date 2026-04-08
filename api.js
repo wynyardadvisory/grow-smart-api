@@ -551,6 +551,49 @@ app.delete("/locations/:id", requireAuth, async (req, res) => {
   res.status(204).send();
 });
 
+// PUT /locations/:id/area-order — save reordered area sort_order for a location
+app.put("/locations/:id/area-order", requireAuth, async (req, res) => {
+  const locId  = req.params.id;
+  const userId = req.user.id;
+  const { area_ids } = req.body; // ordered array of area UUIDs
+
+  if (!Array.isArray(area_ids) || area_ids.length === 0) {
+    return res.status(400).json({ error: "area_ids must be a non-empty array" });
+  }
+
+  // Verify this location belongs to the user
+  const { data: loc, error: locErr } = await supabaseService
+    .from("locations")
+    .select("id")
+    .eq("id", locId)
+    .eq("user_id", userId)
+    .single();
+  if (locErr || !loc) return res.status(403).json({ error: "Location not found" });
+
+  // Verify all supplied area IDs belong to this location
+  const { data: ownedAreas, error: areaErr } = await supabaseService
+    .from("growing_areas")
+    .select("id")
+    .eq("location_id", locId)
+    .in("id", area_ids);
+  if (areaErr) return res.status(500).json({ error: areaErr.message });
+
+  const ownedIds = new Set((ownedAreas || []).map(a => a.id));
+  if (area_ids.some(id => !ownedIds.has(id))) {
+    return res.status(400).json({ error: "One or more area_ids do not belong to this location" });
+  }
+
+  // Update sort_order sequentially (1-based) matching the supplied order
+  const updates = area_ids.map((id, i) =>
+    supabaseService.from("growing_areas").update({ sort_order: i + 1 }).eq("id", id)
+  );
+  const results = await Promise.all(updates);
+  const failed  = results.find(r => r.error);
+  if (failed) return res.status(500).json({ error: failed.error.message });
+
+  res.json({ ok: true });
+});
+
 // =============================================================================
 // GROWING AREAS
 // =============================================================================
