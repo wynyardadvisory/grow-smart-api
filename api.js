@@ -1282,6 +1282,66 @@ app.delete("/crops/:id", requireAuth, async (req, res) => {
   res.status(204).send();
 });
 
+// POST /crops/:id/convert-to-succession
+// Converts an existing standalone crop instance into the first sowing of a new
+// succession group. Does not create a new crop — wraps the existing one.
+// Body: { target_sowings, interval_days }
+app.post("/crops/:id/convert-to-succession", requireAuth, async (req, res) => {
+  try {
+    // Fetch the existing crop — must belong to this user
+    const { data: crop, error: cropErr } = await req.db.from("crop_instances")
+      .select("*")
+      .eq("id", req.params.id)
+      .eq("user_id", req.user.id)
+      .eq("active", true)
+      .single();
+
+    if (cropErr || !crop) return res.status(404).json({ error: "Crop not found" });
+    if (crop.succession_group_id) {
+      return res.status(400).json({ error: "Crop is already part of a succession group" });
+    }
+
+    const target_sowings = Number(req.body.target_sowings) || 3;
+    const interval_days  = req.body.interval_days ? Number(req.body.interval_days) : null;
+
+    // Create the succession group using the crop's existing data
+    const { data: group, error: groupErr } = await supabaseService.from("succession_groups").insert({
+      user_id:       req.user.id,
+      crop_def_id:   crop.crop_def_id  || null,
+      crop_name:     crop.name,
+      variety_id:    crop.variety_id   || null,
+      variety_name:  crop.variety      || null,
+      area_id:       crop.area_id      || null,
+      target_sowings,
+      interval_days,
+      notes:         crop.notes        || null,
+    }).select().single();
+    if (groupErr) return res.status(500).json({ error: groupErr.message });
+
+    // Link the existing crop instance to the new group as Sow 1
+    const { error: updateErr } = await supabaseService.from("crop_instances")
+      .update({
+        succession_group_id: group.id,
+        succession_index:    1,
+        updated_at:          new Date().toISOString(),
+      })
+      .eq("id", crop.id)
+      .eq("user_id", req.user.id);
+
+    if (updateErr) {
+      // Rollback group creation if update fails
+      await supabaseService.from("succession_groups").delete().eq("id", group.id);
+      return res.status(500).json({ error: updateErr.message });
+    }
+
+    await runRuleEngine(req.user.id);
+    res.status(201).json({ group_id: group.id, crop_id: crop.id });
+  } catch (e) {
+    console.error("[convert-to-succession]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // =============================================================================
 // SUCCESSION GROUPS
 // =============================================================================
