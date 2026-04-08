@@ -4917,16 +4917,27 @@ app.post("/crops/:id/log-action", requireAuth, async (req, res) => {
 });
 
 // POST /activity/log
-// Generic activity logging for any scope: crop, area, or location.
-// Feed is crop-scope only in v1.
-// Watering updates the timestamp at the selected scope only (no cascade in v1).
+// Generic activity logging — supports scope_ids (array) for multi-area logging.
+// activity_type: watered | fed | pruned_mulched | weeded | other
+// scope_type:    area | location | crop
+// scope_ids:     array of UUIDs (preferred) OR scope_id: single UUID
+//
+// Water  → timestamps area.last_watered_at (rule engine suppresses tasks)
+// Feed   → timestamps crop.last_fed_at for all crops in selected areas
+// Prune  → timestamps area.last_pruned_or_mulched_at
+// Weed   → timestamps area.last_weeded_at
+// Other  → free-text log only
 app.post("/activity/log", requireAuth, async (req, res) => {
-  const { activity_type, scope_type, scope_id, performed_at, notes, custom_label } = req.body;
+  const { activity_type, scope_type, performed_at, notes, custom_label } = req.body;
+  // Accept scope_ids (array) or legacy scope_id (single)
+  const scopeIds = req.body.scope_ids
+    ? (Array.isArray(req.body.scope_ids) ? req.body.scope_ids : [req.body.scope_ids])
+    : req.body.scope_id ? [req.body.scope_id] : [];
 
   // Validation
   if (!activity_type) return res.status(400).json({ error: "activity_type required" });
   if (!scope_type)    return res.status(400).json({ error: "scope_type required" });
-  if (!scope_id)      return res.status(400).json({ error: "scope_id required" });
+  if (!scopeIds.length) return res.status(400).json({ error: "scope_id or scope_ids required" });
   if (!["watered","fed","pruned_mulched","weeded","other"].includes(activity_type)) {
     return res.status(400).json({ error: "Invalid activity_type" });
   }
@@ -4936,62 +4947,50 @@ app.post("/activity/log", requireAuth, async (req, res) => {
   if (activity_type === "other" && !custom_label?.trim()) {
     return res.status(400).json({ error: "custom_label required for activity type 'other'" });
   }
-  // Feed is crop-scope only in v1
-  if (activity_type === "fed" && scope_type !== "crop") {
-    return res.status(400).json({ error: "Feeding can only be logged against a specific crop in v1" });
-  }
 
-  const now   = performed_at ? new Date(performed_at).toISOString() : new Date().toISOString();
+  const now    = performed_at ? new Date(performed_at).toISOString() : new Date().toISOString();
   const userId = req.user.id;
   let nextActionHint = null;
 
-  // ── Crop scope ─────────────────────────────────────────────────────────────
-  if (scope_type === "crop") {
-    const { data: crop, error: cropErr } = await req.db.from("crop_instances")
-      .select("id, name, area_id, crop_def_id")
-      .eq("id", scope_id).eq("user_id", userId).single();
-    if (cropErr || !crop) return res.status(404).json({ error: "Crop not found" });
-
-    const updates = { updated_at: now };
-    if (activity_type === "watered") {
-      updates.last_watered_at = now;
-      nextActionHint = "Watering logged — next check suppressed for a couple of days";
-    } else if (activity_type === "fed") {
-      updates.last_fed_at = now;
-      const { data: def } = await supabaseService.from("crop_definitions")
-        .select("feed_interval_days").eq("id", crop.crop_def_id).single();
-      const interval = def?.feed_interval_days || 14;
-      nextActionHint = `Next feed in about ${interval} days`;
-    } else if (activity_type === "pruned_mulched") {
-      updates.last_pruned_or_mulched_at = now;
-      nextActionHint = "Pruning/mulching logged";
-    } else if (activity_type === "weeded") {
-      updates.last_weeded_at = now;
-      nextActionHint = "Weeding logged";
-    } else {
-      nextActionHint = "Activity logged";
-    }
-
-    await supabaseService.from("crop_instances").update(updates).eq("id", scope_id).eq("user_id", userId);
-
-  // ── Area scope ─────────────────────────────────────────────────────────────
-  } else if (scope_type === "area") {
-    // Verify ownership via location
-    const { data: area } = await supabaseService.from("growing_areas")
+  // ── Area scope (main path from new multi-step UI) ───────────────────────────
+  if (scope_type === "area") {
+    // Verify ownership of all areas
+    const { data: areas } = await supabaseService.from("growing_areas")
       .select("id, name, location_id, locations!inner(user_id)")
-      .eq("id", scope_id).single();
-    if (!area || area.locations?.user_id !== userId) {
-      return res.status(404).json({ error: "Area not found" });
-    }
+      .in("id", scopeIds);
+    const ownedAreas = (areas || []).filter(a => a.locations?.user_id === userId);
+    if (!ownedAreas.length) return res.status(404).json({ error: "No valid areas found" });
+    const ownedIds = ownedAreas.map(a => a.id);
 
     if (activity_type === "watered") {
       await supabaseService.from("growing_areas")
-        .update({ last_watered_at: now }).eq("id", scope_id);
-      nextActionHint = "Watering logged for this area";
+        .update({ last_watered_at: now }).in("id", ownedIds);
+      nextActionHint = `Watering logged for ${ownedIds.length} area${ownedIds.length !== 1 ? "s" : ""}`;
+
+    } else if (activity_type === "fed") {
+      // Feed: stamp last_fed_at on all active crops in these areas
+      const { data: crops } = await supabaseService.from("crop_instances")
+        .select("id, crop_def_id")
+        .in("area_id", ownedIds)
+        .eq("user_id", userId)
+        .eq("active", true);
+      if (crops?.length) {
+        await supabaseService.from("crop_instances")
+          .update({ last_fed_at: now, updated_at: now })
+          .in("id", crops.map(c => c.id));
+      }
+      nextActionHint = `Feeding logged for ${crops?.length || 0} crop${crops?.length !== 1 ? "s" : ""}`;
+
     } else if (activity_type === "pruned_mulched") {
-      nextActionHint = "Pruning/mulching logged for this area";
+      await supabaseService.from("growing_areas")
+        .update({ last_pruned_or_mulched_at: now }).in("id", ownedIds);
+      nextActionHint = `Pruning/mulching logged for ${ownedIds.length} area${ownedIds.length !== 1 ? "s" : ""}`;
+
     } else if (activity_type === "weeded") {
-      nextActionHint = "Weeding logged for this area";
+      await supabaseService.from("growing_areas")
+        .update({ last_weeded_at: now }).in("id", ownedIds);
+      nextActionHint = `Weeding logged for ${ownedIds.length} area${ownedIds.length !== 1 ? "s" : ""}`;
+
     } else {
       nextActionHint = "Activity logged";
     }
@@ -4999,25 +4998,89 @@ app.post("/activity/log", requireAuth, async (req, res) => {
   // ── Location scope ─────────────────────────────────────────────────────────
   } else if (scope_type === "location") {
     const { data: location } = await supabaseService.from("locations")
-      .select("id, name").eq("id", scope_id).eq("user_id", userId).single();
+      .select("id, name").eq("id", scopeIds[0]).eq("user_id", userId).single();
     if (!location) return res.status(404).json({ error: "Location not found" });
 
     if (activity_type === "watered") {
-      await supabaseService.from("locations")
-        .update({ last_watered_at: now }).eq("id", scope_id);
-      nextActionHint = "Watering logged for this location";
+      // Stamp all areas in this location
+      await supabaseService.from("growing_areas")
+        .update({ last_watered_at: now }).eq("location_id", scopeIds[0]);
+      nextActionHint = "Watering logged for all areas in this location";
+    } else if (activity_type === "fed") {
+      const { data: crops } = await supabaseService.from("crop_instances")
+        .select("id")
+        .eq("location_id", scopeIds[0])
+        .eq("user_id", userId)
+        .eq("active", true);
+      if (crops?.length) {
+        await supabaseService.from("crop_instances")
+          .update({ last_fed_at: now, updated_at: now })
+          .in("id", crops.map(c => c.id));
+      }
+      nextActionHint = `Feeding logged for ${crops?.length || 0} crops`;
     } else if (activity_type === "pruned_mulched") {
+      await supabaseService.from("growing_areas")
+        .update({ last_pruned_or_mulched_at: now }).eq("location_id", scopeIds[0]);
       nextActionHint = "Pruning/mulching logged for this location";
     } else if (activity_type === "weeded") {
+      await supabaseService.from("growing_areas")
+        .update({ last_weeded_at: now }).eq("location_id", scopeIds[0]);
       nextActionHint = "Weeding logged for this location";
     } else {
       nextActionHint = "Activity logged";
+    }
+
+  // ── Crop scope — handles single or multiple crop IDs ─────────────────────────
+  } else if (scope_type === "crop") {
+    if (scopeIds.length === 1) {
+      // Single crop — fetch def for feed interval hint
+      const { data: crop, error: cropErr } = await req.db.from("crop_instances")
+        .select("id, name, area_id, crop_def_id")
+        .eq("id", scopeIds[0]).eq("user_id", userId).single();
+      if (cropErr || !crop) return res.status(404).json({ error: "Crop not found" });
+
+      const updates = { updated_at: now };
+      if (activity_type === "watered") {
+        updates.last_watered_at = now;
+        nextActionHint = "Watering logged — next check suppressed for a couple of days";
+      } else if (activity_type === "fed") {
+        updates.last_fed_at = now;
+        const { data: def } = await supabaseService.from("crop_definitions")
+          .select("feed_interval_days").eq("id", crop.crop_def_id).single();
+        const interval = def?.feed_interval_days || 14;
+        nextActionHint = `Next feed in about ${interval} days`;
+      } else if (activity_type === "pruned_mulched") {
+        updates.last_pruned_or_mulched_at = now;
+        nextActionHint = "Pruning/mulching logged";
+      } else if (activity_type === "weeded") {
+        updates.last_weeded_at = now;
+        nextActionHint = "Weeding logged";
+      } else {
+        nextActionHint = "Activity logged";
+      }
+      await supabaseService.from("crop_instances").update(updates).eq("id", scopeIds[0]).eq("user_id", userId);
+
+    } else {
+      // Bulk crop update — verify ownership then update all at once
+      const { data: crops } = await supabaseService.from("crop_instances")
+        .select("id").in("id", scopeIds).eq("user_id", userId).eq("active", true);
+      const ownedIds = (crops || []).map(c => c.id);
+      if (!ownedIds.length) return res.status(404).json({ error: "No valid crops found" });
+
+      const updates = { updated_at: now };
+      if (activity_type === "watered")        updates.last_watered_at = now;
+      else if (activity_type === "fed")        updates.last_fed_at = now;
+      else if (activity_type === "pruned_mulched") updates.last_pruned_or_mulched_at = now;
+      else if (activity_type === "weeded")     updates.last_weeded_at = now;
+
+      await supabaseService.from("crop_instances").update(updates).in("id", ownedIds).eq("user_id", userId);
+      nextActionHint = `${activity_type === "fed" ? "Feeding" : "Activity"} logged for ${ownedIds.length} crop${ownedIds.length !== 1 ? "s" : ""}`;
     }
   }
 
   // Always write to manual_activity_logs (non-fatal if fails)
   try {
-    await writeActivityLog(userId, activity_type, scope_type, scope_id, now, notes, custom_label);
+    await writeActivityLog(userId, activity_type, scope_type, scopeIds[0], now, notes, custom_label);
   } catch(malErr) { console.error("[ActivityLog] manual_activity_logs insert failed:", malErr.message); }
 
   // Re-run engine for actions that affect scheduling
