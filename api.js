@@ -591,7 +591,7 @@ app.post("/areas", requireAuth,
 );
 
 app.put("/areas/:id", requireAuth, async (req, res) => {
-  const allowed = ["name","type","width_m","length_m","sun_exposure","notes","soil_ph","soil_temperature_c","layout_x","layout_y","rotation","shape_type","soil_moisture"];
+  const allowed = ["name","type","width_m","length_m","sun_exposure","notes","soil_ph","soil_ph_logged_at","soil_ph_source","soil_temperature_c","soil_temperature_logged_at","soil_temperature_source","layout_x","layout_y","rotation","shape_type","soil_moisture","soil_moisture_source"];
   const updates = Object.fromEntries(Object.entries(req.body).filter(([k]) => allowed.includes(k)));
   // Normalise numeric fields — empty string → null, validate ranges
   for (const field of ["width_m","length_m","soil_ph","soil_temperature_c"]) {
@@ -623,6 +623,61 @@ app.put("/areas/:id", requireAuth, async (req, res) => {
   const { data, error } = await req.db.from("growing_areas")
     .update(updates).eq("id", req.params.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// POST /areas/:id/soil-reading — log a soil moisture, temperature or pH reading
+// source: sensor | manual | weather_estimate
+// type:   moisture | temperature | ph
+app.post("/areas/:id/soil-reading", requireAuth, async (req, res) => {
+  const { type, value, source } = req.body;
+
+  const VALID_TYPES   = ["moisture", "temperature", "ph"];
+  const VALID_SOURCES = ["sensor", "manual", "weather_estimate"];
+
+  if (!VALID_TYPES.includes(type))   return res.status(400).json({ error: "type must be moisture, temperature or ph" });
+  if (!VALID_SOURCES.includes(source)) return res.status(400).json({ error: "source must be sensor, manual or weather_estimate" });
+  if (type === "ph" && source !== "manual") return res.status(400).json({ error: "pH source must be manual" });
+
+  // Verify area ownership via location
+  const { data: area } = await supabaseService
+    .from("growing_areas")
+    .select("id, location_id, locations!inner(user_id)")
+    .eq("id", req.params.id)
+    .single();
+  if (!area || area.locations?.user_id !== req.user.id) return res.status(404).json({ error: "Area not found" });
+
+  const now = new Date().toISOString();
+  const updates = {};
+
+  if (type === "moisture") {
+    const VALID_MOISTURE = ["dry", "ok", "wet"];
+    if (!VALID_MOISTURE.includes(value)) return res.status(400).json({ error: "moisture value must be dry, ok or wet" });
+    updates.soil_moisture            = value;
+    updates.soil_moisture_logged_at  = now;
+    updates.soil_moisture_source     = source;
+  } else if (type === "temperature") {
+    const n = Number(value);
+    if (isNaN(n) || n < -20 || n > 60) return res.status(400).json({ error: "temperature must be between -20 and 60" });
+    updates.soil_temperature_c        = n;
+    updates.soil_temperature_logged_at = now;
+    updates.soil_temperature_source   = source;
+  } else if (type === "ph") {
+    const n = Number(value);
+    if (isNaN(n) || n < 0 || n > 14) return res.status(400).json({ error: "pH must be between 0 and 14" });
+    updates.soil_ph            = n;
+    updates.soil_ph_logged_at  = now;
+    updates.soil_ph_source     = source;
+  }
+
+  const { data, error } = await supabaseService
+    .from("growing_areas")
+    .update(updates)
+    .eq("id", req.params.id)
+    .select()
+    .single();
+  if (error) return res.status(500).json({ error: error.message });
+
   res.json(data);
 });
 
@@ -832,7 +887,16 @@ Respond ONLY with a JSON object — no markdown, no explanation. Use this exact 
     "pest_window_start": 5,
     "pest_window_end": 9,
     "pest_notes": "brief pest notes",
-    "grower_notes": "key growing tips for UK growers"
+    "grower_notes": "key growing tips for UK growers",
+    "soil_temp_min_c": 10.0,
+    "soil_temp_optimal_min_c": 15.0,
+    "soil_temp_optimal_max_c": 25.0,
+    "soil_temp_max_c": 30.0,
+    "soil_ph_min": 6.0,
+    "soil_ph_optimal_min": 6.2,
+    "soil_ph_optimal_max": 6.8,
+    "soil_ph_max": 7.0,
+    "soil_moisture_pref": "medium"
   },
   "variety": {
     "name": "corrected variety name or null if not provided",
@@ -859,7 +923,9 @@ Only use null if you genuinely have no information about that specific variety's
 If the crop is not valid, return:
 { "valid": false, "rejection_reason": "brief reason", "crop": null, "variety": null }
 
-Use null for any fields you don't have reliable data for. All month values are integers 1-12. Base everything on UK growing conditions.`;
+Use null for any fields you don't have reliable data for. All month values are integers 1-12. Base everything on UK growing conditions.
+For soil_moisture_pref use one of: low, medium, high, even_moisture, dry_down_before_harvest
+For soil temperature fields: use null for perennial crops where soil temp is not a germination limiting factor.`;
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -966,6 +1032,15 @@ Use null for any fields you don't have reliable data for. All month values are i
         pest_window_end:       cropData.pest_window_end,
         pest_notes:            cropData.pest_notes,
         grower_notes:          cropData.grower_notes,
+        soil_temp_min_c:         cropData.soil_temp_min_c         || null,
+        soil_temp_optimal_min_c: cropData.soil_temp_optimal_min_c || null,
+        soil_temp_optimal_max_c: cropData.soil_temp_optimal_max_c || null,
+        soil_temp_max_c:         cropData.soil_temp_max_c         || null,
+        soil_ph_min:             cropData.soil_ph_min             || null,
+        soil_ph_optimal_min:     cropData.soil_ph_optimal_min     || null,
+        soil_ph_optimal_max:     cropData.soil_ph_optimal_max     || null,
+        soil_ph_max:             cropData.soil_ph_max             || null,
+        soil_moisture_pref:      cropData.soil_moisture_pref      || null,
       }).select("id").single();
 
       if (cropErr) throw new Error(`Crop insert failed: ${cropErr.message}`);
