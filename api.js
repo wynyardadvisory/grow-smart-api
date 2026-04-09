@@ -2643,10 +2643,8 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
   try {
     const db = supabaseService; // service role for cross-table queries
     const now = new Date();
-    const day1ago  = new Date(now - 1  * 86400000).toISOString();
     const day7ago  = new Date(now - 7  * 86400000).toISOString();
     const day28ago = new Date(now - 28 * 86400000).toISOString();
-    const day30ago = new Date(now - 30 * 86400000).toISOString();
 
     // Get all demo user IDs to exclude from every metric
     const { data: demoProfiles } = await db.from("profiles").select("id").eq("is_demo", true);
@@ -2719,13 +2717,6 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
       // Activity signals — all user-initiated actions with timestamps
       // Used for DAU / WAU / MAU / retention. Pulled wide (30 days) so we
       // can filter down per metric in JS rather than making 6+ separate calls.
-      { data: taskActivity },
-      { data: harvestActivity },
-      { data: activityLogData },
-      { data: observationActivity },
-      { data: photoActivity },
-      { data: feedActivity },
-      { data: cropCreatedActivity },
 
     ] = await Promise.all([
       db.from("profiles").select("*", { count: "exact", head: true }).eq("is_demo", false),
@@ -2761,52 +2752,18 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
       // Feedback avg rating
       db.from("feedback").select("rating").not("rating", "is", null).not("user_id", "in", demoExclude),
 
-      // Activity signals — pulled for last 30 days (covers DAU/WAU/MAU + retention windows)
-      // .limit(10000) on each to avoid Supabase's default 1000-row cap silently truncating results
-      db.from("tasks").select("user_id, completed_at").not("completed_at", "is", null).gte("completed_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
-      db.from("harvest_log").select("user_id, harvested_at").gte("harvested_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
-      db.from("manual_activity_logs").select("user_id, performed_at").gte("performed_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
-      db.from("crop_observations").select("user_id, created_at").gte("created_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
-      db.from("crop_photos").select("user_id, created_at").gte("created_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
-      db.from("user_feeds").select("user_id, created_at").gte("created_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
-      // crop_instances created after day 1 of signup (onboarding excluded via retention logic below)
-      db.from("crop_instances").select("user_id, created_at").gte("created_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
     ]);
 
-    // ── Build unified activity event list ─────────────────────────────────────
-    // Each entry is { user_id, ts } where ts is the action timestamp.
-    // Normalise all timestamps to full ISO datetime strings so string comparison
-    // works correctly. harvested_at and performed_at are date-only (YYYY-MM-DD)
-    // in the DB — appending T00:00:00.000Z makes them comparable to datetimes.
-    const toISO = ts => {
-      if (!ts) return null;
-      if (ts.includes("T")) return ts; // already a datetime
-      return ts + "T00:00:00.000Z";   // date-only — treat as start of day
-    };
-
-    const allActivity = [
-      ...(taskActivity        || []).map(r => ({ user_id: r.user_id, ts: toISO(r.completed_at) })),
-      ...(harvestActivity     || []).map(r => ({ user_id: r.user_id, ts: toISO(r.harvested_at) })),
-      ...(activityLogData     || []).map(r => ({ user_id: r.user_id, ts: toISO(r.performed_at) })),
-      ...(observationActivity || []).map(r => ({ user_id: r.user_id, ts: toISO(r.created_at) })),
-      ...(photoActivity       || []).map(r => ({ user_id: r.user_id, ts: toISO(r.created_at) })),
-      ...(feedActivity        || []).map(r => ({ user_id: r.user_id, ts: toISO(r.created_at) })),
-      ...(cropCreatedActivity || []).map(r => ({ user_id: r.user_id, ts: toISO(r.created_at) })),
-    ].filter(e => e.ts); // drop any nulls
-
-    // ── DAU / WAU / MAU ───────────────────────────────────────────────────────
-    const dau = new Set(allActivity.filter(e => e.ts >= day1ago).map(e => e.user_id)).size;
-    const wau = new Set(allActivity.filter(e => e.ts >= day7ago).map(e => e.user_id)).size;
-    const mau = new Set(allActivity.filter(e => e.ts >= day30ago).map(e => e.user_id)).size;
-
-    // ── Cohort retention — computed via SQL RPC ───────────────────────────────
-    // get_retention_metrics() unions all user-action tables in Postgres and
-    // computes true cohort-window retention per user. Avoids JS timestamp
-    // comparison bugs and Supabase row limits entirely.
+    // ── DAU / WAU / MAU / Retention — all via SQL RPC ────────────────────────
+    // get_retention_metrics() computes everything in Postgres — no JS timestamp
+    // comparison, no row limits, no format mismatches.
     const { data: retentionData, error: retentionError } = await supabaseService.rpc("get_retention_metrics");
     if (retentionError) console.error("[Metrics] retention RPC error:", retentionError.message);
 
-    const rm = retentionData || {};
+    const rm  = retentionData || {};
+    const dau = Number(rm.dau || 0);
+    const wau = Number(rm.wau || 0);
+    const mau = Number(rm.mau || 0);
     const d7RetentionRate  = rm.d7_rate  != null ? Number(rm.d7_rate)  : null;
     const d14RetentionRate = rm.d14_rate != null ? Number(rm.d14_rate) : null;
     const d21RetentionRate = rm.d21_rate != null ? Number(rm.d21_rate) : null;
