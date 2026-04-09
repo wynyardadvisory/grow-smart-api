@@ -2762,30 +2762,34 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
     ]);
 
     // ── Build unified activity event list ─────────────────────────────────────
-    // Each entry is { user_id, ts } where ts is the action timestamp.
-    // Normalise all timestamps to full ISO datetime strings so string comparison
-    // works correctly. harvested_at and performed_at are date-only (YYYY-MM-DD)
-    // in the DB — appending T00:00:00.000Z makes them comparable to datetimes.
-    const toISO = ts => {
+    // Each entry is { user_id, ms } where ms is the action timestamp in epoch ms.
+    // We use numeric comparison (not string) to avoid timezone format mismatches
+    // between Supabase returning +00:00 vs Z suffix, and date-only vs datetime.
+    const toMs = ts => {
       if (!ts) return null;
-      if (ts.includes("T")) return ts; // already a datetime
-      return ts + "T00:00:00.000Z";   // date-only — treat as start of day
+      // date-only strings (YYYY-MM-DD) — parse as UTC start of day
+      if (/^\d{4}-\d{2}-\d{2}$/.test(ts)) return Date.UTC(...ts.split("-").map((v,i) => i===1 ? +v-1 : +v));
+      return new Date(ts).getTime();
     };
 
+    const now1ago  = now.getTime() - 1  * 86400000;
+    const now7ago  = now.getTime() - 7  * 86400000;
+    const now30ago = now.getTime() - 30 * 86400000;
+
     const allActivity = [
-      ...(taskActivity        || []).map(r => ({ user_id: r.user_id, ts: toISO(r.completed_at) })),
-      ...(harvestActivity     || []).map(r => ({ user_id: r.user_id, ts: toISO(r.harvested_at) })),
-      ...(activityLogData     || []).map(r => ({ user_id: r.user_id, ts: toISO(r.performed_at) })),
-      ...(observationActivity || []).map(r => ({ user_id: r.user_id, ts: toISO(r.created_at) })),
-      ...(photoActivity       || []).map(r => ({ user_id: r.user_id, ts: toISO(r.created_at) })),
-      ...(feedActivity        || []).map(r => ({ user_id: r.user_id, ts: toISO(r.created_at) })),
-      ...(cropCreatedActivity || []).map(r => ({ user_id: r.user_id, ts: toISO(r.created_at) })),
-    ].filter(e => e.ts); // drop any nulls
+      ...(taskActivity        || []).map(r => ({ user_id: r.user_id, ms: toMs(r.completed_at) })),
+      ...(harvestActivity     || []).map(r => ({ user_id: r.user_id, ms: toMs(r.harvested_at) })),
+      ...(activityLogData     || []).map(r => ({ user_id: r.user_id, ms: toMs(r.performed_at) })),
+      ...(observationActivity || []).map(r => ({ user_id: r.user_id, ms: toMs(r.created_at) })),
+      ...(photoActivity       || []).map(r => ({ user_id: r.user_id, ms: toMs(r.created_at) })),
+      ...(feedActivity        || []).map(r => ({ user_id: r.user_id, ms: toMs(r.created_at) })),
+      ...(cropCreatedActivity || []).map(r => ({ user_id: r.user_id, ms: toMs(r.created_at) })),
+    ].filter(e => e.ms !== null && !isNaN(e.ms));
 
     // ── DAU / WAU / MAU ───────────────────────────────────────────────────────
-    const dau = new Set(allActivity.filter(e => e.ts >= day1ago).map(e => e.user_id)).size;
-    const wau = new Set(allActivity.filter(e => e.ts >= day7ago).map(e => e.user_id)).size;
-    const mau = new Set(allActivity.filter(e => e.ts >= day30ago).map(e => e.user_id)).size;
+    const dau = new Set(allActivity.filter(e => e.ms >= now1ago).map(e => e.user_id)).size;
+    const wau = new Set(allActivity.filter(e => e.ms >= now7ago).map(e => e.user_id)).size;
+    const mau = new Set(allActivity.filter(e => e.ms >= now30ago).map(e => e.user_id)).size;
 
     // ── Cohort retention ──────────────────────────────────────────────────────
     // For each user, check whether they had at least one genuine user-action
@@ -2798,37 +2802,33 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
     // Denominator is all real users old enough to have reached that window.
 
     // Build a map of user_id → Set of activity timestamps for fast lookup
+    // Build a map of user_id → array of epoch ms timestamps for fast lookup
     const activityByUser = {};
     for (const e of allActivity) {
       if (!activityByUser[e.user_id]) activityByUser[e.user_id] = [];
-      activityByUser[e.user_id].push(e.ts);
+      activityByUser[e.user_id].push(e.ms);
     }
 
-    // We need all-time activity for retention (not just last 30 days) because
-    // a user who signed up 28 days ago has a window starting 21 days ago —
-    // that's within 30 days, so we're fine. But D28 users signed up ≥28 days
-    // ago, meaning their window (days 21–28) is entirely within our 30-day
-    // pull. No additional query needed.
-
-    const d7Cohort  = realAuthUsers.filter(u => new Date(u.created_at) <= new Date(now - 7  * 86400000));
-    const d28Cohort = realAuthUsers.filter(u => new Date(u.created_at) <= new Date(now - 28 * 86400000));
+    const nowMs = now.getTime();
+    const d7Cohort  = realAuthUsers.filter(u => new Date(u.created_at).getTime() <= nowMs - 7  * 86400000);
+    const d28Cohort = realAuthUsers.filter(u => new Date(u.created_at).getTime() <= nowMs - 28 * 86400000);
 
     let d7Retained = 0;
     for (const u of d7Cohort) {
-      const signupTs  = new Date(u.created_at).getTime();
-      const windowStart = new Date(signupTs + 2  * 86400000).toISOString();
-      const windowEnd   = new Date(signupTs + 7  * 86400000).toISOString();
+      const signupMs    = new Date(u.created_at).getTime();
+      const windowStart = signupMs + 2  * 86400000;
+      const windowEnd   = signupMs + 7  * 86400000;
       const events = activityByUser[u.id] || [];
-      if (events.some(ts => ts >= windowStart && ts <= windowEnd)) d7Retained++;
+      if (events.some(ms => ms >= windowStart && ms <= windowEnd)) d7Retained++;
     }
 
     let d28Retained = 0;
     for (const u of d28Cohort) {
-      const signupTs  = new Date(u.created_at).getTime();
-      const windowStart = new Date(signupTs + 21 * 86400000).toISOString();
-      const windowEnd   = new Date(signupTs + 28 * 86400000).toISOString();
+      const signupMs    = new Date(u.created_at).getTime();
+      const windowStart = signupMs + 21 * 86400000;
+      const windowEnd   = signupMs + 28 * 86400000;
       const events = activityByUser[u.id] || [];
-      if (events.some(ts => ts >= windowStart && ts <= windowEnd)) d28Retained++;
+      if (events.some(ms => ms >= windowStart && ms <= windowEnd)) d28Retained++;
     }
 
     const d7RetentionRate  = d7Cohort.length  > 0 ? Math.round((d7Retained  / d7Cohort.length)  * 100) : null;
