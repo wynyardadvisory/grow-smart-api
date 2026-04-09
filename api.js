@@ -5807,6 +5807,27 @@ app.post("/admin/backfill-badges", requireAuth, requireAdmin, async (req, res) =
 // =============================================================================
 // PUSH NOTIFICATIONS
 // =============================================================================
+// POST /push/register — register a native device push token (iOS/Android via Capacitor)
+// Called automatically on app launch after the user grants notification permission.
+app.post("/push/register", requireAuth, async (req, res) => {
+  const { token, platform } = req.body;
+  if (!token) return res.status(400).json({ error: "token required" });
+  const { error } = await supabaseService.from("device_push_tokens").upsert({
+    user_id: req.user.id,
+    platform: platform || "ios",
+    push_token: token,
+    endpoint: token,          // reuse endpoint col as unique key for native tokens
+    is_active: true,
+    last_seen_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  }, { onConflict: "user_id,endpoint" });
+  if (error) return res.status(500).json({ error: error.message });
+  await supabaseService.from("notification_preferences").upsert({
+    user_id: req.user.id, push_enabled: true, updated_at: new Date().toISOString(),
+  }, { onConflict: "user_id", ignoreDuplicates: true });
+  res.json({ ok: true });
+});
+
 app.get("/notifications/vapid-key", (_req, res) => {
   if (!process.env.VAPID_PUBLIC_KEY) return res.status(503).json({ error: "Push not configured" });
   res.json({ publicKey: process.env.VAPID_PUBLIC_KEY });
