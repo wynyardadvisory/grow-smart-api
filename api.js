@@ -229,14 +229,29 @@ function buildTimeline(crop) {
   const STAGE_ORDER = ["seed", "seedling", "vegetative", "flowering", "fruiting", "harvesting"];
   const currentIdx  = STAGE_ORDER.indexOf(currentStage);
 
-  // Harvest date — use sowDate+DTM (already offset-adjusted)
-  // Only use fixed calendar month when no offset set
+  // Harvest date calculation
+  // Priority: DTM (sow date + days to maturity) — most accurate for this plant
+  // Fallback: fixed calendar month from crop_definitions — only when no DTM
+  // Safety: harvest date must always be after sow date
   const harvestStart = def.harvest_month_start;
   const harvestEnd   = def.harvest_month_end;
-  const year         = new Date().getFullYear();
+  const sowDateObj   = new Date(sowDate);
   let harvestDate    = dtm ? addDays(sowDate, dtm) : null;
-  if (harvestStart && offsetDays === 0) {
-    harvestDate = new Date(year, harvestStart - 1, 15).toISOString().split("T")[0];
+
+  // Only use fixed month if there is no DTM to calculate from
+  if (!harvestDate && harvestStart && offsetDays === 0) {
+    let year = sowDateObj.getFullYear();
+    let candidate = new Date(year, harvestStart - 1, 15);
+    // If the fixed month date is before or within 7 days of sow date, try next year
+    if (candidate <= new Date(sowDateObj.getTime() + 7 * 86400000)) {
+      candidate = new Date(year + 1, harvestStart - 1, 15);
+    }
+    harvestDate = candidate.toISOString().split("T")[0];
+  }
+
+  // Final safety check — harvest must always be after sow date
+  if (harvestDate && new Date(harvestDate) <= sowDateObj) {
+    harvestDate = dtm ? addDays(sowDate, dtm) : addDays(sowDate, 60);
   }
 
   const LABELS = {
