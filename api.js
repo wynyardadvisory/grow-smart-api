@@ -2799,52 +2799,22 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
     const wau = new Set(allActivity.filter(e => e.ts >= day7ago).map(e => e.user_id)).size;
     const mau = new Set(allActivity.filter(e => e.ts >= day30ago).map(e => e.user_id)).size;
 
-    // ── Cohort retention ──────────────────────────────────────────────────────
-    // For each user, check whether they had at least one genuine user-action
-    // event within their own cohort window after signup.
-    //
-    // D7  window: signup + 2 days  → signup + 7 days
-    // D28 window: signup + 21 days → signup + 28 days
-    //
-    // Day 1 is excluded from both windows to avoid onboarding noise.
-    // Denominator is all real users old enough to have reached that window.
+    // ── Cohort retention — computed via SQL RPC ───────────────────────────────
+    // get_retention_metrics() unions all user-action tables in Postgres and
+    // computes true cohort-window retention per user. Avoids JS timestamp
+    // comparison bugs and Supabase row limits entirely.
+    const { data: retentionData, error: retentionError } = await supabaseService.rpc("get_retention_metrics");
+    if (retentionError) console.error("[Metrics] retention RPC error:", retentionError.message);
 
-    // Build a map of user_id → Set of activity timestamps for fast lookup
-    const activityByUser = {};
-    for (const e of allActivity) {
-      if (!activityByUser[e.user_id]) activityByUser[e.user_id] = [];
-      activityByUser[e.user_id].push(e.ts);
-    }
-
-    // We need all-time activity for retention (not just last 30 days) because
-    // a user who signed up 28 days ago has a window starting 21 days ago —
-    // that's within 30 days, so we're fine. But D28 users signed up ≥28 days
-    // ago, meaning their window (days 21–28) is entirely within our 30-day
-    // pull. No additional query needed.
-
-    const d7Cohort  = realAuthUsers.filter(u => new Date(u.created_at) <= new Date(now - 7  * 86400000));
-    const d28Cohort = realAuthUsers.filter(u => new Date(u.created_at) <= new Date(now - 28 * 86400000));
-
-    let d7Retained = 0;
-    for (const u of d7Cohort) {
-      const signupTs  = new Date(u.created_at).getTime();
-      const windowStart = new Date(signupTs + 2  * 86400000).toISOString();
-      const windowEnd   = new Date(signupTs + 7  * 86400000).toISOString();
-      const events = activityByUser[u.id] || [];
-      if (events.some(ts => ts >= windowStart && ts <= windowEnd)) d7Retained++;
-    }
-
-    let d28Retained = 0;
-    for (const u of d28Cohort) {
-      const signupTs  = new Date(u.created_at).getTime();
-      const windowStart = new Date(signupTs + 21 * 86400000).toISOString();
-      const windowEnd   = new Date(signupTs + 28 * 86400000).toISOString();
-      const events = activityByUser[u.id] || [];
-      if (events.some(ts => ts >= windowStart && ts <= windowEnd)) d28Retained++;
-    }
-
-    const d7RetentionRate  = d7Cohort.length  > 0 ? Math.round((d7Retained  / d7Cohort.length)  * 100) : null;
-    const d28RetentionRate = d28Cohort.length > 0 ? Math.round((d28Retained / d28Cohort.length) * 100) : null;
+    const rm = retentionData || {};
+    const d7RetentionRate  = rm.d7_rate  != null ? Number(rm.d7_rate)  : null;
+    const d14RetentionRate = rm.d14_rate != null ? Number(rm.d14_rate) : null;
+    const d21RetentionRate = rm.d21_rate != null ? Number(rm.d21_rate) : null;
+    const d28RetentionRate = rm.d28_rate != null ? Number(rm.d28_rate) : null;
+    const d7Retained  = Number(rm.d7_retained  || 0);
+    const d28Retained = Number(rm.d28_retained || 0);
+    const d7Cohort    = { length: Number(rm.d7_cohort  || 0) };
+    const d28Cohort   = { length: Number(rm.d28_cohort || 0) };
 
     // ── Derived metrics ───────────────────────────────────────────────────────
     const activationRate    = totalSignups > 0 ? Math.round((totalActivated / totalSignups) * 100) : 0;
@@ -2895,8 +2865,12 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
       // D7:  did they interact in days 2–7 after their own signup date?
       // D28: did they interact in days 21–28 after their own signup date?
       d7Retention:  d7RetentionRate,
+      d14Retention: d14RetentionRate,
+      d21Retention: d21RetentionRate,
       d28Retention: d28RetentionRate,
       d7RetentionRaw:  { retained: d7Retained,  cohort: d7Cohort.length },
+      d14RetentionRaw: { retained: Number(rm.d14_retained || 0), cohort: Number(rm.d14_cohort || 0) },
+      d21RetentionRaw: { retained: Number(rm.d21_retained || 0), cohort: Number(rm.d21_cohort || 0) },
       d28RetentionRaw: { retained: d28Retained, cohort: d28Cohort.length },
 
       // Keep old field names as aliases so the frontend doesn't break
