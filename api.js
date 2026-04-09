@@ -3932,16 +3932,32 @@ app.get("/dashboard", requireAuth, async (req, res) => {
   const harvestForecast = crops
     .filter(c => c.crop_def?.harvest_month_start || c.sown_date)
     .map(c => {
-      const tl = buildTimeline(c);
+      const isPerennial = c.crop_def?.is_perennial;
       let windowStart, windowEnd;
-      if (tl?.harvest_date_iso) {
-        windowStart = tl.harvest_date_iso;
-        windowEnd   = tl.harvest_date_iso;
-      } else if (c.crop_def?.harvest_month_start) {
-        windowStart = new Date(year, c.crop_def.harvest_month_start - 1, 1).toISOString().split("T")[0];
-        windowEnd   = new Date(year, c.crop_def.harvest_month_end   - 1, 28).toISOString().split("T")[0];
+
+      if (isPerennial && c.crop_def?.harvest_month_start) {
+        // Perennial crops: always use the seasonal harvest window, not days-from-planting.
+        // Days-to-maturity from planting is meaningless for established perennials and
+        // produces past dates that incorrectly show as "Ready now".
+        const hStart = c.crop_def.harvest_month_start;
+        const hEnd   = c.crop_def.harvest_month_end || hStart;
+        // Use next upcoming harvest window — if this year's window has passed, show next year's
+        const thisYearStart = new Date(year, hStart - 1, 1).toISOString().split("T")[0];
+        const useYear = thisYearStart < new Date().toISOString().split("T")[0] && hEnd < currentMonth
+          ? year + 1 : year;
+        windowStart = new Date(useYear, hStart - 1, 1).toISOString().split("T")[0];
+        windowEnd   = new Date(useYear, hEnd   - 1, 28).toISOString().split("T")[0];
       } else {
-        return null;
+        const tl = buildTimeline(c);
+        if (tl?.harvest_date_iso) {
+          windowStart = tl.harvest_date_iso;
+          windowEnd   = tl.harvest_date_iso;
+        } else if (c.crop_def?.harvest_month_start) {
+          windowStart = new Date(year, c.crop_def.harvest_month_start - 1, 1).toISOString().split("T")[0];
+          windowEnd   = new Date(year, c.crop_def.harvest_month_end   - 1, 28).toISOString().split("T")[0];
+        } else {
+          return null;
+        }
       }
       return { crop: c.succession_index ? `${c.name} (Sow ${c.succession_index})` : c.name, variety: c.variety || null, crop_instance_id: c.id, window_start: windowStart, window_end: windowEnd };
     })
