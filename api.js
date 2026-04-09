@@ -314,9 +314,13 @@ app.post("/auth/profile", requireAuth,
   [body("name").trim().notEmpty(), body("postcode").trim().notEmpty()],
   async (req, res) => {
     if (!validate(req, res)) return;
-    const { name, postcode } = req.body;
+    const { name, postcode, measurement_unit } = req.body;
+    const updates = { id: req.user.id, name, postcode };
+    if (measurement_unit === "metric" || measurement_unit === "imperial") {
+      updates.measurement_unit = measurement_unit;
+    }
     const { data, error } = await req.db.from("profiles")
-      .upsert({ id: req.user.id, name, postcode }).select().single();
+      .upsert(updates).select().single();
     if (error) return res.status(500).json({ error: error.message });
     res.status(201).json(data);
   }
@@ -734,6 +738,31 @@ app.post("/areas/:id/soil-reading", requireAuth, async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
 
   res.json(data);
+});
+
+// POST /areas/:id/duplicate — copy area (name, type, dimensions) without crops or soil data
+app.post("/areas/:id/duplicate", requireAuth, async (req, res) => {
+  // Fetch the original area, verifying ownership via location join
+  const { data: orig, error: fetchErr } = await req.db
+    .from("growing_areas")
+    .select("id, name, type, width_m, length_m, sun_exposure, notes, location_id, locations!inner(user_id)")
+    .eq("id", req.params.id)
+    .eq("locations.user_id", req.user.id)
+    .single();
+  if (fetchErr || !orig) return res.status(404).json({ error: "Area not found" });
+
+  const { data, error } = await req.db.from("growing_areas").insert({
+    location_id:  orig.location_id,
+    name:         orig.name + " (copy)",
+    type:         orig.type,
+    width_m:      orig.width_m,
+    length_m:     orig.length_m,
+    sun_exposure: orig.sun_exposure,
+    notes:        orig.notes,
+    // Soil data deliberately excluded — could be different bed, impacts rule engine
+  }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
 });
 
 app.delete("/areas/:id", requireAuth, async (req, res) => {
@@ -1180,7 +1209,7 @@ For soil temperature fields: use null for perennial crops where soil temp is not
 
 app.get("/crops", requireAuth, async (req, res) => {
   const { data, error } = await req.db.from("crop_instances")
-    .select("*, area:area_id(name, type), crop_def:crop_def_id(name, harvest_month_start, harvest_month_end, harvest_month_start, harvest_month_end, days_to_maturity_min, days_to_maturity_max, sow_method, is_perennial, default_establishment, pest_window_start, pest_window_end), variety:variety_id(name, days_to_maturity_min, days_to_maturity_max)")
+    .select("*, area:area_id(name, type, location_id, location:location_id(name)), crop_def:crop_def_id(name, harvest_month_start, harvest_month_end, harvest_month_start, harvest_month_end, days_to_maturity_min, days_to_maturity_max, sow_method, is_perennial, default_establishment, pest_window_start, pest_window_end), variety:variety_id(name, days_to_maturity_min, days_to_maturity_max)")
     .eq("user_id", req.user.id).eq("active", true)
     .order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
