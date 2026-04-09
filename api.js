@@ -2648,191 +2648,26 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
     const newSignupsWeek  = realAuthUsers.filter(u => new Date(u.created_at) >= new Date(day7ago)).length;
     const newSignupsLastWeek = realAuthUsers.filter(u => new Date(u.created_at) >= new Date(day28ago) && new Date(u.created_at) < new Date(day7ago)).length;
 
-    // ── Activity signal — fetch all genuine user-action events ────────────────
-    // These tables are only ever written to by real user actions (not the rule
-    // engine or any background process). We union them to get a clean activity
-    // signal for DAU/WAU/MAU and cohort retention.
-    //
-    // crop_instances.created_at — user added a crop (day 2+ only to exclude
-    //   onboarding auto-creates on day 1)
-    // tasks.completed_at        — user completed a task
-    // harvest_log.harvested_at  — user logged a harvest
-    // manual_activity_logs.performed_at — user logged any manual activity
-    // crop_observations.created_at — user submitted a plant check / observation
-    // crop_photos.created_at    — user added a photo
-    // user_feeds.created_at     — user added a feed entry
-    //
-    // Note: locations and growing_areas have no created_at column — excluded.
+    // ── DAU / WAU / MAU / Retention — all computed in SQL via RPC ───────────────
+    // get_retention_metrics() unions all user-action tables in Postgres,
+    // computes cohort windows per user, and returns clean counts.
+    // No JS timestamp comparison, no row limits, no format mismatches.
+    const { data: retentionData, error: retentionError } = await db.rpc("get_retention_metrics");
+    if (retentionError) console.error("[Metrics] retention RPC error:", retentionError.message);
 
-    const [
-      // Activated (completed onboarding = have a profile)
-      { count: totalActivated },
+    const rm = retentionData || {};
+    const dau = Number(rm.dau  || 0);
+    const wau = Number(rm.wau  || 0);
+    const mau = Number(rm.mau  || 0);
 
-      // Garden usage counts
-      { count: totalLocations },
-      { count: totalAreas },
-      { count: totalCrops },
-
-      // Crop lifecycle
-      { count: cropsSown },
-      { count: cropsHarvested },
-      { count: harvestLogs },
-
-      // Task engine
-      { count: tasksGenerated },
-      { count: tasksCompleted },
-
-      // Feeds & photos
-      { count: totalFeeds },
-      { count: totalPhotos },
-
-      // Dataset
-      { count: totalVarieties },
-      { count: yieldDataPoints },
-
-      // Email sequences
-      { count: emailWaitlistInvites },
-      { count: emailFeedbackDay3 },
-      { count: emailFeedbackDay7 },
-      { count: emailReengageDay14 },
-      { count: emailReengageDay30 },
-      { count: emailDailyFallback },
-
-      // Push tokens
-      { count: pushTokens },
-
-      // Feedback ratings
-      { data: feedbackRatings },
-
-      // Activity signals — all user-initiated actions with timestamps
-      // Used for DAU / WAU / MAU / retention. Pulled wide (30 days) so we
-      // can filter down per metric in JS rather than making 6+ separate calls.
-      { data: taskActivity },
-      { data: harvestActivity },
-      { data: activityLogData },
-      { data: observationActivity },
-      { data: photoActivity },
-      { data: feedActivity },
-      { data: cropCreatedActivity },
-
-    ] = await Promise.all([
-      db.from("profiles").select("*", { count: "exact", head: true }).eq("is_demo", false),
-
-      db.from("locations").select("*", { count: "exact", head: true }).not("user_id", "in", demoExclude),
-      db.from("growing_areas").select("*", { count: "exact", head: true }).not("user_id", "in", demoExclude),
-      db.from("crop_instances").select("*", { count: "exact", head: true }).not("user_id", "in", demoExclude),
-
-      db.from("crop_instances").select("*", { count: "exact", head: true }).not("sown_date", "is", null).not("user_id", "in", demoExclude),
-      db.from("crop_instances").select("*", { count: "exact", head: true }).eq("status", "harvested").not("user_id", "in", demoExclude),
-      db.from("harvest_log").select("*", { count: "exact", head: true }).not("user_id", "in", demoExclude),
-
-      db.from("tasks").select("*", { count: "exact", head: true }).is("completed_at", null).not("status", "eq", "expired").not("user_id", "in", demoExclude),
-      db.from("tasks").select("*", { count: "exact", head: true }).not("completed_at", "is", null).not("user_id", "in", demoExclude),
-
-      db.from("user_feeds").select("*", { count: "exact", head: true }).not("user_id", "in", demoExclude),
-      db.from("crop_photos").select("*", { count: "exact", head: true }).not("user_id", "in", demoExclude),
-
-      db.from("varieties").select("*", { count: "exact", head: true }),
-      db.from("harvest_log").select("*", { count: "exact", head: true }).not("quantity_value", "is", null).not("user_id", "in", demoExclude),
-
-      // Email sequences
-      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "waitlist_invite").not("user_id", "in", demoExclude),
-      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "feedback_day3").not("user_id", "in", demoExclude),
-      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "feedback_day7").not("user_id", "in", demoExclude),
-      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "reengage_day14").not("user_id", "in", demoExclude),
-      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "reengage_day30").not("user_id", "in", demoExclude),
-      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "daily_fallback").not("user_id", "in", demoExclude),
-
-      // Push tokens
-      db.from("device_push_tokens").select("*", { count: "exact", head: true }).eq("is_active", true).not("user_id", "in", demoExclude),
-
-      // Feedback avg rating
-      db.from("feedback").select("rating").not("rating", "is", null).not("user_id", "in", demoExclude),
-
-      // Activity signals — pulled for last 30 days (covers DAU/WAU/MAU + retention windows)
-      // .limit(10000) on each to avoid Supabase's default 1000-row cap silently truncating results
-      db.from("tasks").select("user_id, completed_at").not("completed_at", "is", null).gte("completed_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
-      db.from("harvest_log").select("user_id, harvested_at").gte("harvested_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
-      db.from("manual_activity_logs").select("user_id, performed_at").gte("performed_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
-      db.from("crop_observations").select("user_id, created_at").gte("created_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
-      db.from("crop_photos").select("user_id, created_at").gte("created_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
-      db.from("user_feeds").select("user_id, created_at").gte("created_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
-      // crop_instances created after day 1 of signup (onboarding excluded via retention logic below)
-      db.from("crop_instances").select("user_id, created_at").gte("created_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
-    ]);
-
-    // ── Build unified activity event list ─────────────────────────────────────
-    // Each entry is { user_id, ms } where ms is the action timestamp in epoch ms.
-    // We use numeric comparison (not string) to avoid timezone format mismatches
-    // between Supabase returning +00:00 vs Z suffix, and date-only vs datetime.
-    const toMs = ts => {
-      if (!ts) return null;
-      // date-only strings (YYYY-MM-DD) — parse as UTC start of day
-      if (/^\d{4}-\d{2}-\d{2}$/.test(ts)) return Date.UTC(...ts.split("-").map((v,i) => i===1 ? +v-1 : +v));
-      return new Date(ts).getTime();
-    };
-
-    const now1ago  = now.getTime() - 1  * 86400000;
-    const now7ago  = now.getTime() - 7  * 86400000;
-    const now30ago = now.getTime() - 30 * 86400000;
-
-    const allActivity = [
-      ...(taskActivity        || []).map(r => ({ user_id: r.user_id, ms: toMs(r.completed_at) })),
-      ...(harvestActivity     || []).map(r => ({ user_id: r.user_id, ms: toMs(r.harvested_at) })),
-      ...(activityLogData     || []).map(r => ({ user_id: r.user_id, ms: toMs(r.performed_at) })),
-      ...(observationActivity || []).map(r => ({ user_id: r.user_id, ms: toMs(r.created_at) })),
-      ...(photoActivity       || []).map(r => ({ user_id: r.user_id, ms: toMs(r.created_at) })),
-      ...(feedActivity        || []).map(r => ({ user_id: r.user_id, ms: toMs(r.created_at) })),
-      ...(cropCreatedActivity || []).map(r => ({ user_id: r.user_id, ms: toMs(r.created_at) })),
-    ].filter(e => e.ms !== null && !isNaN(e.ms));
-
-    // ── DAU / WAU / MAU ───────────────────────────────────────────────────────
-    const dau = new Set(allActivity.filter(e => e.ms >= now1ago).map(e => e.user_id)).size;
-    const wau = new Set(allActivity.filter(e => e.ms >= now7ago).map(e => e.user_id)).size;
-    const mau = new Set(allActivity.filter(e => e.ms >= now30ago).map(e => e.user_id)).size;
-
-    // ── Cohort retention ──────────────────────────────────────────────────────
-    // For each user, check whether they had at least one genuine user-action
-    // event within their own cohort window after signup.
-    //
-    // D7  window: signup + 2 days  → signup + 7 days
-    // D28 window: signup + 21 days → signup + 28 days
-    //
-    // Day 1 is excluded from both windows to avoid onboarding noise.
-    // Denominator is all real users old enough to have reached that window.
-
-    // Build a map of user_id → Set of activity timestamps for fast lookup
-    // Build a map of user_id → array of epoch ms timestamps for fast lookup
-    const activityByUser = {};
-    for (const e of allActivity) {
-      if (!activityByUser[e.user_id]) activityByUser[e.user_id] = [];
-      activityByUser[e.user_id].push(e.ms);
-    }
-
-    const nowMs = now.getTime();
-    const d7Cohort  = realAuthUsers.filter(u => new Date(u.created_at).getTime() <= nowMs - 7  * 86400000);
-    const d28Cohort = realAuthUsers.filter(u => new Date(u.created_at).getTime() <= nowMs - 28 * 86400000);
-
-    let d7Retained = 0;
-    for (const u of d7Cohort) {
-      const signupMs    = new Date(u.created_at).getTime();
-      const windowStart = signupMs + 2  * 86400000;
-      const windowEnd   = signupMs + 7  * 86400000;
-      const events = activityByUser[u.id] || [];
-      if (events.some(ms => ms >= windowStart && ms <= windowEnd)) d7Retained++;
-    }
-
-    let d28Retained = 0;
-    for (const u of d28Cohort) {
-      const signupMs    = new Date(u.created_at).getTime();
-      const windowStart = signupMs + 21 * 86400000;
-      const windowEnd   = signupMs + 28 * 86400000;
-      const events = activityByUser[u.id] || [];
-      if (events.some(ms => ms >= windowStart && ms <= windowEnd)) d28Retained++;
-    }
-
-    const d7RetentionRate  = d7Cohort.length  > 0 ? Math.round((d7Retained  / d7Cohort.length)  * 100) : null;
-    const d28RetentionRate = d28Cohort.length > 0 ? Math.round((d28Retained / d28Cohort.length) * 100) : null;
+    const d7RetentionRate  = rm.d7_rate  != null ? Number(rm.d7_rate)  : null;
+    const d14RetentionRate = rm.d14_rate != null ? Number(rm.d14_rate) : null;
+    const d21RetentionRate = rm.d21_rate != null ? Number(rm.d21_rate) : null;
+    const d28RetentionRate = rm.d28_rate != null ? Number(rm.d28_rate) : null;
+    const d7Retained  = Number(rm.d7_retained  || 0);
+    const d28Retained = Number(rm.d28_retained || 0);
+    const d7Cohort    = { length: Number(rm.d7_cohort  || 0) };
+    const d28Cohort   = { length: Number(rm.d28_cohort || 0) };
 
     // ── Derived metrics ───────────────────────────────────────────────────────
     const activationRate    = totalSignups > 0 ? Math.round((totalActivated / totalSignups) * 100) : 0;
@@ -2883,9 +2718,13 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
       // D7:  did they interact in days 2–7 after their own signup date?
       // D28: did they interact in days 21–28 after their own signup date?
       d7Retention:  d7RetentionRate,
+      d14Retention: d14RetentionRate,
+      d21Retention: d21RetentionRate,
       d28Retention: d28RetentionRate,
       d7RetentionRaw:  { retained: d7Retained,  cohort: d7Cohort.length },
       d28RetentionRaw: { retained: d28Retained, cohort: d28Cohort.length },
+      d14RetentionRaw: { retained: Number(rm.d14_retained || 0), cohort: Number(rm.d14_cohort || 0) },
+      d21RetentionRaw: { retained: Number(rm.d21_retained || 0), cohort: Number(rm.d21_cohort || 0) },
 
       // Keep old field names as aliases so the frontend doesn't break
       week1Retention: d7RetentionRate,
