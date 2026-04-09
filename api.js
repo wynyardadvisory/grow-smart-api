@@ -2751,7 +2751,7 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
       db.from("profiles").select("*", { count: "exact", head: true }).eq("is_demo", false),
 
       db.from("locations").select("*", { count: "exact", head: true }).not("user_id", "in", demoExclude),
-      db.from("growing_areas").select("*", { count: "exact", head: true }).not("user_id", "in", demoExclude),
+      db.from("growing_areas").select("*, locations!inner(user_id)", { count: "exact", head: true }).not("locations.user_id", "in", demoExclude),
       db.from("crop_instances").select("*", { count: "exact", head: true }).not("user_id", "in", demoExclude),
 
       db.from("crop_instances").select("*", { count: "exact", head: true }).not("sown_date", "is", null).not("user_id", "in", demoExclude),
