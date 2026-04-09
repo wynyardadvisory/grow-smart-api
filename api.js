@@ -1530,7 +1530,7 @@ app.post("/succession-groups", requireAuth,
 // GET /succession-groups — list all groups with their active sowings
 app.get("/succession-groups", requireAuth, async (req, res) => {
   const { data: groups, error } = await supabaseService.from("succession_groups")
-    .select("*")
+    .select("*, area:area_id(name, type, location_id, location:location_id(name))")
     .eq("user_id", req.user.id)
     .order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
