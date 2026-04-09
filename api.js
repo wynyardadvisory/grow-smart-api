@@ -2648,6 +2648,52 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
     const newSignupsWeek  = realAuthUsers.filter(u => new Date(u.created_at) >= new Date(day7ago)).length;
     const newSignupsLastWeek = realAuthUsers.filter(u => new Date(u.created_at) >= new Date(day28ago) && new Date(u.created_at) < new Date(day7ago)).length;
 
+    const [
+      { count: totalActivated },
+      { count: totalLocations },
+      { count: totalAreas },
+      { count: totalCrops },
+      { count: cropsSown },
+      { count: cropsHarvested },
+      { count: harvestLogs },
+      { count: tasksGenerated },
+      { count: tasksCompleted },
+      { count: totalFeeds },
+      { count: totalPhotos },
+      { count: totalVarieties },
+      { count: yieldDataPoints },
+      { count: emailWaitlistInvites },
+      { count: emailFeedbackDay3 },
+      { count: emailFeedbackDay7 },
+      { count: emailReengageDay14 },
+      { count: emailReengageDay30 },
+      { count: emailDailyFallback },
+      { count: pushTokens },
+      { data: feedbackRatings },
+    ] = await Promise.all([
+      db.from("profiles").select("*", { count: "exact", head: true }).eq("is_demo", false),
+      db.from("locations").select("*", { count: "exact", head: true }).not("user_id", "in", demoExclude),
+      db.from("growing_areas").select("*", { count: "exact", head: true }).not("user_id", "in", demoExclude),
+      db.from("crop_instances").select("*", { count: "exact", head: true }).not("user_id", "in", demoExclude),
+      db.from("crop_instances").select("*", { count: "exact", head: true }).not("sown_date", "is", null).not("user_id", "in", demoExclude),
+      db.from("crop_instances").select("*", { count: "exact", head: true }).eq("status", "harvested").not("user_id", "in", demoExclude),
+      db.from("harvest_log").select("*", { count: "exact", head: true }).not("user_id", "in", demoExclude),
+      db.from("tasks").select("*", { count: "exact", head: true }).is("completed_at", null).not("status", "eq", "expired").not("user_id", "in", demoExclude),
+      db.from("tasks").select("*", { count: "exact", head: true }).not("completed_at", "is", null).not("user_id", "in", demoExclude),
+      db.from("user_feeds").select("*", { count: "exact", head: true }).not("user_id", "in", demoExclude),
+      db.from("crop_photos").select("*", { count: "exact", head: true }).not("user_id", "in", demoExclude),
+      db.from("varieties").select("*", { count: "exact", head: true }),
+      db.from("harvest_log").select("*", { count: "exact", head: true }).not("quantity_value", "is", null).not("user_id", "in", demoExclude),
+      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "waitlist_invite").not("user_id", "in", demoExclude),
+      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "feedback_day3").not("user_id", "in", demoExclude),
+      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "feedback_day7").not("user_id", "in", demoExclude),
+      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "reengage_day14").not("user_id", "in", demoExclude),
+      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "reengage_day30").not("user_id", "in", demoExclude),
+      db.from("email_log").select("*", { count: "exact", head: true }).eq("email_type", "daily_fallback").not("user_id", "in", demoExclude),
+      db.from("device_push_tokens").select("*", { count: "exact", head: true }).eq("is_active", true).not("user_id", "in", demoExclude),
+      db.from("feedback").select("rating").not("rating", "is", null).not("user_id", "in", demoExclude),
+    ]);
+
     // ── DAU / WAU / MAU / Retention — all computed in SQL via RPC ───────────────
     // get_retention_metrics() unions all user-action tables in Postgres,
     // computes cohort windows per user, and returns clean counts.
