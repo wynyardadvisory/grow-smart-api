@@ -2750,26 +2750,36 @@ app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
       db.from("feedback").select("rating").not("rating", "is", null).not("user_id", "in", demoExclude),
 
       // Activity signals — pulled for last 30 days (covers DAU/WAU/MAU + retention windows)
-      db.from("tasks").select("user_id, completed_at").not("completed_at", "is", null).gte("completed_at", day30ago).not("user_id", "in", demoExclude),
-      db.from("harvest_log").select("user_id, harvested_at").gte("harvested_at", day30ago).not("user_id", "in", demoExclude),
-      db.from("manual_activity_logs").select("user_id, performed_at").gte("performed_at", day30ago).not("user_id", "in", demoExclude),
-      db.from("crop_observations").select("user_id, created_at").gte("created_at", day30ago).not("user_id", "in", demoExclude),
-      db.from("crop_photos").select("user_id, created_at").gte("created_at", day30ago).not("user_id", "in", demoExclude),
-      db.from("user_feeds").select("user_id, created_at").gte("created_at", day30ago).not("user_id", "in", demoExclude),
+      // .limit(10000) on each to avoid Supabase's default 1000-row cap silently truncating results
+      db.from("tasks").select("user_id, completed_at").not("completed_at", "is", null).gte("completed_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
+      db.from("harvest_log").select("user_id, harvested_at").gte("harvested_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
+      db.from("manual_activity_logs").select("user_id, performed_at").gte("performed_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
+      db.from("crop_observations").select("user_id, created_at").gte("created_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
+      db.from("crop_photos").select("user_id, created_at").gte("created_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
+      db.from("user_feeds").select("user_id, created_at").gte("created_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
       // crop_instances created after day 1 of signup (onboarding excluded via retention logic below)
-      db.from("crop_instances").select("user_id, created_at").gte("created_at", day30ago).not("user_id", "in", demoExclude),
+      db.from("crop_instances").select("user_id, created_at").gte("created_at", day30ago).not("user_id", "in", demoExclude).limit(10000),
     ]);
 
     // ── Build unified activity event list ─────────────────────────────────────
     // Each entry is { user_id, ts } where ts is the action timestamp.
+    // Normalise all timestamps to full ISO datetime strings so string comparison
+    // works correctly. harvested_at and performed_at are date-only (YYYY-MM-DD)
+    // in the DB — appending T00:00:00.000Z makes them comparable to datetimes.
+    const toISO = ts => {
+      if (!ts) return null;
+      if (ts.includes("T")) return ts; // already a datetime
+      return ts + "T00:00:00.000Z";   // date-only — treat as start of day
+    };
+
     const allActivity = [
-      ...(taskActivity      || []).map(r => ({ user_id: r.user_id, ts: r.completed_at })),
-      ...(harvestActivity   || []).map(r => ({ user_id: r.user_id, ts: r.harvested_at })),
-      ...(activityLogData   || []).map(r => ({ user_id: r.user_id, ts: r.performed_at })),
-      ...(observationActivity || []).map(r => ({ user_id: r.user_id, ts: r.created_at })),
-      ...(photoActivity     || []).map(r => ({ user_id: r.user_id, ts: r.created_at })),
-      ...(feedActivity      || []).map(r => ({ user_id: r.user_id, ts: r.created_at })),
-      ...(cropCreatedActivity || []).map(r => ({ user_id: r.user_id, ts: r.created_at })),
+      ...(taskActivity        || []).map(r => ({ user_id: r.user_id, ts: toISO(r.completed_at) })),
+      ...(harvestActivity     || []).map(r => ({ user_id: r.user_id, ts: toISO(r.harvested_at) })),
+      ...(activityLogData     || []).map(r => ({ user_id: r.user_id, ts: toISO(r.performed_at) })),
+      ...(observationActivity || []).map(r => ({ user_id: r.user_id, ts: toISO(r.created_at) })),
+      ...(photoActivity       || []).map(r => ({ user_id: r.user_id, ts: toISO(r.created_at) })),
+      ...(feedActivity        || []).map(r => ({ user_id: r.user_id, ts: toISO(r.created_at) })),
+      ...(cropCreatedActivity || []).map(r => ({ user_id: r.user_id, ts: toISO(r.created_at) })),
     ].filter(e => e.ts); // drop any nulls
 
     // ── DAU / WAU / MAU ───────────────────────────────────────────────────────
