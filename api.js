@@ -6491,6 +6491,129 @@ app.get("/subscription/manage", requireAuth, async (req, res) => {
   }
 });
 
+// ── Garden Health Score ───────────────────────────────────────────────────────
+// GET /garden/health?location_id=
+// Computes a garden health score (0–100) for the given location.
+// v1 components: task adherence, timing adherence, weather suitability.
+// Returns: score, confidence_level (High/Medium/Low), summary, components.
+
+app.get("/garden/health", requireAuth, async (req, res) => {
+  try {
+    const { location_id } = req.query;
+    const userId = req.user.id;
+    const today  = new Date().toISOString().split("T")[0];
+    const win14  = new Date(Date.now() - 14 * 86400000).toISOString().split("T")[0];
+
+    // ── 1. Verify location ownership ─────────────────────────────────────────
+    let postcode = null;
+    if (location_id) {
+      const { data: loc } = await supabaseService.from("locations")
+        .select("id, postcode").eq("id", location_id).eq("user_id", userId).single();
+      if (!loc) return res.status(404).json({ error: "Location not found" });
+      postcode = loc.postcode;
+    } else {
+      const { data: prof } = await supabaseService.from("profiles")
+        .select("postcode").eq("id", userId).single();
+      postcode = prof?.postcode;
+    }
+
+    // ── 2. Task adherence (last 14 days + today) ──────────────────────────────
+    let taskQuery = supabaseService.from("tasks")
+      .select("id, due_date, completed_at, urgency")
+      .eq("user_id", userId)
+      .gte("due_date", win14)
+      .lte("due_date", today);
+    if (location_id) taskQuery = taskQuery.eq("location_id", location_id);
+
+    const { data: windowTasks } = await taskQuery;
+    const tasks = windowTasks || [];
+
+    let taskAdherence   = 70; // neutral default — no tasks ≠ perfect health
+    let timingAdherence = 70;
+
+    if (tasks.length > 0) {
+      const urgencyWeight = u => u === "high" ? 3 : u === "medium" ? 2 : 1;
+      let totalWeight = 0, completedWeight = 0;
+      let timingTotal = 0, timingWeight = 0;
+
+      for (const t of tasks) {
+        const w = urgencyWeight(t.urgency);
+        totalWeight += w;
+        if (t.completed_at) {
+          completedWeight += w;
+          const daysLate = Math.round(
+            (new Date(t.completed_at).getTime() - new Date(t.due_date).getTime()) / 86400000
+          );
+          const timingScore =
+            daysLate <= 0  ? 100 :
+            daysLate <= 3  ? 85  :
+            daysLate <= 7  ? 65  :
+            daysLate <= 14 ? 40  : 15;
+          timingTotal  += timingScore * w;
+          timingWeight += w;
+        }
+      }
+
+      taskAdherence   = Math.round((completedWeight / totalWeight) * 100);
+      timingAdherence = timingWeight > 0 ? Math.round(timingTotal / timingWeight) : 70;
+    }
+
+    // ── 3. Weather suitability ────────────────────────────────────────────────
+    let weatherSuitability = 70;
+    if (postcode) {
+      const { data: wx } = await supabaseService.from("weather_cache")
+        .select("temp_c, frost_risk, rain_mm")
+        .eq("postcode", postcode)
+        .gt("expires_at", new Date().toISOString())
+        .single();
+      if (wx) {
+        let wxScore = 80;
+        if (wx.frost_risk)                           wxScore -= 25;
+        if (wx.temp_c < 5)                           wxScore -= 15;
+        else if (wx.temp_c > 30)                     wxScore -= 10;
+        if (wx.rain_mm > 20)                         wxScore -= 10;
+        else if (wx.rain_mm < 1 && wx.temp_c > 18)  wxScore -= 5;
+        weatherSuitability = Math.max(10, Math.min(100, wxScore));
+      }
+    }
+
+    // ── 4. Final weighted score ───────────────────────────────────────────────
+    const score = Math.round(
+      0.45 * taskAdherence +
+      0.35 * timingAdherence +
+      0.20 * weatherSuitability
+    );
+
+    // ── 5. Confidence level ───────────────────────────────────────────────────
+    const hasTasks   = tasks.length >= 3 ? 1 : tasks.length >= 1 ? 0.5 : 0;
+    const hasWeather = postcode ? 1 : 0;
+    const confRaw    = (hasTasks * 0.7 + hasWeather * 0.3) * 100;
+    const confidence_level =
+      confRaw >= 70 ? "High" : confRaw >= 40 ? "Medium" : "Low";
+
+    // ── 6. Summary copy ───────────────────────────────────────────────────────
+    const summary =
+      score >= 80 ? "Your garden is in good shape — keep it up." :
+      score >= 65 ? "Good progress, but a few tasks could use attention." :
+      score >= 50 ? "Some missed tasks may be affecting your garden's condition." :
+                    "Several tasks are overdue — your garden needs attention.";
+
+    res.json({
+      score:            Math.max(0, Math.min(100, score)),
+      confidence_level,
+      summary,
+      components: {
+        task_adherence:      taskAdherence,
+        timing_adherence:    timingAdherence,
+        weather_suitability: weatherSuitability,
+      },
+    });
+  } catch (err) {
+    captureError("GardenHealth", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Garden Plans CRUD ─────────────────────────────────────────────────────────
 
 app.get("/plans", requireAuth, async (req, res) => {
