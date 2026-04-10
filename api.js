@@ -6689,12 +6689,22 @@ app.get("/garden/health", requireAuth, async (req, res) => {
 
         const areaScores = soilAreas.map(a => {
           let fields = 0;
-          if (a.soil_moisture && isRecent(a.soil_moisture_logged_at, 7))   fields++;
-          if (a.soil_temperature_c !== null && isRecent(a.soil_temperature_logged_at, 7)) fields++;
-          if (a.soil_ph !== null && isRecent(a.soil_ph_logged_at, 90))     fields++;
+          // moisture: valid 30 days (changes slowly in most UK conditions)
+          // temperature: valid 30 days
+          // pH: valid 90 days (stable — changes very slowly)
+          if (a.soil_moisture && isRecent(a.soil_moisture_logged_at, 30))          fields++;
+          if (a.soil_temperature_c !== null && isRecent(a.soil_temperature_logged_at, 30)) fields++;
+          if (a.soil_ph !== null && isRecent(a.soil_ph_logged_at, 90))              fields++;
           if (fields > 0) hasSoilData = true;
           return (fields / 3) * 100;
         });
+
+        // Also count areas with ANY soil data (even older) as having data
+        if (!hasSoilData) {
+          hasSoilData = soilAreas.some(a =>
+            a.soil_moisture || a.soil_temperature_c !== null || a.soil_ph !== null
+          );
+        }
 
         soilDataQuality = Math.round(areaScores.reduce((a, b) => a + b, 0) / areaScores.length);
       }
