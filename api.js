@@ -696,6 +696,13 @@ app.put("/areas/:id", requireAuth, async (req, res) => {
       updates.soil_moisture_logged_at = new Date().toISOString();
     }
   }
+  // soil_ph and soil_temperature_c: auto-stamp logged_at when a real value is saved
+  if ("soil_ph" in updates) {
+    updates.soil_ph_logged_at = updates.soil_ph !== null ? new Date().toISOString() : null;
+  }
+  if ("soil_temperature_c" in updates) {
+    updates.soil_temperature_logged_at = updates.soil_temperature_c !== null ? new Date().toISOString() : null;
+  }
   const { data, error } = await req.db.from("growing_areas")
     .update(updates).eq("id", req.params.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
