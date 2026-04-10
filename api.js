@@ -6528,7 +6528,7 @@ app.get("/garden/health", requireAuth, async (req, res) => {
     const { data: windowTasks } = await taskQuery;
     const tasks = windowTasks || [];
 
-    let taskAdherence   = 70; // neutral default — no tasks ≠ perfect health
+    let taskAdherence   = 70;
     let timingAdherence = 70;
 
     if (tasks.length > 0) {
@@ -6560,6 +6560,7 @@ app.get("/garden/health", requireAuth, async (req, res) => {
 
     // ── 3. Weather suitability ────────────────────────────────────────────────
     let weatherSuitability = 70;
+    let hasWeatherData = false;
     if (postcode) {
       const { data: wx } = await supabaseService.from("weather_cache")
         .select("temp_c, frost_risk, rain_mm")
@@ -6567,6 +6568,7 @@ app.get("/garden/health", requireAuth, async (req, res) => {
         .gt("expires_at", new Date().toISOString())
         .single();
       if (wx) {
+        hasWeatherData = true;
         let wxScore = 80;
         if (wx.frost_risk)                           wxScore -= 25;
         if (wx.temp_c < 5)                           wxScore -= 15;
@@ -6577,39 +6579,389 @@ app.get("/garden/health", requireAuth, async (req, res) => {
       }
     }
 
-    // ── 4. Final weighted score ───────────────────────────────────────────────
+    // ── 4. Observation freshness ──────────────────────────────────────────────
+    // Score per active crop: days since last observation log
+    let observationFreshness = 60; // default — no observation data
+    let hasObservationData   = false;
+    {
+      // Get active crop IDs for this location
+      let cropQuery = supabaseService.from("crop_instances")
+        .select("id, area_id")
+        .eq("user_id", userId)
+        .eq("active", true);
+
+      if (location_id) {
+        const { data: areaRows } = await supabaseService.from("growing_areas")
+          .select("id").eq("location_id", location_id);
+        const areaIds = (areaRows || []).map(a => a.id);
+        if (areaIds.length) cropQuery = cropQuery.in("area_id", areaIds);
+        else cropQuery = null;
+      }
+
+      if (cropQuery) {
+        const { data: activeCrops } = await cropQuery;
+        const cropIds = (activeCrops || []).map(c => c.id);
+
+        if (cropIds.length > 0) {
+          // Most recent observation per crop
+          const { data: obsRows } = await supabaseService.from("observation_logs")
+            .select("crop_id, observed_at")
+            .eq("user_id", userId)
+            .in("crop_id", cropIds)
+            .order("observed_at", { ascending: false });
+
+          const latestByCrop = {};
+          for (const o of (obsRows || [])) {
+            if (!latestByCrop[o.crop_id]) latestByCrop[o.crop_id] = o.observed_at;
+          }
+
+          const nowMs = Date.now();
+          const scores = cropIds.map(id => {
+            const lastObs = latestByCrop[id];
+            if (!lastObs) return 10; // never observed
+            const days = Math.round((nowMs - new Date(lastObs).getTime()) / 86400000);
+            return days <= 7  ? 100 :
+                   days <= 14 ? 80  :
+                   days <= 21 ? 55  :
+                   days <= 35 ? 30  : 10;
+          });
+
+          observationFreshness = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
+          hasObservationData   = obsRows?.length > 0;
+        }
+      }
+    }
+
+    // ── 5. Crop condition ─────────────────────────────────────────────────────
+    // Derived from crop_instances status and missed_task_note
+    let cropCondition   = 75; // default
+    let hasCropData     = false;
+    {
+      let ccQuery = supabaseService.from("crop_instances")
+        .select("id, status, missed_task_note, active")
+        .eq("user_id", userId)
+        .eq("active", true);
+
+      if (location_id) {
+        const { data: areaRows } = await supabaseService.from("growing_areas")
+          .select("id").eq("location_id", location_id);
+        const areaIds = (areaRows || []).map(a => a.id);
+        if (areaIds.length) ccQuery = ccQuery.in("area_id", areaIds);
+        else ccQuery = null;
+      }
+
+      if (ccQuery) {
+        const { data: activeCrops } = await ccQuery;
+        if (activeCrops?.length > 0) {
+          hasCropData = true;
+          let total = 0;
+          for (const c of activeCrops) {
+            let s = 80;
+            if (c.missed_task_note) s -= 20;
+            if (c.status === "harvesting") s = Math.max(s, 85);
+            total += s;
+          }
+          cropCondition = Math.round(total / activeCrops.length);
+        }
+      }
+    }
+
+    // ── 6. Soil data quality ──────────────────────────────────────────────────
+    // Scores how complete and recent area soil data is
+    let soilDataQuality = 0;
+    let hasSoilData     = false;
+    {
+      let soilQuery = supabaseService.from("growing_areas")
+        .select("soil_moisture, soil_moisture_logged_at, soil_ph, soil_ph_logged_at, soil_temperature_c, soil_temperature_logged_at");
+      if (location_id) soilQuery = soilQuery.eq("location_id", location_id);
+      else {
+        // Get all locations for user
+        const { data: locs } = await supabaseService.from("locations").select("id").eq("user_id", userId);
+        const locIds = (locs || []).map(l => l.id);
+        if (locIds.length) soilQuery = soilQuery.in("location_id", locIds);
+      }
+
+      const { data: soilAreas } = await soilQuery;
+      if (soilAreas?.length > 0) {
+        const nowMs = Date.now();
+        const isRecent = (loggedAt, maxDays) =>
+          loggedAt && (nowMs - new Date(loggedAt).getTime()) / 86400000 <= maxDays;
+
+        const areaScores = soilAreas.map(a => {
+          let fields = 0;
+          if (a.soil_moisture && isRecent(a.soil_moisture_logged_at, 7))   fields++;
+          if (a.soil_temperature_c !== null && isRecent(a.soil_temperature_logged_at, 7)) fields++;
+          if (a.soil_ph !== null && isRecent(a.soil_ph_logged_at, 90))     fields++;
+          if (fields > 0) hasSoilData = true;
+          return (fields / 3) * 100;
+        });
+
+        soilDataQuality = Math.round(areaScores.reduce((a, b) => a + b, 0) / areaScores.length);
+      }
+    }
+
+    // ── 7. Final weighted score (extended) ────────────────────────────────────
+    // Weights: task 30%, timing 20%, observation 10%, soil 10%, weather 10%, crop condition 10%
+    // Remaining 10% distributed back to task+timing when soil/obs missing
     const score = Math.round(
-      0.45 * taskAdherence +
-      0.35 * timingAdherence +
-      0.20 * weatherSuitability
+      0.30 * taskAdherence   +
+      0.20 * timingAdherence +
+      0.15 * observationFreshness +
+      0.10 * cropCondition   +
+      0.15 * weatherSuitability +
+      0.10 * soilDataQuality
     );
 
-    // ── 5. Confidence level ───────────────────────────────────────────────────
-    const hasTasks   = tasks.length >= 3 ? 1 : tasks.length >= 1 ? 0.5 : 0;
-    const hasWeather = postcode ? 1 : 0;
-    const confRaw    = (hasTasks * 0.7 + hasWeather * 0.3) * 100;
+    // ── 8. Confidence level (extended) ───────────────────────────────────────
+    const confInputs = [
+      { weight: 0.30, score: tasks.length >= 3 ? 1 : tasks.length >= 1 ? 0.5 : 0 },
+      { weight: 0.20, score: hasObservationData ? 1 : 0.2 },
+      { weight: 0.20, score: hasSoilData ? 1 : 0 },
+      { weight: 0.15, score: hasWeatherData ? 1 : 0.4 },
+      { weight: 0.15, score: hasCropData ? 0.8 : 0.2 },
+    ];
+    const confRaw = confInputs.reduce((sum, c) => sum + c.weight * c.score, 0) * 100;
     const confidence_level =
       confRaw >= 70 ? "High" : confRaw >= 40 ? "Medium" : "Low";
 
-    // ── 6. Summary copy ───────────────────────────────────────────────────────
+    const confidenceNote =
+      !hasObservationData && !hasSoilData ? "Log crop observations and soil data to improve accuracy" :
+      !hasSoilData                         ? "Add soil data to your areas to improve accuracy" :
+      !hasObservationData                  ? "Log crop observations to improve accuracy" :
+      confidence_level === "High"          ? "Based on tasks, observations, soil data and weather" :
+                                             "Based on recent activity and weather";
+
+    // ── 9. Summary copy ───────────────────────────────────────────────────────
     const summary =
       score >= 80 ? "Your garden is in good shape — keep it up." :
       score >= 65 ? "Good progress, but a few tasks could use attention." :
       score >= 50 ? "Some missed tasks may be affecting your garden's condition." :
                     "Several tasks are overdue — your garden needs attention.";
 
+    // ── 10. Risk flags ────────────────────────────────────────────────────────
+    const risk_flags = [];
+    if (taskAdherence < 50)          risk_flags.push("Several tasks are overdue");
+    if (timingAdherence < 50)        risk_flags.push("Task timing has been consistently late");
+    if (observationFreshness < 40)   risk_flags.push("Crops haven't been checked recently");
+    if (!hasSoilData)                risk_flags.push("No soil data — health score is an estimate");
+    if (weatherSuitability < 50)     risk_flags.push("Current weather conditions are challenging");
+
     res.json({
       score:            Math.max(0, Math.min(100, score)),
       confidence_level,
+      confidence_note:  confidenceNote,
       summary,
+      risk_flags,
       components: {
-        task_adherence:      taskAdherence,
-        timing_adherence:    timingAdherence,
-        weather_suitability: weatherSuitability,
+        task_adherence:       taskAdherence,
+        timing_adherence:     timingAdherence,
+        observation_freshness: observationFreshness,
+        crop_condition:       cropCondition,
+        weather_suitability:  weatherSuitability,
+        soil_data_quality:    soilDataQuality,
       },
     });
   } catch (err) {
     captureError("GardenHealth", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Plan Quality Score ───────────────────────────────────────────────────────
+// GET /garden/plan-quality?plan_id=
+// Computes quality metrics for a draft or committed garden plan.
+// Returns: score, label, rotation_quality, space_efficiency, effort_level,
+//          yield_potential, confidence_level, risk_flags
+
+app.get("/garden/plan-quality", requireAuth, async (req, res) => {
+  try {
+    const { plan_id } = req.query;
+    if (!plan_id) return res.status(400).json({ error: "plan_id required" });
+    const userId = req.user.id;
+
+    // ── 1. Load plan + verify ownership ──────────────────────────────────────
+    const { data: plan, error: planErr } = await supabaseService.from("garden_plans")
+      .select("id, location_id, name, status")
+      .eq("id", plan_id).eq("user_id", userId).single();
+    if (planErr || !plan) return res.status(404).json({ error: "Plan not found" });
+
+    // ── 2. Load plan assignments with crop category ───────────────────────────
+    const { data: assignments } = await supabaseService.from("plan_area_assignments")
+      .select("area_id, crop_name, crop_definition:crop_definitions(name, category, days_to_maturity_min, days_to_maturity_max)")
+      .eq("plan_id", plan_id);
+
+    // ── 3. Load all areas for location (for space efficiency) ─────────────────
+    const { data: allAreas } = await supabaseService.from("growing_areas")
+      .select("id, width_m, length_m, type")
+      .eq("location_id", plan.location_id);
+
+    // ── 4. Load crop history per area (for rotation quality) ──────────────────
+    const areaIds = (allAreas || []).map(a => a.id);
+    let cropHistory = []; // { area_id, category }
+    if (areaIds.length) {
+      const { data: hist } = await supabaseService.from("crop_instances")
+        .select("area_id, crop_definitions(category)")
+        .eq("user_id", userId)
+        .in("area_id", areaIds)
+        .eq("status", "harvested")
+        .not("harvested_at", "is", null)
+        .order("harvested_at", { ascending: false });
+
+      // Keep only most recent per area
+      const seen = new Set();
+      for (const c of (hist || [])) {
+        if (!seen.has(c.area_id)) {
+          seen.add(c.area_id);
+          cropHistory.push({ area_id: c.area_id, category: c.crop_definitions?.category || null });
+        }
+      }
+    }
+
+    const assignArr  = assignments || [];
+    const assignMap  = Object.fromEntries(assignArr.map(a => [a.area_id, a]));
+    const histMap    = Object.fromEntries(cropHistory.map(h => [h.area_id, h.category]));
+    const totalAreas = allAreas?.length || 0;
+    const plannedAreas = assignArr.length;
+
+    // ── 5. Rotation quality ───────────────────────────────────────────────────
+    // Start at 100, apply penalties for same-family repeats and bonuses for diversity
+    let rotationScore = 100;
+    const familiesUsed = new Set();
+    let legumePlanned  = false;
+
+    for (const a of assignArr) {
+      const plannedCat = a.crop_definition?.category || null;
+      const prevCat    = histMap[a.area_id] || null;
+      if (plannedCat) familiesUsed.add(plannedCat);
+      if (plannedCat === "legume") legumePlanned = true;
+
+      if (plannedCat && prevCat) {
+        if (plannedCat === prevCat)                                    rotationScore -= 30;
+        else if (plannedCat === "brassica" && prevCat === "brassica")  rotationScore -= 20;
+        else if (plannedCat === "fruiting" && prevCat === "fruiting")  rotationScore -= 15;
+      }
+    }
+
+    // Bonus: good diversity
+    if (familiesUsed.size >= 3) rotationScore += 5;
+    if (legumePlanned)          rotationScore += 5;
+    // Penalty: no assignments at all
+    if (plannedAreas === 0)     rotationScore  = 50;
+
+    rotationScore = Math.max(0, Math.min(100, rotationScore));
+
+    // ── 6. Space efficiency ───────────────────────────────────────────────────
+    let spaceEfficiency = 0;
+    if (totalAreas > 0) {
+      // Area-based: what fraction of available areas have a crop planned
+      const occupancy = plannedAreas / totalAreas;
+
+      // If we have dimensions, use m²
+      const totalM2   = (allAreas || []).reduce((s, a) => s + ((a.width_m || 0) * (a.length_m || 0)), 0);
+      const plannedM2 = assignArr.reduce((s, a) => {
+        const area = (allAreas || []).find(ar => ar.id === a.area_id);
+        return s + ((area?.width_m || 0) * (area?.length_m || 0));
+      }, 0);
+
+      spaceEfficiency = totalM2 > 0
+        ? Math.round((plannedM2 / totalM2) * 100)
+        : Math.round(occupancy * 100);
+
+      // Cap at 95 — 100% is theoretically overplanted
+      spaceEfficiency = Math.min(95, spaceEfficiency);
+    }
+
+    // ── 7. Effort level ───────────────────────────────────────────────────────
+    // Based on crop categories — fruiting/brassica = higher effort, salad/herb = lower
+    const effortByCategory = {
+      fruiting: 3, brassica: 3, root: 2, allium: 2,
+      legume: 2, salad: 1, herb: 1, perennial: 1, fruit: 2,
+    };
+    let effortTotal = 0, effortCount = 0;
+    for (const a of assignArr) {
+      const cat = a.crop_definition?.category;
+      if (cat && effortByCategory[cat] !== undefined) {
+        effortTotal += effortByCategory[cat];
+        effortCount++;
+      }
+    }
+    const effortAvg = effortCount > 0 ? effortTotal / effortCount : 2;
+    const effort_level =
+      effortAvg >= 2.5 ? "High" : effortAvg >= 1.7 ? "Moderate" : "Low";
+    const effort_score = Math.round((1 - (effortAvg - 1) / 2) * 100); // invert for 0-100
+
+    // ── 8. Yield potential ────────────────────────────────────────────────────
+    // Directional — based on crop selection and rotation quality
+    let yieldScore = 60; // baseline
+    if (assignArr.length > 0) {
+      // Fruiting and root crops tend to yield more by weight
+      const highYieldCats = new Set(["fruiting", "root"]);
+      const highYieldCount = assignArr.filter(a => highYieldCats.has(a.crop_definition?.category)).length;
+      yieldScore += (highYieldCount / assignArr.length) * 20;
+      // Rotation bonus
+      yieldScore += (rotationScore / 100) * 15;
+      // Space utilisation
+      yieldScore += (spaceEfficiency / 100) * 10;
+    }
+    yieldScore = Math.round(Math.max(0, Math.min(100, yieldScore)));
+    const yield_potential =
+      yieldScore >= 75 ? "Strong" : yieldScore >= 55 ? "Moderate" : "Limited";
+
+    // ── 9. Plan quality score (composite) ────────────────────────────────────
+    // Weights: rotation 35%, yield 25%, space 20%, effort 10%, assignments 10%
+    const assignmentCompleteness = totalAreas > 0 ? Math.min(100, (plannedAreas / totalAreas) * 100) : 0;
+    const planScore = Math.round(
+      0.35 * rotationScore          +
+      0.25 * yieldScore             +
+      0.20 * spaceEfficiency        +
+      0.10 * effort_score           +
+      0.10 * assignmentCompleteness
+    );
+
+    const plan_label =
+      planScore >= 85 ? "Strong"   :
+      planScore >= 70 ? "Good"     :
+      planScore >= 50 ? "Balanced" : "Needs attention";
+
+    // ── 10. Confidence ────────────────────────────────────────────────────────
+    const hasHistory     = cropHistory.length > 0;
+    const hasDimensions  = (allAreas || []).some(a => a.width_m && a.length_m);
+    const confRaw =
+      (plannedAreas > 0 ? 0.4 : 0) +
+      (hasHistory       ? 0.3 : 0) +
+      (hasDimensions    ? 0.2 : 0) +
+      0.1; // base
+    const confidence_level =
+      confRaw >= 0.8 ? "High" : confRaw >= 0.5 ? "Medium" : "Low";
+
+    // ── 11. Risk flags ────────────────────────────────────────────────────────
+    const risk_flags = [];
+    if (plannedAreas === 0)       risk_flags.push("No crops assigned to areas yet");
+    if (rotationScore < 60)       risk_flags.push("Repeated crop families increase disease risk");
+    if (spaceEfficiency < 40)     risk_flags.push("Most areas are unplanned — space underused");
+    if (!hasHistory)              risk_flags.push("No crop history — rotation quality is estimated");
+    if (plannedAreas < totalAreas * 0.5 && totalAreas > 1)
+                                  risk_flags.push(`${totalAreas - plannedAreas} area${totalAreas - plannedAreas > 1 ? "s" : ""} without a planned crop`);
+
+    res.json({
+      score:             Math.max(0, Math.min(100, planScore)),
+      label:             plan_label,
+      confidence_level,
+      rotation_quality:  rotationScore,
+      space_efficiency:  spaceEfficiency,
+      effort_level,
+      yield_potential,
+      yield_score:       yieldScore,
+      risk_flags,
+      meta: {
+        planned_areas:  plannedAreas,
+        total_areas:    totalAreas,
+        has_history:    hasHistory,
+        has_dimensions: hasDimensions,
+      },
+    });
+  } catch (err) {
+    captureError("PlanQuality", err);
     res.status(500).json({ error: err.message });
   }
 });
