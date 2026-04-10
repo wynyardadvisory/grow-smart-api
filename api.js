@@ -5071,7 +5071,7 @@ app.post("/crops/:id/observe", requireAuth, async (req, res) => {
     updates.timeline_offset_days = timeline_offset_days;
     engineActions.push("timeline_offset_applied");
   }
-  if (Object.keys(updates).length > 0) { updates.updated_at = new Date().toISOString(); await req.db.from("crop_instances").update(updates).eq("id", req.params.id).eq("user_id", req.user.id); }
+  if (Object.keys(updates).length > 0) { updates.updated_at = new Date().toISOString(); await supabaseService.from("crop_instances").update(updates).eq("id", req.params.id).eq("user_id", req.user.id); }
 
   // ── Crop-scoped task purge — runs when stage or timeline offset changes ────
   // Clears open engine-generated tasks for this crop so the rule engine
