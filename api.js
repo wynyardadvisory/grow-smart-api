@@ -5053,7 +5053,7 @@ app.post("/crops/:id/observe", requireAuth, async (req, res) => {
   const { data: obs, error: obsErr } = await req.db.from("observation_logs").insert({
     user_id: req.user.id, crop_id: req.params.id,
     observed_at: new Date().toISOString().split("T")[0],
-    observation_type, symptom_code: symptom_code || null,
+    observation_type: "other", symptom_code: symptom_code || null,
     severity: severity || null, notes: notes || null,
   }).select().single();
   if (obsErr) return res.status(500).json({ error: obsErr.message });
