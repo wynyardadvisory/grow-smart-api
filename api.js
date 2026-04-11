@@ -5581,6 +5581,95 @@ app.get("/activity/insights", requireAuth, async (req, res) => {
   }
 });
 
+// GET /activity/:id — fetch single activity event
+app.get("/activity/:id", requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabaseService
+      .from("activity_events")
+      .select("*")
+      .eq("id", req.params.id)
+      .eq("user_id", req.user.id)
+      .single();
+    if (error || !data) return res.status(404).json({ error: "Not found" });
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PATCH /activity/:id — edit manual activity (note only for now)
+app.patch("/activity/:id", requireAuth, async (req, res) => {
+  try {
+    const { note } = req.body;
+
+    // Verify it exists, belongs to user, and is manual
+    const { data: existing } = await supabaseService
+      .from("activity_events")
+      .select("id, is_manual, source_table, source_id")
+      .eq("id", req.params.id)
+      .eq("user_id", req.user.id)
+      .single();
+
+    if (!existing)          return res.status(404).json({ error: "Not found" });
+    if (!existing.is_manual) return res.status(403).json({ error: "Only manual logs can be edited" });
+
+    // Update activity_events
+    const { data, error } = await supabaseService
+      .from("activity_events")
+      .update({ note: note ?? null })
+      .eq("id", req.params.id)
+      .eq("user_id", req.user.id)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: error.message });
+
+    // Mirror note update to source table
+    if (existing.source_table === "manual_activity_logs") {
+      await supabaseService.from("manual_activity_logs")
+        .update({ notes: note ?? null })
+        .eq("id", existing.source_id);
+    }
+
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /activity/:id — delete manual activity
+app.delete("/activity/:id", requireAuth, async (req, res) => {
+  try {
+    const { data: existing } = await supabaseService
+      .from("activity_events")
+      .select("id, is_manual, source_table, source_id")
+      .eq("id", req.params.id)
+      .eq("user_id", req.user.id)
+      .single();
+
+    if (!existing)           return res.status(404).json({ error: "Not found" });
+    if (!existing.is_manual) return res.status(403).json({ error: "Only manual logs can be deleted" });
+
+    // Delete from source table first
+    if (existing.source_table === "manual_activity_logs") {
+      await supabaseService.from("manual_activity_logs")
+        .delete()
+        .eq("id", existing.source_id);
+    }
+
+    // Delete from activity_events
+    const { error } = await supabaseService
+      .from("activity_events")
+      .delete()
+      .eq("id", req.params.id)
+      .eq("user_id", req.user.id);
+    if (error) return res.status(500).json({ error: error.message });
+
+    res.json({ deleted: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /activity/log
 // Generic activity logging — supports scope_ids (array) for multi-area logging.
 // activity_type: watered | fed | pruned_mulched | weeded | other
