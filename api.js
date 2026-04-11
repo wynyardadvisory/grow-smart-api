@@ -2202,6 +2202,59 @@ app.get("/blocked-periods/:id/adjustments", requireAuth, async (req, res) => {
 // =============================================================================
 // AREA OPTIMISER
 // AI-powered suggestions for every area — empty or populated.
+// ── Boost This Area — feature usage tracking ──────────────────────────────────
+// Free users get 3 lifetime uses tracked server-side.
+// Pro users and Mark bypass entirely.
+// GET  /features/boost-status — returns current usage and whether they can use
+// POST /features/boost-use    — increments counter (only if allowed)
+
+const BOOST_LIMIT = 3;
+
+app.get("/features/boost-status", requireAuth, async (req, res) => {
+  try {
+    const { data: profile, error } = await req.db.from("profiles")
+      .select("boost_uses, plan").eq("id", req.user.id).single();
+    if (error) throw error;
+
+    const uses   = profile?.boost_uses || 0;
+    const isPro  = profile?.plan === "pro";
+    const canUse = isPro || uses < BOOST_LIMIT;
+
+    res.json({ uses, limit: BOOST_LIMIT, is_pro: isPro, can_use: canUse });
+  } catch (err) {
+    captureError("BoostStatus", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/features/boost-use", requireAuth, async (req, res) => {
+  try {
+    const { data: profile, error } = await req.db.from("profiles")
+      .select("boost_uses, plan").eq("id", req.user.id).single();
+    if (error) throw error;
+
+    const isPro = profile?.plan === "pro";
+    const uses  = profile?.boost_uses || 0;
+
+    // Pro users don't consume the counter
+    if (isPro) return res.json({ uses, limit: BOOST_LIMIT, is_pro: true, can_use: true });
+
+    // Block if already at limit
+    if (uses >= BOOST_LIMIT) {
+      return res.status(403).json({ error: "boost_limit_reached", uses, limit: BOOST_LIMIT, can_use: false });
+    }
+
+    // Increment
+    const newUses = uses + 1;
+    await req.db.from("profiles").update({ boost_uses: newUses }).eq("id", req.user.id);
+
+    res.json({ uses: newUses, limit: BOOST_LIMIT, is_pro: false, can_use: newUses < BOOST_LIMIT });
+  } catch (err) {
+    captureError("BoostUse", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Empty areas: "what to plant here". Populated areas: "what to add / boost with".
 // Cache is invalidated whenever crops are added, deleted or harvested in the area.
 // =============================================================================
