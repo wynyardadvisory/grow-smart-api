@@ -5400,6 +5400,52 @@ app.post("/crops/:id/log-action", requireAuth, async (req, res) => {
   res.json({ ok: true, action_type: canonicalType, next_action_hint: nextActionHint });
 });
 
+// =============================================================================
+// ACTIVITY FEED
+// =============================================================================
+
+// GET /activity/feed
+// Returns paginated reverse-chronological activity feed for the authenticated user.
+// Query params:
+//   cursor        — occurred_at ISO string — return items older than this
+//   limit         — default 25, max 50
+//   event_type    — filter to single event type
+//   location_id   — filter by location
+//   area_id       — filter by area
+//   crop_instance_id — filter by crop
+app.get("/activity/feed", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const limit  = Math.min(parseInt(req.query.limit) || 25, 50);
+    const { cursor, event_type, location_id, area_id, crop_instance_id } = req.query;
+
+    let query = req.db
+      .from("activity_events")
+      .select("id, event_type, title, subtitle, occurred_at, note, photo_url, quantity_g, quantity_units, location_id, location_name, area_id, area_name, crop_instance_id, crop_name, is_manual")
+      .eq("user_id", userId)
+      .order("occurred_at", { ascending: false })
+      .order("created_at",  { ascending: false })
+      .limit(limit + 1); // fetch one extra to determine if there's a next page
+
+    if (cursor)           query = query.lt("occurred_at", cursor);
+    if (event_type)       query = query.eq("event_type", event_type);
+    if (location_id)      query = query.eq("location_id", location_id);
+    if (area_id)          query = query.eq("area_id", area_id);
+    if (crop_instance_id) query = query.eq("crop_instance_id", crop_instance_id);
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: error.message });
+
+    const hasMore   = data.length > limit;
+    const items     = hasMore ? data.slice(0, limit) : data;
+    const nextCursor = hasMore ? items[items.length - 1].occurred_at : null;
+
+    res.json({ items, next_cursor: nextCursor, has_more: hasMore });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /activity/log
 // Generic activity logging — supports scope_ids (array) for multi-area logging.
 // activity_type: watered | fed | pruned_mulched | weeded | other
