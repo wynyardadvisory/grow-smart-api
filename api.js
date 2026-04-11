@@ -6386,25 +6386,83 @@ app.get("/subscription/status", requireAuth, async (req, res) => {
 // STRIPE — WEB SUBSCRIPTION CHECKOUT
 // =============================================================================
 
+// ── Stripe price IDs — all tiers and intervals ───────────────────────────────
 const STRIPE_PRICES = {
-  early:    "price_1TGz47D44o8wCiOZ9mG7HREJ", // £49/year — early subscriber loyalty price
-  standard: "price_1TGz5jD44o8wCiOZIsEcIwBT", // £79/year — standard price
+  loyalty:        { monthly: "price_1TL2MGD44o8wCiOZpMYxjCJV", annual: "price_1TL2MeD44o8wCiOZGML8xig4" },
+  early_supporter:{ monthly: "price_1TGz5jD44o8wCiOZIsEcIwBT", annual: "price_1TGz47D44o8wCiOZ9mG7HREJ" },
+  standard:       { monthly: "price_1TL2MyD44o8wCiOZQlbK4l1e", annual: "price_1TL2NGD44o8wCiOZG5yJjCKE" },
 };
+
+// ── Launch date ───────────────────────────────────────────────────────────────
+// Set this to the ISO date string when PRO_ENABLED goes live (e.g. "2026-04-15").
+// Users registered on or before this date get loyalty pricing for 28 days.
+// Leave empty string until you go live — existing users will be backfilled to
+// price_tier=loyalty in profiles at that point.
+const LAUNCH_DATE = process.env.LAUNCH_DATE || "";
+const LOYALTY_WINDOW_DAYS = 28;
+
+// ── Resolve the correct price tier for a user ─────────────────────────────────
+// loyalty    → registered user who subscribes within 28 days of launch
+// early_supporter → new user subscribing after launch (or loyalty window closed)
+// standard   → full price
+function resolveUserPriceTier(profilePriceTier) {
+  if (!LAUNCH_DATE) return "early_supporter"; // pre-launch: use early supporter as default
+  const launchMs = new Date(LAUNCH_DATE).getTime();
+  const nowMs    = Date.now();
+  const daysSinceLaunch = (nowMs - launchMs) / 86400000;
+
+  if (profilePriceTier === "loyalty" && daysSinceLaunch <= LOYALTY_WINDOW_DAYS) {
+    return "loyalty";
+  }
+  if (daysSinceLaunch <= 90) return "early_supporter"; // 90-day early supporter window
+  return "standard";
+}
+
+// GET /subscription/pricing
+// Returns the correct prices to show this user in the paywall.
+app.get("/subscription/pricing", requireAuth, async (req, res) => {
+  try {
+    const { data: profile } = await supabaseService
+      .from("profiles").select("price_tier").eq("id", req.user.id).single();
+
+    const tier   = resolveUserPriceTier(profile?.price_tier || "standard");
+    const prices = STRIPE_PRICES[tier] || STRIPE_PRICES.standard;
+
+    const DISPLAY = {
+      loyalty:         { monthly: "£2.99", annual: "£29",  label: "Loyalty offer",         badge: "Your special price" },
+      early_supporter: { monthly: "£4.99", annual: "£49",  label: "Early supporter offer", badge: "Best value" },
+      standard:        { monthly: "£5.99", annual: "£59",  label: null,                    badge: "Best value" },
+    };
+
+    res.json({
+      tier,
+      monthly_price_id: prices.monthly,
+      annual_price_id:  prices.annual,
+      display:          DISPLAY[tier],
+    });
+  } catch (err) {
+    captureError("SubscriptionPricing", err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // POST /subscription/create-checkout
 // Creates a Stripe Checkout session for web subscribers.
-// Returns a URL to redirect the user to Stripe's hosted checkout page.
+// Resolves correct price based on user's price_tier and loyalty window.
 app.post("/subscription/create-checkout", requireAuth, async (req, res) => {
   try {
-    const { price_type = "standard" } = req.body; // "early" or "standard"
-    const priceId = STRIPE_PRICES[price_type] || STRIPE_PRICES.standard;
+    const { interval = "annual" } = req.body; // "monthly" or "annual"
 
-    // Get or create Stripe customer linked to this user
+    // Resolve correct tier and price for this user
     const { data: profile } = await supabaseService
       .from("profiles")
-      .select("email, stripe_customer_id")
+      .select("email, stripe_customer_id, price_tier")
       .eq("id", req.user.id)
       .single();
+
+    const tier    = resolveUserPriceTier(profile?.price_tier || "standard");
+    const prices  = STRIPE_PRICES[tier] || STRIPE_PRICES.standard;
+    const priceId = interval === "monthly" ? prices.monthly : prices.annual;
 
     let customerId = profile?.stripe_customer_id;
 
@@ -6414,12 +6472,8 @@ app.post("/subscription/create-checkout", requireAuth, async (req, res) => {
         metadata: { supabase_user_id: req.user.id },
       });
       customerId = customer.id;
-
-      // Save customer ID to profile
-      await supabaseService
-        .from("profiles")
-        .update({ stripe_customer_id: customerId })
-        .eq("id", req.user.id);
+      await supabaseService.from("profiles")
+        .update({ stripe_customer_id: customerId }).eq("id", req.user.id);
     }
 
     const session = await stripe.checkout.sessions.create({
@@ -6429,15 +6483,9 @@ app.post("/subscription/create-checkout", requireAuth, async (req, res) => {
       line_items: [{ price: priceId, quantity: 1 }],
       success_url: "https://app.vercro.com/?subscribed=true",
       cancel_url:  "https://app.vercro.com/?subscription_cancelled=true",
-      metadata: {
-        supabase_user_id: req.user.id,
-        price_type,
-      },
+      metadata: { supabase_user_id: req.user.id, tier, interval },
       subscription_data: {
-        metadata: {
-          supabase_user_id: req.user.id,
-          price_type,
-        },
+        metadata: { supabase_user_id: req.user.id, tier, interval },
       },
     });
 
