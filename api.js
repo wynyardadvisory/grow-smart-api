@@ -5419,13 +5419,12 @@ app.get("/activity/feed", requireAuth, async (req, res) => {
     const limit  = Math.min(parseInt(req.query.limit) || 25, 50);
     const { cursor, event_type, location_id, area_id, crop_instance_id } = req.query;
 
-    let query = req.db
+    let query = supabaseService
       .from("activity_events")
       .select("id, event_type, title, subtitle, occurred_at, note, photo_url, quantity_g, quantity_units, location_id, location_name, area_id, area_name, crop_instance_id, crop_name, is_manual")
       .eq("user_id", userId)
       .order("occurred_at", { ascending: false })
-      .order("created_at",  { ascending: false })
-      .limit(limit + 1); // fetch one extra to determine if there's a next page
+      .limit(limit + 1);
 
     if (cursor)           query = query.lt("occurred_at", cursor);
     if (event_type)       query = query.eq("event_type", event_type);
@@ -5436,8 +5435,8 @@ app.get("/activity/feed", requireAuth, async (req, res) => {
     const { data, error } = await query;
     if (error) return res.status(500).json({ error: error.message });
 
-    const hasMore   = data.length > limit;
-    const items     = hasMore ? data.slice(0, limit) : data;
+    const hasMore    = data.length > limit;
+    const items      = hasMore ? data.slice(0, limit) : data;
     const nextCursor = hasMore ? items[items.length - 1].occurred_at : null;
 
     res.json({ items, next_cursor: nextCursor, has_more: hasMore });
