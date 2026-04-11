@@ -1856,6 +1856,15 @@ app.post("/tasks/:id/complete", requireAuth, async (req, res) => {
     }
   }
 
+  // Dual-write to activity_events (non-fatal)
+  writeActivityEvent("tasks", data.id, req.user.id, "task_completed",
+    completedAt, completedAt, {
+      cropInstanceId: data.crop_instance_id || null,
+      areaId:         data.crop_instance_id ? null : data.area_id || null,
+      title:          `Completed — ${data.action}`,
+      isManual:       false,
+    });
+
   res.json(data);
 });
 
@@ -2552,6 +2561,16 @@ app.post("/crops/:id/photos", requireAuth, async (req, res) => {
     }).select().single();
 
     if (error) throw new Error(error.message);
+
+    // Dual-write to activity_events (non-fatal)
+    writeActivityEvent("crop_photos", data.id, req.user.id, "photo_added",
+      data.created_at, data.created_at, {
+        cropInstanceId: req.params.id,
+        title:          "Photo added",
+        photoUrl:       data.photo_url,
+        isManual:       false,
+      });
+
     res.status(201).json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -3690,6 +3709,16 @@ app.post("/harvest-log", requireAuth,
 
     if (error) return res.status(500).json({ error: error.message });
 
+    // Dual-write to activity_events (non-fatal)
+    writeActivityEvent("harvest_log", data.id, req.user.id, "harvest_logged",
+      data.harvested_at, data.created_at, {
+        cropInstanceId: crop_instance_id || null,
+        title:          "Harvested",
+        note:           notes || null,
+        quantityG:      data.quantity_g || null,
+        isManual:       false,
+      });
+
     // Only mark crop as harvested if this is the final harvest
     if (crop_instance_id && !partial) {
       const harvestedAt = new Date().toISOString().split("T")[0];
@@ -4322,6 +4351,18 @@ app.post("/harvest", requireAuth,
       photo_url:      photo_url      || null,
     }).select().single();
     if (error) return res.status(500).json({ error: error.message });
+
+    // Dual-write to activity_events (non-fatal)
+    writeActivityEvent("harvest_log", data.id, req.user.id, "harvest_logged",
+      data.harvested_at, data.created_at, {
+        cropInstanceId: crop_instance_id,
+        title:          "Harvested",
+        note:           notes        || null,
+        photoUrl:       photo_url    || null,
+        quantityG:      quantity_g   || null,
+        quantityUnits:  quantity_units || null,
+        isManual:       false,
+      });
 
     // Mark the crop task as complete if there's an open harvest task
     await req.db.from("tasks")
@@ -5192,7 +5233,7 @@ app.get("/crops/:id/observations", requireAuth, async (req, res) => {
 
 // ── Shared helper — write a manual_activity_logs row ─────────────────────────
 async function writeActivityLog(userId, activityType, scopeType, scopeId, performedAt, notes, customLabel) {
-  await supabaseService.from("manual_activity_logs").insert({
+  const { data } = await supabaseService.from("manual_activity_logs").insert({
     user_id:       userId,
     activity_type: activityType,
     scope_type:    scopeType,
@@ -5200,7 +5241,82 @@ async function writeActivityLog(userId, activityType, scopeType, scopeId, perfor
     performed_at:  performedAt,
     notes:         notes    || null,
     custom_label:  customLabel || null,
-  });
+  }).select().single();
+  return data || null;
+}
+
+// ── Shared helper — dual-write to activity_events ────────────────────────────
+async function writeActivityEvent(sourceTable, sourceId, userId, eventType, occurredAt, createdAt, opts = {}) {
+  try {
+    let locationName = opts.locationName || null;
+    let areaName     = opts.areaName     || null;
+    let cropName     = opts.cropName     || null;
+    let locationId   = opts.locationId   || null;
+    let areaId       = opts.areaId       || null;
+
+    if (opts.cropInstanceId && (!cropName || !areaId)) {
+      const { data: ci } = await supabaseService
+        .from("crop_instances")
+        .select("area_id, crop_def_id, crop_definitions(name), growing_areas(id, name, location_id, locations(id, name))")
+        .eq("id", opts.cropInstanceId)
+        .single();
+      if (ci) {
+        cropName     = ci.crop_definitions?.name         || null;
+        areaId       = ci.growing_areas?.id              || null;
+        areaName     = ci.growing_areas?.name            || null;
+        locationId   = ci.growing_areas?.locations?.id  || null;
+        locationName = ci.growing_areas?.locations?.name || null;
+      }
+    } else if (opts.areaId && (!areaName || !locationId)) {
+      const { data: ga } = await supabaseService
+        .from("growing_areas")
+        .select("id, name, location_id, locations(id, name)")
+        .eq("id", opts.areaId)
+        .single();
+      if (ga) {
+        areaId       = ga.id;
+        areaName     = ga.name;
+        locationId   = ga.locations?.id   || null;
+        locationName = ga.locations?.name || null;
+      }
+    } else if (opts.locationId && !locationName) {
+      const { data: loc } = await supabaseService
+        .from("locations")
+        .select("id, name")
+        .eq("id", opts.locationId)
+        .single();
+      if (loc) {
+        locationId   = loc.id;
+        locationName = loc.name;
+      }
+    }
+
+    const subtitle = [locationName, cropName || areaName].filter(Boolean).join(" · ") || null;
+
+    await supabaseService.from("activity_events").insert({
+      source_table:     sourceTable,
+      source_id:        sourceId,
+      user_id:          userId,
+      event_type:       eventType,
+      occurred_at:      occurredAt,
+      created_at:       createdAt || new Date().toISOString(),
+      is_manual:        opts.isManual      || false,
+      location_id:      locationId,
+      area_id:          areaId,
+      crop_instance_id: opts.cropInstanceId || null,
+      location_name:    locationName,
+      area_name:        areaName,
+      crop_name:        cropName,
+      title:            opts.title,
+      subtitle:         subtitle,
+      note:             opts.note          || null,
+      photo_url:        opts.photoUrl      || null,
+      quantity_g:       opts.quantityG     || null,
+      quantity_units:   opts.quantityUnits || null,
+    });
+  } catch (e) {
+    console.error(`[ActivityEvent] dual-write failed (${sourceTable}/${sourceId}):`, e.message);
+  }
 }
 
 // POST /crops/:id/log-action
@@ -5238,7 +5354,18 @@ app.post("/crops/:id/log-action", requireAuth, async (req, res) => {
 
   // Write to manual_activity_logs (non-fatal if fails)
   try {
-    await writeActivityLog(req.user.id, canonicalType, "crop", req.params.id, now, notes, custom_label);
+    const malRow = await writeActivityLog(req.user.id, canonicalType, "crop", req.params.id, now, notes, custom_label);
+    if (malRow) {
+      const eventTypeMap = { watered: "manual_watering", fed: "manual_feeding", weeded: "manual_weeding", pruned_mulched: "manual_pruned_mulched", other: "manual_other" };
+      const titleMap     = { watered: "Watered", fed: "Fed", weeded: "Weeded", pruned_mulched: "Pruned / mulched", other: custom_label || "Activity logged" };
+      writeActivityEvent("manual_activity_logs", malRow.id, req.user.id,
+        eventTypeMap[canonicalType] || "manual_other", now, malRow.created_at, {
+          cropInstanceId: req.params.id,
+          title:          titleMap[canonicalType] || "Activity logged",
+          note:           notes || null,
+          isManual:       true,
+        });
+    }
   } catch(malErr) { console.error("[LogAction] manual_activity_logs insert failed:", malErr.message); }
 
   // Update summary timestamps + build hint
@@ -5437,7 +5564,22 @@ app.post("/activity/log", requireAuth, async (req, res) => {
 
   // Always write to manual_activity_logs (non-fatal if fails)
   try {
-    await writeActivityLog(userId, activity_type, scope_type, scopeIds[0], now, notes, custom_label);
+    const malRow = await writeActivityLog(userId, activity_type, scope_type, scopeIds[0], now, notes, custom_label);
+    if (malRow) {
+      const eventTypeMap = { watered: "manual_watering", fed: "manual_feeding", weeded: "manual_weeding", pruned_mulched: "manual_pruned_mulched", other: "manual_other" };
+      const titleMap     = { watered: "Watered", fed: "Fed", weeded: "Weeded", pruned_mulched: "Pruned / mulched", other: custom_label || "Activity logged" };
+      const scopeOpts    = scope_type === "crop"     ? { cropInstanceId: scopeIds[0] }
+                         : scope_type === "area"     ? { areaId: scopeIds[0] }
+                         : scope_type === "location" ? { locationId: scopeIds[0] }
+                         : {};
+      writeActivityEvent("manual_activity_logs", malRow.id, userId,
+        eventTypeMap[activity_type] || "manual_other", now, malRow.created_at, {
+          ...scopeOpts,
+          title:    titleMap[activity_type] || "Activity logged",
+          note:     notes || null,
+          isManual: true,
+        });
+    }
   } catch(malErr) { console.error("[ActivityLog] manual_activity_logs insert failed:", malErr.message); }
 
   // Re-run engine for actions that affect scheduling
