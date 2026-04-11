@@ -5445,6 +5445,189 @@ app.get("/activity/feed", requireAuth, async (req, res) => {
   }
 });
 
+// GET /activity/insights
+// Returns personalised insights derived from activity_events.
+// Query params:
+//   scope_type — "user" | "area" | "crop" (default: user)
+//   scope_id   — uuid (required if scope_type is area or crop)
+//
+// Insight types returned:
+//   last_watered       — most recent manual watering, days ago
+//   last_fed           — most recent manual feeding, days ago
+//   watering_interval  — average days between waterings (min 3 samples)
+//   feeding_interval   — average days between feedings (min 3 samples)
+//   inactivity         — no manual activity in last N days
+//   streak             — consecutive days with at least one manual action (user scope only)
+const MANUAL_EVENT_TYPES = [
+  "manual_watering", "manual_feeding", "manual_weeding",
+  "manual_pruned_mulched", "manual_other",
+];
+
+app.get("/activity/insights", requireAuth, async (req, res) => {
+  try {
+    const userId     = req.user.id;
+    const scopeType  = req.query.scope_type || "user";
+    const scopeId    = req.query.scope_id   || null;
+    const now        = new Date();
+    const todayLocal = now.toISOString().split("T")[0];
+
+    // Build base query filter
+    const applyScope = (q) => {
+      q = q.eq("user_id", userId);
+      if (scopeType === "area"  && scopeId) q = q.eq("area_id", scopeId);
+      if (scopeType === "crop"  && scopeId) q = q.eq("crop_instance_id", scopeId);
+      return q;
+    };
+
+    const insights = [];
+
+    // ── Last watered ───────────────────────────────────────────────────────────
+    const { data: lastWatered } = await applyScope(
+      supabaseService.from("activity_events").select("occurred_at")
+        .eq("event_type", "manual_watering")
+    ).order("occurred_at", { ascending: false }).limit(1);
+
+    if (lastWatered?.length) {
+      const days = Math.floor((now - new Date(lastWatered[0].occurred_at)) / 86400000);
+      insights.push({
+        type:  "last_watered",
+        label: days === 0 ? "Watered today" : days === 1 ? "Last watered yesterday" : `Last watered ${days} days ago`,
+        value: days,
+        unit:  "days_ago",
+      });
+    }
+
+    // ── Last fed ───────────────────────────────────────────────────────────────
+    const { data: lastFed } = await applyScope(
+      supabaseService.from("activity_events").select("occurred_at")
+        .eq("event_type", "manual_feeding")
+    ).order("occurred_at", { ascending: false }).limit(1);
+
+    if (lastFed?.length) {
+      const days = Math.floor((now - new Date(lastFed[0].occurred_at)) / 86400000);
+      insights.push({
+        type:  "last_fed",
+        label: days === 0 ? "Fed today" : days === 1 ? "Last fed yesterday" : `Last fed ${days} days ago`,
+        value: days,
+        unit:  "days_ago",
+      });
+    }
+
+    // ── Watering interval ──────────────────────────────────────────────────────
+    const { data: wateringHistory } = await applyScope(
+      supabaseService.from("activity_events").select("occurred_at")
+        .eq("event_type", "manual_watering")
+    ).order("occurred_at", { ascending: false }).limit(10);
+
+    if (wateringHistory?.length >= 4) {
+      const intervals = [];
+      for (let i = 0; i < wateringHistory.length - 1; i++) {
+        const diff = Math.floor((new Date(wateringHistory[i].occurred_at) - new Date(wateringHistory[i+1].occurred_at)) / 86400000);
+        if (diff > 0) intervals.push(diff);
+      }
+      if (intervals.length >= 3) {
+        const avg = Math.round(intervals.reduce((a,b) => a+b, 0) / intervals.length);
+        insights.push({
+          type:  "watering_interval",
+          label: `You usually water every ${avg} day${avg !== 1 ? "s" : ""}`,
+          value: avg,
+          unit:  "days",
+        });
+      }
+    }
+
+    // ── Feeding interval ───────────────────────────────────────────────────────
+    const { data: feedingHistory } = await applyScope(
+      supabaseService.from("activity_events").select("occurred_at")
+        .eq("event_type", "manual_feeding")
+    ).order("occurred_at", { ascending: false }).limit(10);
+
+    if (feedingHistory?.length >= 4) {
+      const intervals = [];
+      for (let i = 0; i < feedingHistory.length - 1; i++) {
+        const diff = Math.floor((new Date(feedingHistory[i].occurred_at) - new Date(feedingHistory[i+1].occurred_at)) / 86400000);
+        if (diff > 0) intervals.push(diff);
+      }
+      if (intervals.length >= 3) {
+        const avg = Math.round(intervals.reduce((a,b) => a+b, 0) / intervals.length);
+        insights.push({
+          type:  "feeding_interval",
+          label: `You usually feed every ${avg} day${avg !== 1 ? "s" : ""}`,
+          value: avg,
+          unit:  "days",
+        });
+      }
+    }
+
+    // ── Inactivity ─────────────────────────────────────────────────────────────
+    const { data: recentManual } = await applyScope(
+      supabaseService.from("activity_events").select("occurred_at")
+        .in("event_type", MANUAL_EVENT_TYPES)
+    ).order("occurred_at", { ascending: false }).limit(1);
+
+    const inactivityThreshold = scopeType === "user" ? 5 : 8;
+    if (!recentManual?.length) {
+      insights.push({
+        type:  "inactivity",
+        label: "No manual activity logged yet",
+        value: null,
+        unit:  "days",
+      });
+    } else {
+      const daysSince = Math.floor((now - new Date(recentManual[0].occurred_at)) / 86400000);
+      if (daysSince >= inactivityThreshold) {
+        insights.push({
+          type:  "inactivity",
+          label: `No activity logged in ${daysSince} days`,
+          value: daysSince,
+          unit:  "days",
+        });
+      }
+    }
+
+    // ── Activity streak (user scope only, manual actions only) ─────────────────
+    if (scopeType === "user") {
+      const { data: manualDates } = await supabaseService
+        .from("activity_events")
+        .select("occurred_at")
+        .eq("user_id", userId)
+        .in("event_type", MANUAL_EVENT_TYPES)
+        .order("occurred_at", { ascending: false })
+        .limit(200);
+
+      if (manualDates?.length) {
+        // Get distinct local date strings
+        const distinctDates = [...new Set(
+          manualDates.map(r => new Date(r.occurred_at).toLocaleDateString("en-CA")) // YYYY-MM-DD
+        )].sort().reverse();
+
+        let streak = 0;
+        let cursor = new Date(todayLocal);
+        for (const dateStr of distinctDates) {
+          const d = new Date(dateStr);
+          const diff = Math.floor((cursor - d) / 86400000);
+          if (diff === 0) { streak++; cursor.setDate(cursor.getDate() - 1); }
+          else if (diff === 1) { streak++; cursor = d; cursor.setDate(cursor.getDate() - 1); }
+          else break;
+        }
+
+        if (streak > 0) {
+          insights.push({
+            type:  "streak",
+            label: streak === 1 ? "Active today" : `${streak} day activity streak`,
+            value: streak,
+            unit:  "days",
+          });
+        }
+      }
+    }
+
+    res.json({ insights, scope_type: scopeType, scope_id: scopeId });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /activity/log
 // Generic activity logging — supports scope_ids (array) for multi-area logging.
 // activity_type: watered | fed | pruned_mulched | weeded | other
