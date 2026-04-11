@@ -5446,146 +5446,99 @@ app.get("/activity/feed", requireAuth, async (req, res) => {
 });
 
 // GET /activity/insights
-// Returns personalised insights derived from activity_events.
+// Returns max 2 prioritised insights derived from activity_events.
+// Hierarchy:
+//   Case A — no any activity → inactivity only
+//   Case B — activity exists → last_watered + last_fed (if present)
+//   Streak surfaced as third insight only if >= 3 days
 // Query params:
 //   scope_type — "user" | "area" | "crop" (default: user)
 //   scope_id   — uuid (required if scope_type is area or crop)
-//
-// Insight types returned:
-//   last_watered       — most recent manual watering, days ago
-//   last_fed           — most recent manual feeding, days ago
-//   watering_interval  — average days between waterings (min 3 samples)
-//   feeding_interval   — average days between feedings (min 3 samples)
-//   inactivity         — no manual activity in last N days
-//   streak             — consecutive days with at least one manual action (user scope only)
 const MANUAL_EVENT_TYPES = [
   "manual_watering", "manual_feeding", "manual_weeding",
   "manual_pruned_mulched", "manual_other",
 ];
 
+// Any meaningful user interaction (for inactivity check)
+const ANY_ACTIVITY_TYPES = [
+  "manual_watering", "manual_feeding", "manual_weeding",
+  "manual_pruned_mulched", "manual_other",
+  "task_completed", "harvest_logged", "photo_added", "observation_added",
+];
+
 app.get("/activity/insights", requireAuth, async (req, res) => {
   try {
-    const userId     = req.user.id;
-    const scopeType  = req.query.scope_type || "user";
-    const scopeId    = req.query.scope_id   || null;
-    const now        = new Date();
+    const userId    = req.user.id;
+    const scopeType = req.query.scope_type || "user";
+    const scopeId   = req.query.scope_id   || null;
+    const now       = new Date();
     const todayLocal = now.toISOString().split("T")[0];
 
-    // Build base query filter
     const applyScope = (q) => {
       q = q.eq("user_id", userId);
-      if (scopeType === "area"  && scopeId) q = q.eq("area_id", scopeId);
-      if (scopeType === "crop"  && scopeId) q = q.eq("crop_instance_id", scopeId);
+      if (scopeType === "area" && scopeId) q = q.eq("area_id", scopeId);
+      if (scopeType === "crop" && scopeId) q = q.eq("crop_instance_id", scopeId);
       return q;
     };
 
+    // ── Check any recent activity (for inactivity insight) ────────────────────
+    const { data: recentAny } = await applyScope(
+      supabaseService.from("activity_events").select("occurred_at")
+        .in("event_type", ANY_ACTIVITY_TYPES)
+    ).order("occurred_at", { ascending: false }).limit(1);
+
+    const hasAnyActivity  = recentAny?.length > 0;
+    const daysSinceAny    = hasAnyActivity
+      ? Math.floor((now - new Date(recentAny[0].occurred_at)) / 86400000)
+      : null;
+    const inactivityThreshold = scopeType === "user" ? 5 : 8;
+
     const insights = [];
 
-    // ── Last watered ───────────────────────────────────────────────────────────
-    const { data: lastWatered } = await applyScope(
-      supabaseService.from("activity_events").select("occurred_at")
-        .eq("event_type", "manual_watering")
-    ).order("occurred_at", { ascending: false }).limit(1);
-
-    if (lastWatered?.length) {
-      const days = Math.floor((now - new Date(lastWatered[0].occurred_at)) / 86400000);
-      insights.push({
-        type:  "last_watered",
-        label: days === 0 ? "Watered today" : days === 1 ? "Last watered yesterday" : `Last watered ${days} days ago`,
-        value: days,
-        unit:  "days_ago",
-      });
-    }
-
-    // ── Last fed ───────────────────────────────────────────────────────────────
-    const { data: lastFed } = await applyScope(
-      supabaseService.from("activity_events").select("occurred_at")
-        .eq("event_type", "manual_feeding")
-    ).order("occurred_at", { ascending: false }).limit(1);
-
-    if (lastFed?.length) {
-      const days = Math.floor((now - new Date(lastFed[0].occurred_at)) / 86400000);
-      insights.push({
-        type:  "last_fed",
-        label: days === 0 ? "Fed today" : days === 1 ? "Last fed yesterday" : `Last fed ${days} days ago`,
-        value: days,
-        unit:  "days_ago",
-      });
-    }
-
-    // ── Watering interval ──────────────────────────────────────────────────────
-    const { data: wateringHistory } = await applyScope(
-      supabaseService.from("activity_events").select("occurred_at")
-        .eq("event_type", "manual_watering")
-    ).order("occurred_at", { ascending: false }).limit(10);
-
-    if (wateringHistory?.length >= 4) {
-      const intervals = [];
-      for (let i = 0; i < wateringHistory.length - 1; i++) {
-        const diff = Math.floor((new Date(wateringHistory[i].occurred_at) - new Date(wateringHistory[i+1].occurred_at)) / 86400000);
-        if (diff > 0) intervals.push(diff);
-      }
-      if (intervals.length >= 3) {
-        const avg = Math.round(intervals.reduce((a,b) => a+b, 0) / intervals.length);
-        insights.push({
-          type:  "watering_interval",
-          label: `You usually water every ${avg} day${avg !== 1 ? "s" : ""}`,
-          value: avg,
-          unit:  "days",
-        });
-      }
-    }
-
-    // ── Feeding interval ───────────────────────────────────────────────────────
-    const { data: feedingHistory } = await applyScope(
-      supabaseService.from("activity_events").select("occurred_at")
-        .eq("event_type", "manual_feeding")
-    ).order("occurred_at", { ascending: false }).limit(10);
-
-    if (feedingHistory?.length >= 4) {
-      const intervals = [];
-      for (let i = 0; i < feedingHistory.length - 1; i++) {
-        const diff = Math.floor((new Date(feedingHistory[i].occurred_at) - new Date(feedingHistory[i+1].occurred_at)) / 86400000);
-        if (diff > 0) intervals.push(diff);
-      }
-      if (intervals.length >= 3) {
-        const avg = Math.round(intervals.reduce((a,b) => a+b, 0) / intervals.length);
-        insights.push({
-          type:  "feeding_interval",
-          label: `You usually feed every ${avg} day${avg !== 1 ? "s" : ""}`,
-          value: avg,
-          unit:  "days",
-        });
-      }
-    }
-
-    // ── Inactivity ─────────────────────────────────────────────────────────────
-    const { data: recentManual } = await applyScope(
-      supabaseService.from("activity_events").select("occurred_at")
-        .in("event_type", MANUAL_EVENT_TYPES)
-    ).order("occurred_at", { ascending: false }).limit(1);
-
-    const inactivityThreshold = scopeType === "user" ? 5 : 8;
-    if (!recentManual?.length) {
-      insights.push({
-        type:  "inactivity",
-        label: "No manual activity logged yet",
-        value: null,
-        unit:  "days",
-      });
+    if (!hasAnyActivity || daysSinceAny >= inactivityThreshold) {
+      // Case A — no meaningful activity → show inactivity only
+      const label = !hasAnyActivity
+        ? "No activity logged in your garden yet"
+        : daysSinceAny === 1
+          ? "It's been a day since your last logged activity"
+          : `It's been ${daysSinceAny} days since your last logged activity`;
+      insights.push({ type: "inactivity", label, value: daysSinceAny, unit: "days", filter: null });
     } else {
-      const daysSince = Math.floor((now - new Date(recentManual[0].occurred_at)) / 86400000);
-      if (daysSince >= inactivityThreshold) {
+      // Case B — activity exists → last watered + last fed
+      const { data: lastWatered } = await applyScope(
+        supabaseService.from("activity_events").select("occurred_at")
+          .eq("event_type", "manual_watering")
+      ).order("occurred_at", { ascending: false }).limit(1);
+
+      if (lastWatered?.length) {
+        const days = Math.floor((now - new Date(lastWatered[0].occurred_at)) / 86400000);
         insights.push({
-          type:  "inactivity",
-          label: `No activity logged in ${daysSince} days`,
-          value: daysSince,
-          unit:  "days",
+          type:   "last_watered",
+          label:  days === 0 ? "Watered today" : days === 1 ? "Last watered yesterday" : `Last watered ${days} days ago`,
+          value:  days,
+          unit:   "days_ago",
+          filter: "manual_watering",
+        });
+      }
+
+      const { data: lastFed } = await applyScope(
+        supabaseService.from("activity_events").select("occurred_at")
+          .eq("event_type", "manual_feeding")
+      ).order("occurred_at", { ascending: false }).limit(1);
+
+      if (lastFed?.length) {
+        const days = Math.floor((now - new Date(lastFed[0].occurred_at)) / 86400000);
+        insights.push({
+          type:   "last_fed",
+          label:  days === 0 ? "Fed today" : days === 1 ? "Last fed yesterday" : `Last fed ${days} days ago`,
+          value:  days,
+          unit:   "days_ago",
+          filter: "manual_feeding",
         });
       }
     }
 
-    // ── Activity streak (user scope only, manual actions only) ─────────────────
+    // ── Activity streak (user scope only, manual actions only, min 3 days) ─────
     if (scopeType === "user") {
       const { data: manualDates } = await supabaseService
         .from("activity_events")
@@ -5596,27 +5549,27 @@ app.get("/activity/insights", requireAuth, async (req, res) => {
         .limit(200);
 
       if (manualDates?.length) {
-        // Get distinct local date strings
         const distinctDates = [...new Set(
-          manualDates.map(r => new Date(r.occurred_at).toLocaleDateString("en-CA")) // YYYY-MM-DD
+          manualDates.map(r => new Date(r.occurred_at).toLocaleDateString("en-CA"))
         )].sort().reverse();
 
         let streak = 0;
-        let cursor = new Date(todayLocal);
+        let cur = new Date(todayLocal);
         for (const dateStr of distinctDates) {
-          const d = new Date(dateStr);
-          const diff = Math.floor((cursor - d) / 86400000);
-          if (diff === 0) { streak++; cursor.setDate(cursor.getDate() - 1); }
-          else if (diff === 1) { streak++; cursor = d; cursor.setDate(cursor.getDate() - 1); }
+          const d    = new Date(dateStr);
+          const diff = Math.floor((cur - d) / 86400000);
+          if (diff === 0)      { streak++; cur.setDate(cur.getDate() - 1); }
+          else if (diff === 1) { streak++; cur = new Date(d); cur.setDate(cur.getDate() - 1); }
           else break;
         }
 
-        if (streak > 0) {
+        if (streak >= 3) {
           insights.push({
-            type:  "streak",
-            label: streak === 1 ? "Active today" : `${streak} day activity streak`,
-            value: streak,
-            unit:  "days",
+            type:   "streak",
+            label:  `${streak} day activity streak`,
+            value:  streak,
+            unit:   "days",
+            filter: null,
           });
         }
       }
