@@ -6264,12 +6264,11 @@ app.post("/webhooks/revenuecat",
         return res.status(400).json({ error: "No event in payload" });
       }
 
-      const { type, app_user_id, expiration_at_ms, store } = event;
+      const { type, app_user_id, expiration_at_ms, store, offered_product_id, offering_id } = event;
 
-      console.log(`[RevenueCat] Event: ${type} for user: ${app_user_id}`);
+      console.log(`[RevenueCat] Event: ${type} for user: ${app_user_id} offering: ${offering_id}`);
 
       // Map RevenueCat app_user_id to our Supabase user ID
-      // We use the Supabase user UUID as the RevenueCat App User ID
       const userId = app_user_id;
 
       // Determine new plan state based on event type
@@ -6310,15 +6309,26 @@ app.post("/webhooks/revenuecat",
         return res.status(200).json({ received: true });
       }
 
-      // Update profile
+      // Update profile — record which offering/tier was purchased
+      const updates = {
+        plan:                   newPlan,
+        pro_expires_at:         proExpiresAt,
+        pro_source:             store || "revenuecat",
+        revenuecat_app_user_id: userId,
+      };
+
+      // If this is a new purchase, record the offering so we know which tier they paid
+      if (newPlan === "pro" && offering_id) {
+        console.log(`[RevenueCat] Purchased offering: ${offering_id}`);
+        // offering_id will be "loyalty", "early_supporter", or "default"
+        // We don't change price_tier here — that was set at subscription time
+        // Just log it for audit purposes
+        updates.pro_source = `${store || "revenuecat"}:${offering_id}`;
+      }
+
       const { error } = await supabaseService
         .from("profiles")
-        .update({
-          plan:           newPlan,
-          pro_expires_at: proExpiresAt,
-          pro_source:     store || "revenuecat",
-          revenuecat_app_user_id: userId,
-        })
+        .update(updates)
         .eq("id", userId);
 
       if (error) {
