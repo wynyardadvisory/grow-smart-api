@@ -259,16 +259,19 @@ function templateFeedbackDay7Quiet(name) {
 
 // ── Send helper ───────────────────────────────────────────────────────────────
 
-async function sendEmail(to, template) {
+async function sendEmail(to, template, emailType) {
   const resend = getResend();
   if (!resend) return { sent: false, reason: "resend_not_configured" };
   try {
-    const { data, error } = await resend.emails.send({
+    const payload = {
       from:    FROM,
       to,
       subject: template.subject,
       html:    template.html,
-    });
+    };
+    // Add email_type tag so Resend webhook can identify the email type
+    if (emailType) payload.tags = [{ name: "email_type", value: emailType }];
+    const { data, error } = await resend.emails.send(payload);
     if (error) {
       console.error(`[Email] Failed to send to ${to}:`, error);
       return { sent: false, reason: error.message };
@@ -316,13 +319,14 @@ async function runNudgeUnactivated(supabase) {
     // Skip unsubscribed users
     if (unsubscribedIds.has(user.id)) { skipped++; continue; }
 
-    const result = await sendEmail(user.email, templateNudgeUnactivated(user.user_metadata?.full_name || null));
+    const result = await sendEmail(user.email, templateNudgeUnactivated(user.user_metadata?.full_name || null), "nudge_unactivated");
     if (result.sent) {
       await supabase.from("email_log").insert({
-        user_id:    user.id,
-        email:      user.email,
-        email_type: "nudge_unactivated",
-        sent_at:    new Date().toISOString(),
+        user_id:         user.id,
+        email:           user.email,
+        email_type:      "nudge_unactivated",
+        sent_at:         new Date().toISOString(),
+        resend_email_id: result.id || null,
       });
       sent++;
     }
@@ -357,13 +361,14 @@ async function runNudgeUnconfirmed(supabase) {
     if (alreadySentIds.has(user.id)) { skipped++; continue; }
 
     if (_unsubIds.has(user.id)) { skipped++; continue; }
-    const result = await sendEmail(user.email, templateNudgeUnconfirmed(user.user_metadata?.full_name || null));
+    const result = await sendEmail(user.email, templateNudgeUnconfirmed(user.user_metadata?.full_name || null), "nudge_unconfirmed");
     if (result.sent) {
       await supabase.from("email_log").insert({
-        user_id:    user.id,
-        email:      user.email,
-        email_type: "nudge_unconfirmed",
-        sent_at:    new Date().toISOString(),
+        user_id:         user.id,
+        email:           user.email,
+        email_type:      "nudge_unconfirmed",
+        sent_at:         new Date().toISOString(),
+        resend_email_id: result.id || null,
       });
       sent++;
     }
@@ -421,11 +426,12 @@ async function runFeedbackSequence(supabase) {
       const template = isActive
         ? templateFeedbackDay3Active(profile.name, tasksCompleted)
         : templateFeedbackDay3Quiet(profile.name);
-      const result = await sendEmail(user.email, template);
+      const result = await sendEmail(user.email, template, "feedback_day3");
       if (result.sent) {
         await supabase.from("email_log").insert({
           user_id: profile.id, email: user.email,
           email_type: "feedback_day3", sent_at: new Date().toISOString(),
+          resend_email_id: result.id || null,
         });
         sent++;
       }
@@ -436,11 +442,12 @@ async function runFeedbackSequence(supabase) {
       const template = isActive
         ? templateFeedbackDay7Active(profile.name, tasksCompleted)
         : templateFeedbackDay7Quiet(profile.name);
-      const result = await sendEmail(user.email, template);
+      const result = await sendEmail(user.email, template, "feedback_day7");
       if (result.sent) {
         await supabase.from("email_log").insert({
           user_id: profile.id, email: user.email,
           email_type: "feedback_day7", sent_at: new Date().toISOString(),
+          resend_email_id: result.id || null,
         });
         sent++;
       }
@@ -543,7 +550,7 @@ async function runWaitlistInvites(supabase) {
 
   let sent = 0, skipped = 0;
   for (const person of pending) {
-    const result = await sendEmail(person.email, templateWaitlistInvite(person.name));
+    const result = await sendEmail(person.email, templateWaitlistInvite(person.name), "waitlist_invite");
     if (result.sent) {
       await supabase.from("waitlist")
         .update({
@@ -586,7 +593,7 @@ async function runWaitlistNudges(supabase) {
       continue;
     }
 
-    const result = await sendEmail(person.email, templateWaitlistNudge(person.name));
+    const result = await sendEmail(person.email, templateWaitlistNudge(person.name), "waitlist_nudge");
     if (result.sent) {
       await supabase.from("waitlist")
         .update({
@@ -806,7 +813,7 @@ async function runWaitlistNudges2(supabase) {
     if (signedUpEmails.has(person.email?.toLowerCase())) { skipped++; continue; }
     // nudge_count 1 = already had day-3 nudge, now send day-7
     if ((person.nudge_count || 0) !== 1) { skipped++; continue; }
-    const result = await sendEmail(person.email, templateWaitlistNudge2(person.name));
+    const result = await sendEmail(person.email, templateWaitlistNudge2(person.name), "waitlist_nudge2");
     if (result.sent) {
       await supabase.from("waitlist")
         .update({ nudge_count: 2, last_nudge_at: new Date().toISOString() })
@@ -839,7 +846,7 @@ async function runWaitlistNudges3(supabase) {
   for (const person of invited) {
     if (signedUpEmails.has(person.email?.toLowerCase())) { skipped++; continue; }
     if ((person.nudge_count || 0) !== 2) { skipped++; continue; }
-    const result = await sendEmail(person.email, templateWaitlistNudge3(person.name));
+    const result = await sendEmail(person.email, templateWaitlistNudge3(person.name), "waitlist_nudge3");
     if (result.sent) {
       await supabase.from("waitlist")
         .update({ nudge_count: 3, last_nudge_at: new Date().toISOString() })
@@ -886,18 +893,18 @@ async function runReengagement(supabase) {
 
     // Day 14
     if (daysSince >= 14 && daysSince < 15 && !userSent.has("reengage_day14")) {
-      const result = await sendEmail(user.email, templateReengageDay14(profile.name));
+      const result = await sendEmail(user.email, templateReengageDay14(profile.name), "reengage_day14");
       if (result.sent) {
-        await supabase.from("email_log").insert({ user_id: profile.id, email: user.email, email_type: "reengage_day14", sent_at: new Date().toISOString() });
+        await supabase.from("email_log").insert({ user_id: profile.id, email: user.email, email_type: "reengage_day14", sent_at: new Date().toISOString(), resend_email_id: result.id || null });
         sent++;
       }
     }
 
     // Day 30
     if (daysSince >= 30 && daysSince < 31 && !userSent.has("reengage_day30")) {
-      const result = await sendEmail(user.email, templateReengageDay30(profile.name));
+      const result = await sendEmail(user.email, templateReengageDay30(profile.name), "reengage_day30");
       if (result.sent) {
-        await supabase.from("email_log").insert({ user_id: profile.id, email: user.email, email_type: "reengage_day30", sent_at: new Date().toISOString() });
+        await supabase.from("email_log").insert({ user_id: profile.id, email: user.email, email_type: "reengage_day30", sent_at: new Date().toISOString(), resend_email_id: result.id || null });
         sent++;
       }
     }
@@ -1031,11 +1038,12 @@ async function runOnboardingRecovery(supabase) {
     const user = userMap[profile.id];
     if (!user?.email) { skipped++; continue; }
     const template = templateOnboardingRecovery(profile.name);
-    const result = await sendEmail(user.email, template);
+    const result = await sendEmail(user.email, template, "onboarding_recovery");
     if (result.sent) {
       await supabase.from("email_log").insert({
         user_id: profile.id, email: user.email,
         email_type: "onboarding_recovery", sent_at: new Date().toISOString(),
+        resend_email_id: result.id || null,
       });
       sent++;
     } else { skipped++; }
@@ -1182,13 +1190,14 @@ async function runWeeklyEmailDigest(supabase) {
     if (userTasks.length === 0) { skipped++; continue; }
 
     const template = templateGardenToday(profile.name, userTasks, userCrops);
-    const result   = await sendEmail(user.email, template);
+    const result   = await sendEmail(user.email, template, "weekly_digest");
     if (result.sent) {
       await supabase.from("email_log").insert({
-        user_id:    profile.id,
-        email:      user.email,
-        email_type: "weekly_digest",
-        sent_at:    new Date().toISOString(),
+        user_id:         profile.id,
+        email:           user.email,
+        email_type:      "weekly_digest",
+        sent_at:         new Date().toISOString(),
+        resend_email_id: result.id || null,
       });
       sent++;
     } else {

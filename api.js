@@ -2844,6 +2844,12 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
       { data: pushOpenedRows },
       { data: pushByType },
 
+      // Email analytics — last 30 days from email_events
+      { data: emailDeliveredRows },
+      { data: emailOpenedRows },
+      { data: emailClickedRows },
+      { data: emailBouncedRows },
+
       // Activity signals — all user-initiated actions with timestamps
       // Used for DAU / WAU / MAU / retention. Pulled wide (30 days) so we
       // can filter down per metric in JS rather than making 6+ separate calls.
@@ -2886,6 +2892,12 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
       db.from("notification_events").select("id, notification_type").eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
       db.from("notification_events").select("id, notification_type").not("opened_at", "is", null).gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
       db.from("notification_events").select("notification_type, status").eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
+
+      // Email analytics — last 30 days from email_events
+      db.from("email_events").select("email_type").eq("event_type", "email.delivered").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
+      db.from("email_events").select("email_type").eq("event_type", "email.opened").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
+      db.from("email_events").select("email_type").eq("event_type", "email.clicked").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
+      db.from("email_events").select("email_type").eq("event_type", "email.bounced").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
 
     ]);
 
@@ -2991,6 +3003,19 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
       pushCTR7d:    pushSentRows?.length > 0 ? Math.round(((pushOpenedRows?.length || 0) / pushSentRows.length) * 100) : null,
       pushByType7d: (pushByType || []).reduce((acc, r) => {
         acc[r.notification_type] = (acc[r.notification_type] || 0) + 1;
+        return acc;
+      }, {}),
+
+      // Email analytics — last 30 days
+      emailDelivered30d: emailDeliveredRows?.length || 0,
+      emailOpened30d:    emailOpenedRows?.length || 0,
+      emailClicked30d:   emailClickedRows?.length || 0,
+      emailBounced30d:   emailBouncedRows?.length || 0,
+      emailOpenRate30d:  emailDeliveredRows?.length > 0 ? Math.round(((emailOpenedRows?.length || 0) / emailDeliveredRows.length) * 100) : null,
+      emailClickRate30d: emailDeliveredRows?.length > 0 ? Math.round(((emailClickedRows?.length || 0) / emailDeliveredRows.length) * 100) : null,
+      emailBounceRate30d: emailDeliveredRows?.length > 0 ? Math.round(((emailBouncedRows?.length || 0) / emailDeliveredRows.length) * 100) : null,
+      emailOpensByType30d: (emailOpenedRows || []).reduce((acc, r) => {
+        if (r.email_type) acc[r.email_type] = (acc[r.email_type] || 0) + 1;
         return acc;
       }, {}),
 
@@ -6706,6 +6731,66 @@ app.get("/sentry-test", (_req, _res) => {
 // =============================================================================
 // RevenueCat calls this endpoint when subscription events occur.
 // We update the user's plan in profiles based on the event type.
+// =============================================================================
+// RESEND EMAIL WEBHOOK
+// =============================================================================
+// Receives email events from Resend — delivered, opened, clicked, bounced.
+// Stores in email_events table for admin analytics.
+// Docs: https://resend.com/docs/webhooks/introduction
+// Deduplication: svix-id header is stored as unique key — safe to retry.
+
+app.post("/webhooks/resend", express.json(), async (req, res) => {
+  // Respond 200 immediately — Resend retries if it doesn't get a quick response
+  res.status(200).json({ ok: true });
+
+  try {
+    const svixId    = req.headers["svix-id"] || null;
+    const eventType = req.body?.type;
+    const data      = req.body?.data;
+
+    if (!eventType || !data) return;
+
+    const emailId   = data.email_id || null;
+    const recipient = Array.isArray(data.to) ? data.to[0] : (data.to || null);
+
+    // Resolve email_type from tag or email_log lookup
+    let emailType = null;
+    const tags = data.tags;
+    if (tags && typeof tags === "object") {
+      // Resend returns tags as array [{name, value}] or object {name: value}
+      if (Array.isArray(tags)) {
+        const typeTag = tags.find(t => t.name === "email_type");
+        emailType = typeTag?.value || null;
+      } else {
+        emailType = tags.email_type || null;
+      }
+    }
+    // Fallback: look up email_type from email_log by resend_email_id
+    if (!emailType && emailId) {
+      const { data: logRow } = await supabaseService
+        .from("email_log")
+        .select("email_type")
+        .eq("resend_email_id", emailId)
+        .maybeSingle();
+      emailType = logRow?.email_type || null;
+    }
+
+    await supabaseService.from("email_events").upsert({
+      svix_id:     svixId,
+      email_id:    emailId,
+      email_type:  emailType,
+      event_type:  eventType,
+      recipient,
+      occurred_at: req.body?.created_at || new Date().toISOString(),
+      raw:         req.body,
+    }, { onConflict: "svix_id", ignoreDuplicates: true });
+
+    console.log(`[ResendWebhook] ${eventType} — ${emailType || "unknown"} — ${recipient}`);
+  } catch (e) {
+    captureError("ResendWebhook", e);
+  }
+});
+
 // Docs: https://www.revenuecat.com/docs/integrations/webhooks
 
 app.post("/webhooks/revenuecat",
