@@ -2839,6 +2839,11 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
       // Feedback ratings
       { data: feedbackRatings },
 
+      // Push analytics — last 7 days
+      { data: pushSentRows },
+      { data: pushOpenedRows },
+      { data: pushByType },
+
       // Activity signals — all user-initiated actions with timestamps
       // Used for DAU / WAU / MAU / retention. Pulled wide (30 days) so we
       // can filter down per metric in JS rather than making 6+ separate calls.
@@ -2876,6 +2881,11 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
 
       // Feedback avg rating
       db.from("feedback").select("rating").not("rating", "is", null).not("user_id", "in", demoExclude),
+
+      // Push analytics — last 7 days
+      db.from("notification_events").select("id, notification_type").eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
+      db.from("notification_events").select("id, notification_type").not("opened_at", "is", null).gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
+      db.from("notification_events").select("notification_type, status").eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
 
     ]);
 
@@ -2974,6 +2984,15 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
       // Push
       pushTokens: pushTokens || 0,
       pushOptIn:  totalActivated > 0 ? Math.round((pushTokens / totalActivated) * 100) : 0,
+
+      // Push analytics — last 7 days
+      pushSent7d:   pushSentRows?.length || 0,
+      pushOpened7d: pushOpenedRows?.length || 0,
+      pushCTR7d:    pushSentRows?.length > 0 ? Math.round(((pushOpenedRows?.length || 0) / pushSentRows.length) * 100) : null,
+      pushByType7d: (pushByType || []).reduce((acc, r) => {
+        acc[r.notification_type] = (acc[r.notification_type] || 0) + 1;
+        return acc;
+      }, {}),
 
       // Feedback
       avgRating: feedbackRatings?.length > 0
