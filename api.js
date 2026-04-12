@@ -4857,6 +4857,10 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
     crops,       // [{ name, crop_def_id, stage }]
     area_type,
     area_name,
+    signup_source,
+    signup_medium,
+    signup_campaign,
+    signup_source_self_reported,
   } = req.body;
 
   if (!name || !postcode || !crops?.length || !area_type) {
@@ -4866,8 +4870,13 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
   try {
     // 1. Save profile — use supabaseService so it bypasses RLS and definitely commits
     // locations.user_id FK references profiles.id so profile MUST exist before location insert
+    const profileData = { id: userId, name, postcode };
+    if (signup_source)               profileData.signup_source               = signup_source;
+    if (signup_medium)               profileData.signup_medium               = signup_medium;
+    if (signup_campaign)             profileData.signup_campaign             = signup_campaign;
+    if (signup_source_self_reported) profileData.signup_source_self_reported = signup_source_self_reported;
     const { error: profileErr } = await supabaseService.from("profiles")
-      .upsert({ id: userId, name, postcode }, { onConflict: "id" });
+      .upsert(profileData, { onConflict: "id" });
     if (profileErr) throw new Error("Profile: " + profileErr.message);
 
     // 2. Create default location (or reuse existing)
