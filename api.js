@@ -6299,9 +6299,45 @@ app.post("/admin/backfill-badges", requireAuth, requireAdmin, async (req, res) =
 // =============================================================================
 // POST /push/register — register a native device push token (iOS/Android via Capacitor)
 // Called automatically on app launch after the user grants notification permission.
+// Also registers the token with OneSignal so we can send via their delivery layer.
 app.post("/push/register", requireAuth, async (req, res) => {
   const { token, platform } = req.body;
   if (!token) return res.status(400).json({ error: "token required" });
+
+  // Register with OneSignal — store subscription ID for send path
+  let onesignalSubscriptionId = null;
+  try {
+    const osPayload = {
+      app_id: process.env.ONESIGNAL_APP_ID,
+      subscription: {
+        type: platform === "android" ? "FCMToken" : "iOSPush",
+        token,
+        enabled: true,
+      },
+    };
+    const osRes = await fetch(`https://api.onesignal.com/apps/${process.env.ONESIGNAL_APP_ID}/users`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Key ${process.env.ONESIGNAL_API_KEY}`,
+      },
+      body: JSON.stringify({
+        properties: { external_id: req.user.id },
+        subscriptions: [osPayload.subscription],
+      }),
+    });
+    const osData = await osRes.json();
+    onesignalSubscriptionId = osData?.subscriptions?.[0]?.id || null;
+    if (onesignalSubscriptionId) {
+      console.log(`[Push] OneSignal subscription registered: ${onesignalSubscriptionId} for ${req.user.id}`);
+    } else {
+      console.warn(`[Push] OneSignal registration returned no subscription ID:`, JSON.stringify(osData));
+    }
+  } catch (osErr) {
+    // Non-fatal — still store token locally even if OneSignal registration fails
+    console.warn(`[Push] OneSignal registration failed (non-fatal):`, osErr.message);
+  }
+
   const { error } = await supabaseService.from("device_push_tokens").upsert({
     user_id: req.user.id,
     platform: platform || "ios",
@@ -6310,12 +6346,13 @@ app.post("/push/register", requireAuth, async (req, res) => {
     is_active: true,
     last_seen_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
+    ...(onesignalSubscriptionId ? { onesignal_subscription_id: onesignalSubscriptionId } : {}),
   }, { onConflict: "user_id,endpoint" });
   if (error) return res.status(500).json({ error: error.message });
   await supabaseService.from("notification_preferences").upsert({
     user_id: req.user.id, push_enabled: true, updated_at: new Date().toISOString(),
   }, { onConflict: "user_id", ignoreDuplicates: true });
-  res.json({ ok: true });
+  res.json({ ok: true, onesignal: !!onesignalSubscriptionId });
 });
 
 app.get("/notifications/vapid-key", (_req, res) => {
@@ -6376,7 +6413,7 @@ async function buildEligibleUserSet(window) {
   // Query 1: all active push tokens
   const { data: tokenRows } = await db
     .from("device_push_tokens")
-    .select("user_id, push_token, endpoint")
+    .select("user_id, push_token, endpoint, platform, onesignal_subscription_id")
     .eq("is_active", true);
 
   if (!tokenRows?.length) return { eligible: [], counts: { total_with_token: 0 }, tokenMap: {}, tasksByUser: new Map() };
@@ -6384,7 +6421,7 @@ async function buildEligibleUserSet(window) {
   const tokenMap = {};
   for (const row of tokenRows) {
     if (!tokenMap[row.user_id]) tokenMap[row.user_id] = [];
-    tokenMap[row.user_id].push({ push_token: row.push_token, endpoint: row.endpoint });
+    tokenMap[row.user_id].push({ push_token: row.push_token, endpoint: row.endpoint, platform: row.platform, onesignal_subscription_id: row.onesignal_subscription_id });
   }
   const usersWithTokens = Object.keys(tokenMap);
 

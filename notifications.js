@@ -357,6 +357,33 @@ function selectCandidate(candidates) {
   )[0] || null;
 }
 
+// ── OneSignal send helper — native iOS/Android only ───────────────────────────
+async function sendViaOneSignal(subscriptionIds, candidate) {
+  const res = await fetch("https://api.onesignal.com/notifications", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Key ${process.env.ONESIGNAL_API_KEY}`,
+    },
+    body: JSON.stringify({
+      app_id:                  process.env.ONESIGNAL_APP_ID,
+      include_subscription_ids: subscriptionIds,
+      headings:                { en: candidate.title },
+      contents:                { en: candidate.body },
+      data: {
+        notification_type: candidate.notification_type,
+        priority:          candidate.priority,
+        ...candidate.payload,
+      },
+    }),
+  });
+  const data = await res.json();
+  if (data.errors?.length) {
+    console.warn("[Push] OneSignal errors:", JSON.stringify(data.errors));
+  }
+  return data;
+}
+
 // ── Send notification ─────────────────────────────────────────────────────────
 async function sendNotification(supabase, userId, candidate, preloadedTokens) {
   // preloadedTokens: token array passed in from bulk path — avoids a DB query
@@ -366,7 +393,7 @@ async function sendNotification(supabase, userId, candidate, preloadedTokens) {
   } else {
     const { data } = await supabase
       .from("device_push_tokens")
-      .select("push_token, endpoint")
+      .select("push_token, endpoint, platform, onesignal_subscription_id")
       .eq("user_id", userId)
       .eq("is_active", true);
     tokens = data;
@@ -389,7 +416,31 @@ async function sendNotification(supabase, userId, candidate, preloadedTokens) {
   const eventId = event?.id;
   let sentCount = 0;
 
-  for (const token of tokens) {
+  // Split tokens: native (OneSignal) vs web (VAPID)
+  const nativeTokens = tokens.filter(t => t.platform === "ios" || t.platform === "android");
+  const webTokens    = tokens.filter(t => t.platform === "web");
+
+  // ── Native send via OneSignal ─────────────────────────────────────────────
+  const osSubscriptionIds = nativeTokens
+    .map(t => t.onesignal_subscription_id)
+    .filter(Boolean);
+
+  if (osSubscriptionIds.length) {
+    try {
+      const osResult = await sendViaOneSignal(osSubscriptionIds, candidate);
+      const osSent = osResult.recipients || 0;
+      sentCount += osSent;
+      console.log(`[Push] OneSignal sent to ${userId}: ${candidate.notification_type} — "${candidate.title}" — recipients=${osSent}`);
+    } catch (err) {
+      console.error(`[Push] OneSignal send failed for ${userId}:`, err.message);
+    }
+  } else if (nativeTokens.length) {
+    // Native tokens exist but no OneSignal subscription ID — log for investigation
+    console.warn(`[Push] ${nativeTokens.length} native token(s) for ${userId} have no OneSignal subscription ID — skipping`);
+  }
+
+  // ── Web send via VAPID ────────────────────────────────────────────────────
+  for (const token of webTokens) {
     try {
       const subscription = JSON.parse(token.push_token);
       const payload = JSON.stringify({
@@ -403,14 +454,14 @@ async function sendNotification(supabase, userId, candidate, preloadedTokens) {
       });
       await webpush.sendNotification(subscription, payload);
       sentCount++;
-      console.log(`[Push] Sent to ${userId}: ${candidate.notification_type} — "${candidate.title}"`);
+      console.log(`[Push] Web sent to ${userId}: ${candidate.notification_type} — "${candidate.title}"`);
     } catch (err) {
-      console.error(`[Push] Send failed for ${userId}:`, err.statusCode, err.body);
+      console.error(`[Push] Web send failed for ${userId}:`, err.statusCode, err.body);
       if (err.statusCode === 410 || err.statusCode === 404) {
         await supabase.from("device_push_tokens")
           .update({ is_active: false })
           .eq("user_id", userId).eq("endpoint", token.endpoint);
-        console.log(`[Push] Deactivated expired token for ${userId}`);
+        console.log(`[Push] Deactivated expired web token for ${userId}`);
       }
     }
   }
