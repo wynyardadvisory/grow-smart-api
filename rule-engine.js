@@ -1143,7 +1143,7 @@ class DynamicRiskEngine {
     const m       = currentMonth();
 
     // ── Frost alert (1–3 day horizon) ────────────────────────────────────────
-    if (ctx.frostSensitive && !ctx.isProtected) {
+    if (ctx.frostSensitive && !ctx.isProtected && ctx.areaType !== "indoors") {
       const min7 = ctx.frostRisk7day;
       if (min7 !== null && min7 <= 2) {
         const urgency = min7 <= 0 ? "high" : "medium";
@@ -1165,7 +1165,7 @@ class DynamicRiskEngine {
     }
 
     // ── Heat stress alert ─────────────────────────────────────────────────────
-    if (ctx.tempC !== null && ctx.tempC >= 28 && ctx.areaType !== "greenhouse") {
+    if (ctx.tempC !== null && ctx.tempC >= 28 && ctx.areaType !== "greenhouse" && ctx.areaType !== "indoors") {
       results.push(candidate(ctx, {
         ruleId:       "heat_alert",
         taskType:     "water",
