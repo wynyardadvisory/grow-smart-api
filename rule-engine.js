@@ -917,7 +917,7 @@ class ScheduledRuleEngine {
     // Greenhouse and polytunnel crops stay under cover — suppress outdoor
     // transplant and harden-off tasks entirely. They may still need
     // potting-on or spacing, but that is handled by growing rules.
-    if (ctx.areaType === "greenhouse" || ctx.areaType === "polytunnel") return results;
+    if (ctx.areaType === "greenhouse" || ctx.areaType === "polytunnel" || ctx.areaType === "indoors") return results;
 
     // Tuber and crown crops are planted directly — not transplanted from indoor seedlings.
     // They are handled by _evalSow where the tuber/crown path already exists.
@@ -1238,6 +1238,7 @@ class DynamicRiskEngine {
 
     // Outdoor requirement — skip for greenhouse and any indoor-sown crops
     if (rule.requires_outdoor && ctx.areaType === "greenhouse") return false;
+    if (rule.requires_outdoor && ctx.areaType === "indoors") return false;
     if (rule.requires_outdoor && ctx.cropStatus === "sown_indoors") return false;
     if (rule.requires_unprotected && ctx.isProtected) return false;
 
@@ -1401,11 +1402,11 @@ class RuleEngine {
       }
       if (moistureActive && soilMoisture === "wet") continue; // soil wet — skip watering
 
-      // Suppress if it rained more than 5mm today
-      if (rainMm !== null && rainMm >= 5) continue;
+      // Suppress if it rained more than 5mm today — but not for indoors areas (rain irrelevant)
+      if (areaType !== "indoors" && rainMm !== null && rainMm >= 5) continue;
 
       // Dry day thresholds per area type
-      const BASE_THRESHOLD = areaType === "greenhouse" ? 1
+      const BASE_THRESHOLD = areaType === "greenhouse" || areaType === "indoors" ? 1
         : areaType === "container" || areaType === "pot" ? 2
         : areaType === "raised_bed" ? 4
         : 6; // ground/border

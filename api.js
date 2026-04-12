@@ -7486,7 +7486,8 @@ app.get("/garden/plan-quality", requireAuth, async (req, res) => {
       .eq("location_id", plan.location_id);
 
     // ── 4. Load crop history per area (for rotation quality) ──────────────────
-    const areaIds = (allAreas || []).map(a => a.id);
+    // Indoors areas are excluded from rotation — they have no physical soil
+    const areaIds = (allAreas || []).filter(a => a.type !== "indoors").map(a => a.id);
     let cropHistory = []; // { area_id, category }
     if (areaIds.length) {
       const { data: hist } = await supabaseService.from("crop_instances")
