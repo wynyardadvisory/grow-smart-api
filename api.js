@@ -4712,7 +4712,8 @@ RULES:
 
     let result;
     try {
-      const match = text.match(/\{[\s\S]*\}/);
+      const cleaned = text.replace(/```json\s*/gi, "").replace(/```\s*/gi, "").trim();
+      const match = cleaned.match(/\{[\s\S]*\}/);
       if (!match) throw new Error("No JSON in response");
       result = JSON.parse(match[0]);
     } catch {
