@@ -4680,7 +4680,19 @@ RULES:
 - Base everything on UK growing conditions and the specific crop context provided`;
 
     // ── Call Claude Vision ────────────────────────────────────────────────────
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    // ── Try Claude first, fall back to GPT-4o on overload ────────────────────
+    const parseAIResponse = (text, provider) => {
+      const cleaned = text.replace(/```json\s*/gi, "").replace(/```\s*/gi, "").trim();
+      const match = cleaned.match(/\{[\s\S]*\}/);
+      if (!match) throw new Error(`${provider} returned no JSON`);
+      return JSON.parse(match[0]);
+    };
+
+    let result;
+    let aiProvider = "claude";
+
+    // ── Call Claude ───────────────────────────────────────────────────────────
+    const claudeResponse = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -4693,32 +4705,56 @@ RULES:
         messages: [{
           role: "user",
           content: [
-            {
-              type: "image",
-              source: {
-                type: "base64",
-                media_type: "image/jpeg",
-                data: image,
-              },
-            },
+            { type: "image", source: { type: "base64", media_type: "image/jpeg", data: image } },
             { type: "text", text: prompt },
           ],
         }],
       }),
     });
 
-    const raw  = await response.json();
-    console.error("[DiagnosisAnalyze] Raw API response:", JSON.stringify(raw).slice(0, 500));
-    const text = raw.content?.[0]?.text || "";
+    const claudeRaw = await claudeResponse.json();
 
-    let result;
-    try {
-      const cleaned = text.replace(/```json\s*/gi, "").replace(/```\s*/gi, "").trim();
-      const match = cleaned.match(/\{[\s\S]*\}/);
-      if (!match) throw new Error("No JSON in response");
-      result = JSON.parse(match[0]);
-    } catch {
-      throw new Error(`Claude returned unparseable response: ${text.slice(0, 200)}`);
+    if (claudeRaw.type === "error" && claudeRaw.error?.type === "overloaded_error") {
+      // ── Claude overloaded — fall back to GPT-4o ───────────────────────────
+      console.error("[DiagnosisAnalyze] Claude overloaded, falling back to GPT-4o");
+      aiProvider = "gpt-4o";
+
+      const openaiResponse = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: "gpt-4o",
+          max_tokens: 1200,
+          messages: [{
+            role: "user",
+            content: [
+              { type: "image_url", image_url: { url: `data:image/jpeg;base64,${image}` } },
+              { type: "text", text: prompt },
+            ],
+          }],
+        }),
+      });
+
+      const openaiRaw = await openaiResponse.json();
+      const openaiText = openaiRaw.choices?.[0]?.message?.content || "";
+      try {
+        result = parseAIResponse(openaiText, "GPT-4o");
+      } catch {
+        throw new Error(`GPT-4o returned unparseable response: ${openaiText.slice(0, 200)}`);
+      }
+
+    } else if (claudeRaw.type === "error") {
+      throw new Error(`Claude API error: ${claudeRaw.error?.message || "unknown"}`);
+    } else {
+      const claudeText = claudeRaw.content?.[0]?.text || "";
+      try {
+        result = parseAIResponse(claudeText, "Claude");
+      } catch {
+        throw new Error(`Claude returned unparseable response: ${claudeText.slice(0, 200)}`);
+      }
     }
 
     // ── Validate result before logging ───────────────────────────────────────
@@ -4743,7 +4779,7 @@ RULES:
       diagnosis:        result.problem_name || (result.looks_healthy ? "Healthy" : "No issue detected"),
       severity:         result.severity || null,
       confidence:       result.stage_confidence || null,
-      ai_model:         "claude-sonnet-4-20250514",
+      ai_model:         aiProvider === "gpt-4o" ? "gpt-4o" : "claude-sonnet-4-20250514",
     }).select().single();
 
     if (logErr) console.error("[DiagnosisAnalyze] Log error:", logErr.message);
