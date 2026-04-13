@@ -73,6 +73,66 @@ async function getAllAuthUsers() {
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
+
+// ── AI Helper — Claude with GPT-4o fallback on overload ──────────────────────
+// Text-only call (no image)
+async function callAI({ prompt, maxTokens = 1000 }) {
+  const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: maxTokens, messages: [{ role: "user", content: prompt }] }),
+  });
+  const claudeRaw = await claudeRes.json();
+  if (claudeRaw.type === "error" && claudeRaw.error?.type === "overloaded_error") {
+    console.error("[AI] Claude overloaded, falling back to GPT-4o");
+    const openaiRes = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${process.env.OPENAI_API_KEY}` },
+      body: JSON.stringify({ model: "gpt-4o", max_tokens: maxTokens, messages: [{ role: "user", content: prompt }] }),
+    });
+    const openaiRaw = await openaiRes.json();
+    return { text: openaiRaw.choices?.[0]?.message?.content || "", provider: "gpt-4o" };
+  }
+  if (claudeRaw.type === "error") throw new Error(`Claude API error: ${claudeRaw.error?.message || "unknown"}`);
+  return { text: claudeRaw.content?.[0]?.text || "", provider: "claude" };
+}
+
+// Vision call (with image)
+async function callAIVision({ prompt, imageBase64, maxTokens = 1200 }) {
+  const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: maxTokens, messages: [{ role: "user", content: [
+      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: imageBase64 } },
+      { type: "text", text: prompt },
+    ]}] }),
+  });
+  const claudeRaw = await claudeRes.json();
+  if (claudeRaw.type === "error" && claudeRaw.error?.type === "overloaded_error") {
+    console.error("[AI] Claude overloaded, falling back to GPT-4o vision");
+    const openaiRes = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${process.env.OPENAI_API_KEY}` },
+      body: JSON.stringify({ model: "gpt-4o", max_tokens: maxTokens, messages: [{ role: "user", content: [
+        { type: "image_url", image_url: { url: `data:image/jpeg;base64,${imageBase64}` } },
+        { type: "text", text: prompt },
+      ]}] }),
+    });
+    const openaiRaw = await openaiRes.json();
+    return { text: openaiRaw.choices?.[0]?.message?.content || "", provider: "gpt-4o" };
+  }
+  if (claudeRaw.type === "error") throw new Error(`Claude API error: ${claudeRaw.error?.message || "unknown"}`);
+  return { text: claudeRaw.content?.[0]?.text || "", provider: "claude" };
+}
+
+// Parse JSON from AI response (strips markdown fences)
+function parseAIJson(text, provider = "AI") {
+  const cleaned = text.replace(/```json\s*/gi, "").replace(/```\s*/gi, "").trim();
+  const match = cleaned.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error(`${provider} returned no JSON`);
+  return JSON.parse(match[0]);
+}
+
 const app = express();
 app.disable("etag"); // Prevent 304 caching — responses must always be fresh
 app.use(helmet());
@@ -1035,33 +1095,14 @@ Use null for any fields you don't have reliable data for. All month values are i
 For soil_moisture_pref use one of: low, medium, high, even_moisture, dry_down_before_harvest
 For soil temperature fields: use null for perennial crops where soil temp is not a germination limiting factor.`;
 
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type":      "application/json",
-        "x-api-key":         process.env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model:      "claude-sonnet-4-20250514",
-        max_tokens: 1500,
-        messages:   [{ role: "user", content: prompt }],
-      }),
-    });
-
-    const raw = await response.json();
-    console.log(`[Enrich] Anthropic status: ${response.status}, type: ${raw.type}, error: ${raw.error?.message || 'none'}`);
-    const text = raw.content?.[0]?.text || "";
-    console.log(`[Enrich] Claude raw response (first 300 chars): ${text.slice(0, 300)}`);
+    const { text: enrichText, provider: enrichProvider } = await callAI({ prompt, maxTokens: 1500 });
+    console.log(`[Enrich] Provider: ${enrichProvider}, response (first 300 chars): ${enrichText.slice(0, 300)}`);
 
     let parsed;
     try {
-      // Extract JSON robustly — find the outermost { } block regardless of surrounding text
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) throw new Error("No JSON object found in response");
-      parsed = JSON.parse(jsonMatch[0]);
+      parsed = parseAIJson(enrichText, enrichProvider);
     } catch {
-      throw new Error(`Claude returned unparseable JSON: ${text.slice(0, 200)}`);
+      throw new Error(`${enrichProvider} returned unparseable JSON: ${enrichText.slice(0, 200)}`);
     }
 
     // Store raw response for debugging
@@ -1317,16 +1358,8 @@ app.post("/crops/preview", requireAuth, async (req, res) => {
 Respond ONLY with a JSON object, no markdown:
 {"name":"Canonical crop name","description":"2 sentence description for UK home growers","sow_window":"e.g. Mar - May or null","harvest_window":"e.g. Jul - Sep or null","spacing_cm":25,"days_to_maturity":"60-80 days or null","sow_method":"indoors or outdoors or both or null","feeding_notes":"Brief feeding guidance or null","companion_plants":"2-3 companions or null","common_issues":"2-3 common problems or null","known":false}`;
 
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 600, messages: [{ role: "user", content: prompt }] }),
-    });
-    const raw  = await r.json();
-    const text = raw.content?.[0]?.text || "";
-    const m    = text.match(/\{[\s\S]*\}/);
-    if (!m) throw new Error("No JSON in response");
-    res.json(JSON.parse(m[0]));
+    const { text: previewText, provider: previewProvider } = await callAI({ prompt, maxTokens: 600 });
+    res.json(parseAIJson(previewText, previewProvider));
   } catch (e) {
     console.error("[Preview]", e.message);
     res.status(500).json({ error: e.message });
@@ -1952,25 +1985,8 @@ Respond ONLY with a JSON object — no markdown, no explanation:
 suitable_crop_types should list ALL crop categories this feed is appropriate for.
 If the product is not a real plant feed, return: { "valid": false }`;
 
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 800,
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
-
-    const raw = await response.json();
-    const text = raw.content?.[0]?.text || "";
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error("No JSON in response");
-    const parsed = JSON.parse(jsonMatch[0]);
+    const { text: feedText, provider: feedProvider } = await callAI({ prompt, maxTokens: 800 });
+    const parsed = parseAIJson(feedText, feedProvider);
 
     if (!parsed.valid) {
       console.log(`[FeedEnrich] Invalid feed: ${productName}`);
@@ -2470,25 +2486,8 @@ Respond ONLY with a JSON object — no markdown, no explanation:
   try {
     const prompt = isEmpty ? emptyPrompt : populatedPrompt;
 
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1400,
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
-
-    const raw  = await response.json();
-    const text = raw.content?.[0]?.text || "";
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) throw new Error("No JSON object in response");
-    const parsed = JSON.parse(match[0]);
+    const { text: planText, provider: planProvider } = await callAI({ prompt, maxTokens: 1400 });
+    const parsed = parseAIJson(planText, planProvider);
     const suggestions = parsed.suggestions || [];
     const summary     = parsed.summary || null;
 
@@ -2602,24 +2601,9 @@ app.post("/barcode/scan-image", requireAuth, async (req, res) => {
       ? `This is a photo of a seed packet. Identify the crop name, variety, and brand from the text visible on the packet. Respond ONLY with JSON: {"found":true,"name":"Carrot","variety":"Nantes 2","brand":"Thompson & Morgan","description":"Short growing note","sow_window":"Mar - Jun","is_seed":true} If you cannot identify a crop: {"found":false}`
       : `This is a photo of a garden feed or fertiliser product. Identify the product name, brand, NPK values, and form from the text on the packaging. Respond ONLY with JSON: {"found":true,"name":"Tomorite","brand":"Levington","product_name":"Tomorite Concentrated Tomato Food","form":"liquid","feed_type":"tomato","npk":"4-3-8","description":"Short description","is_feed":true} If you cannot identify it: {"found":false}`;
 
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 500,
-        messages: [{ role: "user", content: [
-          { type: "image", source: { type: "base64", media_type: "image/jpeg", data: image } },
-          { type: "text", text: prompt },
-        ]}],
-      }),
-    });
-
-    const raw  = await r.json();
-    const text = raw.content?.[0]?.text || "";
-    const m    = text.match(/\{[\s\S]*\}/);
-    if (!m) return res.json({ found: false });
-    const parsed = JSON.parse(m[0]);
+    const { text: scanText, provider: scanProvider } = await callAIVision({ prompt, imageBase64: image, maxTokens: 500 });
+    let parsed;
+    try { parsed = parseAIJson(scanText, scanProvider); } catch { return res.json({ found: false }); }
     if (!parsed.found) return res.json({ found: false });
 
     // Store barcode against DB entry if identified
@@ -2717,16 +2701,9 @@ Respond ONLY with JSON: {"is_seed":true,"name":"Carrot","variety":"Nantes 2","de
 Is this a garden feed or fertiliser? If yes, identify it. If NOT, say so.
 Respond ONLY with JSON: {"is_feed":true,"name":"Product name","brand":"${brand||""}","product_name":"${productName}","form":"liquid","feed_type":"tomato","npk":"4-3-8","description":"Brief description"}`;
 
-  const r = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 400, messages: [{ role: "user", content: prompt }] }),
-  });
-  const raw  = await r.json();
-  const text = raw.content?.[0]?.text || "";
-  const m    = text.match(/\{[\s\S]*\}/);
-  if (!m) return { name: productName, brand };
-  const parsed = JSON.parse(m[0]);
+  const { text: barcodeText, provider: barcodeProvider } = await callAI({ prompt, maxTokens: 400 });
+  let parsed;
+  try { parsed = parseAIJson(barcodeText, barcodeProvider); } catch { return { name: productName, brand }; }
   // Store barcode against crop_def / feed_catalog for instant future lookups
   if (mode === "crop" && parsed.is_seed && parsed.name) {
     const { data: cropDef } = await supabaseService
@@ -4314,19 +4291,7 @@ app.get("/tips", requireAuth, async (req, res) => {
   const month = new Date().toLocaleString("en-GB", { month: "long" });
 
   try {
-    const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 800,
-        messages: [{
-          role: "user",
-          content: `You are a practical UK gardening advisor. Generate exactly 3 concise, actionable tips for a UK grower in ${month}.
+    const tipsPrompt = `You are a practical UK gardening advisor. Generate exactly 3 concise, actionable tips for a UK grower in ${month}.
 
 Their current crops:
 ${cropList}
@@ -4340,14 +4305,9 @@ Rules:
 - Vary the topics: e.g. soil prep, pest prevention, companion planting, feeding, protection, tools
 - Keep each tip to 1-2 sentences max
 - Respond ONLY with a JSON array, no preamble, no markdown. Format:
-[{"title":"Short title","tip":"The full tip text","emoji":"relevant emoji"}]`
-        }],
-      }),
-    });
-
-    const aiData = await aiRes.json();
-    const text = aiData.content?.[0]?.text || "[]";
-    const clean = text.replace(/```json|```/g, "").trim();
+[{"title":"Short title","tip":"The full tip text","emoji":"relevant emoji"}]`;
+    const { text: tipsText } = await callAI({ prompt: tipsPrompt, maxTokens: 800 });
+    const clean = tipsText.replace(/```json|```/g, "").trim();
     const tips = JSON.parse(clean);
 
     // Cache the tips
@@ -4679,83 +4639,15 @@ RULES:
 - If the photo is unclear or not a plant, set problem_detected: false and explain in reasoning_summary
 - Base everything on UK growing conditions and the specific crop context provided`;
 
-    // ── Call Claude Vision ────────────────────────────────────────────────────
-    // ── Try Claude first, fall back to GPT-4o on overload ────────────────────
-    const parseAIResponse = (text, provider) => {
-      const cleaned = text.replace(/```json\s*/gi, "").replace(/```\s*/gi, "").trim();
-      const match = cleaned.match(/\{[\s\S]*\}/);
-      if (!match) throw new Error(`${provider} returned no JSON`);
-      return JSON.parse(match[0]);
-    };
-
+    // ── Call AI Vision with GPT-4o fallback ─────────────────────────────────
+    const { text: diagText, provider: diagProvider } = await callAIVision({ prompt, imageBase64: image, maxTokens: 1200 });
     let result;
-    let aiProvider = "claude";
-
-    // ── Call Claude ───────────────────────────────────────────────────────────
-    const claudeResponse = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1200,
-        messages: [{
-          role: "user",
-          content: [
-            { type: "image", source: { type: "base64", media_type: "image/jpeg", data: image } },
-            { type: "text", text: prompt },
-          ],
-        }],
-      }),
-    });
-
-    const claudeRaw = await claudeResponse.json();
-
-    if (claudeRaw.type === "error" && claudeRaw.error?.type === "overloaded_error") {
-      // ── Claude overloaded — fall back to GPT-4o ───────────────────────────
-      console.error("[DiagnosisAnalyze] Claude overloaded, falling back to GPT-4o");
-      aiProvider = "gpt-4o";
-
-      const openaiResponse = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-        },
-        body: JSON.stringify({
-          model: "gpt-4o",
-          max_tokens: 1200,
-          messages: [{
-            role: "user",
-            content: [
-              { type: "image_url", image_url: { url: `data:image/jpeg;base64,${image}` } },
-              { type: "text", text: prompt },
-            ],
-          }],
-        }),
-      });
-
-      const openaiRaw = await openaiResponse.json();
-      const openaiText = openaiRaw.choices?.[0]?.message?.content || "";
-      try {
-        result = parseAIResponse(openaiText, "GPT-4o");
-      } catch {
-        throw new Error(`GPT-4o returned unparseable response: ${openaiText.slice(0, 200)}`);
-      }
-
-    } else if (claudeRaw.type === "error") {
-      throw new Error(`Claude API error: ${claudeRaw.error?.message || "unknown"}`);
-    } else {
-      const claudeText = claudeRaw.content?.[0]?.text || "";
-      try {
-        result = parseAIResponse(claudeText, "Claude");
-      } catch {
-        throw new Error(`Claude returned unparseable response: ${claudeText.slice(0, 200)}`);
-      }
+    try {
+      result = parseAIJson(diagText, diagProvider);
+    } catch {
+      throw new Error(`${diagProvider} returned unparseable response: ${diagText.slice(0, 200)}`);
     }
+
 
     // ── Validate result before logging ───────────────────────────────────────
     // Only count as a use if Claude returned a meaningful, usable result.
@@ -4779,7 +4671,7 @@ RULES:
       diagnosis:        result.problem_name || (result.looks_healthy ? "Healthy" : "No issue detected"),
       severity:         result.severity || null,
       confidence:       result.stage_confidence || null,
-      ai_model:         aiProvider === "gpt-4o" ? "gpt-4o" : "claude-sonnet-4-20250514",
+      ai_model:         diagProvider === "gpt-4o" ? "gpt-4o" : "claude-sonnet-4-20250514",
     }).select().single();
 
     if (logErr) console.error("[DiagnosisAnalyze] Log error:", logErr.message);
