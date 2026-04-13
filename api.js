@@ -4708,6 +4708,7 @@ RULES:
     });
 
     const raw  = await response.json();
+    console.error("[DiagnosisAnalyze] Raw API response:", JSON.stringify(raw).slice(0, 500));
     const text = raw.content?.[0]?.text || "";
 
     let result;
