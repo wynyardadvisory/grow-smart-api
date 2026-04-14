@@ -4881,9 +4881,8 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
         due_date:   today,
         urgency:    "low",
         source:     "onboarding",
-        source_key: `onboarding_starter_${c.name}_${today}`,
+        source_key: `onboarding_starter_${userId}_${c.name}_${today}`,
         created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
       }));
       await supabaseService.from("tasks").upsert(starterTasks, { onConflict: "source_key" });
     }
