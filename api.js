@@ -4902,7 +4902,7 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
         task_type:  "monitor",
         due_date:   today,
         urgency:    "low",
-        source:     "onboarding",
+        source:     "manual",
         source_key: `onboarding_starter_${userId}_${c.name}_${today}`,
         created_at: new Date().toISOString(),
       }));
