@@ -7982,16 +7982,34 @@ function _findGaps(baselineAssignments, sequenceByArea) {
     if (!harvestEnd) continue;
     const seq     = sequenceByArea[a.area_id];
     const nextSow = seq?.followOns?.[0]?.sow_month || null;
-    const gapStart = harvestEnd > 12 ? 1 : harvestEnd + 1;
-    const gapEnd   = nextSow ? nextSow - 1 : 3;
-    if (gapEnd >= gapStart && (gapEnd - gapStart) >= 1) {
+
+    // Handle year-wrap: harvest in autumn (e.g. Oct), next sow in spring (e.g. Mar)
+    // means gap crosses Dec→Jan. We use a 24-month scale to compare correctly.
+    const gapStart = (harvestEnd % 12) + 1; // month after harvest, wraps Dec→Jan
+    let gapEnd;
+    if (!nextSow) {
+      gapEnd = 3; // default: assume sowing in March
+    } else if (nextSow <= harvestEnd) {
+      // next sow is earlier in calendar than harvest end — it must be next year
+      gapEnd = nextSow + 12 - 1;
+    } else {
+      gapEnd = nextSow - 1;
+    }
+
+    // Normalise gapStart to same scale as gapEnd
+    const normStart = gapStart <= 12 && gapEnd > 12 ? gapStart + 12 : gapStart;
+
+    // Gap must be at least 2 months wide to be worth filling
+    if (gapEnd >= normStart && (gapEnd - normStart) >= 1) {
+      const storedStart = gapStart > 12 ? gapStart - 12 : gapStart;
+      const storedEnd   = gapEnd   > 12 ? gapEnd   - 12 : gapEnd;
       gaps.push({
         area_id:          a.area_id,
         area_name:        a.area_name,
         area_type:        a.area_type,
         area_group:       a.area_group,
-        gap_start_month:  gapStart,
-        gap_end_month:    gapEnd,
+        gap_start_month:  storedStart,
+        gap_end_month:    storedEnd,
         after_crop:       a.crop_name,
         current_category: a.category,
       });
@@ -8002,13 +8020,25 @@ function _findGaps(baselineAssignments, sequenceByArea) {
 
 // ── Pick a gap-fill crop ───────────────────────────────────────────────────────
 function _pickGapCrop(gap, cropDefs, userCropNames, usedGapNames, usedGapCategories) {
+  const gapStart = gap.gap_start_month;
+  const gapEnd   = gap.gap_end_month;
+  const wraps    = gapEnd < gapStart; // gap crosses Dec→Jan boundary
+
+  const monthFits = (cropSow, cropHarvest) => {
+    if (!cropSow || !cropHarvest) return false;
+    if (wraps) {
+      return cropSow >= gapStart || cropHarvest <= gapEnd;
+    }
+    return cropSow >= gapStart && cropHarvest <= gapEnd;
+  };
+
   const eligible = cropDefs.filter(d => {
-    if (!d.harvest_month_start || !d.harvest_month_end) return false;
-    if (d.harvest_month_start < gap.gap_start_month)   return false;
-    if (d.harvest_month_end   > gap.gap_end_month)     return false;
-    if (usedGapNames.has(d.name))                      return false;
-    if (usedGapCategories.has(d.category))             return false;
-    if (d.category === gap.current_category)           return false;
+    const sowMonth     = d.sow_direct_start || d.sow_indoors_start;
+    const harvestMonth = d.harvest_month_end;
+    if (!monthFits(sowMonth, harvestMonth))       return false;
+    if (usedGapNames.has(d.name))                 return false;
+    if (usedGapCategories.has(d.category))        return false;
+    if (d.category === gap.current_category)      return false;
     return true;
   });
   if (!eligible.length) return null;
