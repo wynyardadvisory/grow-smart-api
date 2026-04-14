@@ -4735,6 +4735,28 @@ app.post("/admin/reset-tasks", requireAuth, requireAdmin, async (req, res) => {
 
 
 // =============================================================================
+// ADMIN — run rule engine for specific users (task recovery, no deletions)
+// POST /admin/recover-tasks { user_ids: [...] }
+// =============================================================================
+app.post("/admin/recover-tasks", requireAuth, requireAdmin, async (req, res) => {
+  const { user_ids } = req.body;
+  if (!Array.isArray(user_ids) || !user_ids.length) {
+    return res.status(400).json({ error: "user_ids array required" });
+  }
+  try {
+    const results = [];
+    for (const userId of user_ids) {
+      const tasks = await runRuleEngine(userId);
+      results.push({ userId, tasks_generated: tasks.length });
+    }
+    res.json({ recovered: results.length, results });
+  } catch (err) {
+    console.error("[AdminRecoverTasks]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// =============================================================================
 // ONBOARDING — complete setup in one call
 // Creates location + area silently, creates crop instances, runs rule engine.
 // Stage → sow_date mapping so user never has to enter exact dates.
