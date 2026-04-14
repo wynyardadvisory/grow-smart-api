@@ -8932,7 +8932,7 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
     // ── Fetch crop instances ──────────────────────────────────────────────────
     const { data: allCrops } = await supabaseService
       .from("crop_instances")
-      .select("area_id, crop_def_id, variety_id, name, active, status, sown_date, varieties(name), crop_definitions(name, category, harvest_month_start, harvest_month_end, sow_direct_start, sow_indoors_start)")
+      .select("area_id, crop_def_id, variety_id, name, active, status, sown_date, varieties(name, days_to_maturity_min, days_to_maturity_max), crop_definitions(name, category, harvest_month_start, harvest_month_end, sow_direct_start, sow_indoors_start, days_to_maturity_min, days_to_maturity_max)")
       .eq("user_id", req.user.id)
       .in("area_id", areaIds);
 
@@ -8945,6 +8945,18 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
     for (const crop of cropRows) {
       const name     = crop.crop_definitions?.name || crop.name || "Unknown";
       const category = crop.crop_definitions?.category || null;
+      // Use buildTimeline to get the same harvest date the Today screen uses.
+      // This ensures the plan generator uses per-instance estimated harvest dates
+      // (based on sown_date + DTM) rather than generic crop def harvest months.
+      const tlInput = {
+        sown_date: crop.sown_date,
+        crop_def:  crop.crop_definitions || {},
+        variety:   crop.varieties || {},
+      };
+      const tl = crop.sown_date ? buildTimeline(tlInput) : null;
+      const estimatedHarvestMonth = tl?.harvest_date_iso
+        ? new Date(tl.harvest_date_iso).getMonth() + 1
+        : null;
       const entry    = {
         name, category,
         crop_def_id:         crop.crop_def_id,
@@ -8953,7 +8965,7 @@ app.post("/plans/generate", requireAuth, async (req, res) => {
         status:              crop.status,
         sown_date:           crop.sown_date,
         harvest_month_start: crop.crop_definitions?.harvest_month_start || null,
-        harvest_month_end:   crop.crop_definitions?.harvest_month_end   || null,
+        harvest_month_end:   estimatedHarvestMonth || crop.crop_definitions?.harvest_month_end || null,
         sow_month:           crop.crop_definitions?.sow_direct_start || crop.crop_definitions?.sow_indoors_start || null,
       };
       if (crop.active) {
