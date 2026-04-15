@@ -153,6 +153,84 @@ app.use(cors({ origin: (origin, cb) => {
     || /^https:\/\/grow-smart-frontend.*wynyardadvisorys-projects\.vercel\.app$/.test(origin);
   cb(null, allowed);
 }}));
+// ── Stripe webhook — must be registered BEFORE express.json() ─────────────────
+// express.json() parses the body as an object, destroying the raw buffer that
+// Stripe needs to verify the webhook signature. By registering this route first
+// with express.raw(), it receives the unparsed body before the global middleware runs.
+app.post("/subscription/stripe-webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"];
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    } catch (err) {
+      console.error("[Stripe] Webhook signature failed:", err.message);
+      return res.status(400).json({ error: `Webhook error: ${err.message}` });
+    }
+
+    console.log(`[Stripe] Event: ${event.type}`);
+
+    try {
+      if (event.type === "checkout.session.completed") {
+        const session = event.data.object;
+        const userId = session.metadata?.supabase_user_id;
+        if (userId) {
+          await supabaseService.from("profiles").update({
+            plan:       "pro",
+            pro_source: "stripe",
+          }).eq("id", userId);
+          console.log(`[Stripe] checkout.session.completed — upgraded user ${userId} to pro`);
+        }
+      }
+
+      if (event.type === "invoice.payment_succeeded") {
+        const invoice = event.data.object;
+        const customerId = invoice.customer;
+        const { data: profile } = await supabaseService
+          .from("profiles")
+          .select("id")
+          .eq("stripe_customer_id", customerId)
+          .single();
+        if (profile) {
+          const periodEnd = invoice.lines?.data?.[0]?.period?.end;
+          await supabaseService.from("profiles").update({
+            plan:           "pro",
+            pro_source:     "stripe",
+            pro_expires_at: periodEnd ? new Date(periodEnd * 1000).toISOString() : null,
+          }).eq("id", profile.id);
+          console.log(`[Stripe] invoice.payment_succeeded — renewed pro for user ${profile.id}`);
+        }
+      }
+
+      if (event.type === "customer.subscription.deleted" ||
+          event.type === "invoice.payment_failed") {
+        const obj = event.data.object;
+        const customerId = obj.customer;
+        const { data: profile } = await supabaseService
+          .from("profiles")
+          .select("id")
+          .eq("stripe_customer_id", customerId)
+          .single();
+        if (profile) {
+          await supabaseService.from("profiles").update({
+            plan:           "free",
+            pro_expires_at: null,
+          }).eq("id", profile.id);
+          console.log(`[Stripe] ${event.type} — downgraded user ${profile.id} to free`);
+        }
+      }
+    } catch (err) {
+      console.error("[Stripe] Webhook handler error:", err.message);
+      captureError("StripeWebhook", err);
+    }
+
+    res.json({ received: true });
+  }
+);
+
 app.use(express.json({ limit: "10mb" }));
 app.use(morgan("dev"));
 
@@ -7019,82 +7097,7 @@ app.post("/subscription/create-checkout", requireAuth, async (req, res) => {
   }
 });
 
-// POST /subscription/stripe-webhook
-// Stripe calls this when subscription events occur.
-// Uses raw body for Stripe signature verification.
-app.post("/subscription/stripe-webhook",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
-    const sig = req.headers["stripe-signature"];
-    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
-    let event;
-    try {
-      event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
-    } catch (err) {
-      console.error("[Stripe] Webhook signature failed:", err.message);
-      return res.status(400).json({ error: `Webhook error: ${err.message}` });
-    }
-
-    console.log(`[Stripe] Event: ${event.type}`);
-
-    try {
-      if (event.type === "checkout.session.completed") {
-        const session = event.data.object;
-        const userId = session.metadata?.supabase_user_id;
-        if (userId) {
-          await supabaseService.from("profiles").update({
-            plan:       "pro",
-            pro_source: "stripe",
-          }).eq("id", userId);
-          console.log(`[Stripe] checkout.session.completed — upgraded user ${userId} to pro`);
-        }
-      }
-
-      if (event.type === "invoice.payment_succeeded") {
-        const invoice = event.data.object;
-        const customerId = invoice.customer;
-        const { data: profile } = await supabaseService
-          .from("profiles")
-          .select("id")
-          .eq("stripe_customer_id", customerId)
-          .single();
-        if (profile) {
-          const periodEnd = invoice.lines?.data?.[0]?.period?.end;
-          await supabaseService.from("profiles").update({
-            plan:           "pro",
-            pro_source:     "stripe",
-            pro_expires_at: periodEnd ? new Date(periodEnd * 1000).toISOString() : null,
-          }).eq("id", profile.id);
-          console.log(`[Stripe] invoice.payment_succeeded — renewed pro for user ${profile.id}`);
-        }
-      }
-
-      if (event.type === "customer.subscription.deleted" ||
-          event.type === "invoice.payment_failed") {
-        const obj = event.data.object;
-        const customerId = obj.customer;
-        const { data: profile } = await supabaseService
-          .from("profiles")
-          .select("id")
-          .eq("stripe_customer_id", customerId)
-          .single();
-        if (profile) {
-          await supabaseService.from("profiles").update({
-            plan:           "free",
-            pro_expires_at: null,
-          }).eq("id", profile.id);
-          console.log(`[Stripe] ${event.type} — downgraded user ${profile.id} to free`);
-        }
-      }
-    } catch (err) {
-      console.error("[Stripe] Webhook handler error:", err.message);
-      captureError("StripeWebhook", err);
-    }
-
-    res.json({ received: true });
-  }
-);
 
 // GET /subscription/manage
 // Returns a Stripe billing portal URL so users can manage/cancel their subscription.
