@@ -450,13 +450,16 @@ function scoreCandidate(ctx, candidate) {
   // ── Bypass — urgent, real-time, consequence-heavy rules always surface ───────
   // These are already gated by their own risk/weather logic — don't double-suppress.
   // Keep this list tight: only rules where suppression would cause real user harm.
-  // feed_scheduled and sow_prompt are NOT bypassed — let scoring filter weak signals.
+  // sow_prompt and transplant_prompt are calendar-gated — if generated they're valid
+  // and must surface as tasks regardless of confidence score.
   const bypassRules = [
     "pest_slugs_snails",   // dynamic pest risk — already gated by weather/season
     "pest_flea_beetle",    // dynamic pest risk
     "frost_alert",         // real-time weather alert — always urgent
     "watering_due",        // area-level, already gated by rain/dry logic
     "struggling_flag",     // user has flagged a problem — must surface
+    "sow_prompt",          // calendar-gated sowing window — always actionable
+    "transplant_prompt",   // calendar-gated transplant window — always actionable
   ];
   if (bypassRules.includes(candidate.rule_id)) score = Math.max(score, 55);
 
