@@ -395,9 +395,13 @@ function candidate(ctx, opts) {
 // get tasks while advanced users get more precise outputs.
 //
 // Thresholds:
-//   >= 50 → task
-//   >= 30 → insight (surface_class = 'insight')
+//   >= 30 → task (surface_class = 'task')
 //   <  30 → suppress (unless new-user fallback applies)
+//
+// NOTE: The 30–49 "insight" band is collapsed into task for now.
+// There is no current UI surface for insights — tasks must show.
+// Insight infrastructure is preserved for future use.
+// Missing enrichment data should reduce precision, not remove guidance.
 
 function scoreCandidate(ctx, candidate) {
   let score = 0;
@@ -409,6 +413,21 @@ function scoreCandidate(ctx, candidate) {
   // We use rule_id to detect window-based rules
   const windowRules = ["sow_prompt", "transplant_prompt", "harden_off", "perennial_harvest", "perennial_spring_feed"];
   if (windowRules.includes(candidate.rule_id)) score += 20;
+
+  // ── Raised base scores for core actionable rules ─────────────────────────
+  // These rules should surface naturally without needing rich metadata.
+  // Absence of enrichment data (soil temp, pH, stage) should not suppress them.
+  // Base score chosen so one moderate signal (frost safe) pushes them to task level.
+  const raisedBaseRules = {
+    feed_scheduled:        25, // feeding is always actionable when due
+    harden_off:            20, // +20 already from windowRules — nets to 40 total
+    perennial_harvest:      5, // +20 already from windowRules — nets to 25, needs one signal
+    perennial_spring_feed:  5, // +20 already from windowRules — nets to 25, needs one signal
+    perennial_summer_feed: 25, // not in windowRules — needs base
+  };
+  if (raisedBaseRules[candidate.rule_id] !== undefined) {
+    score += raisedBaseRules[candidate.rule_id];
+  }
 
   // Frost safe — positive signal
   if (ctx.frostRisk7day !== null && ctx.frostRisk7day > 0) score += 20;
@@ -1528,16 +1547,17 @@ class RuleEngine {
     });
 
     // Split into surfaced and suppressed
-    const surfaced = scoredCandidates.filter(c => c._score >= 50).map(c => ({
+    // Task threshold is 30 — the 30–49 "insight" band is collapsed into task.
+    // There is no current UI surface for insights, so keeping them hidden causes
+    // guidance to silently disappear. When an insight surface is built, restore
+    // the split by raising this threshold back to 50.
+    const surfaced = scoredCandidates.filter(c => c._score >= 30).map(c => ({
       ...c, surface_class: "task",
-    }));
-    const insights = scoredCandidates.filter(c => c._score >= 30 && c._score < 50).map(c => ({
-      ...c, surface_class: "insight",
     }));
     const suppressed = scoredCandidates.filter(c => c._score < 30);
 
-    // Combine surfaced tasks and insights
-    let finalCandidates = [...surfaced, ...insights];
+    // No insight band for now — all scored candidates are surfaced
+    let finalCandidates = [...surfaced];
 
     // New-user fallback — if nothing surfaced, promote highest-scoring suppressed candidate
     if (finalCandidates.length === 0 && isNewUser && suppressed.length > 0) {
@@ -1626,7 +1646,7 @@ class RuleEngine {
       crop_id:           c.crop_instance_id || null,
       rule_id:           c.rule_id || null,
       model_name:        "v1_max",
-      surface_class:     surfacedKeys.has(c.source_key) ? (c._score >= 50 ? "task" : "insight") : "suppressed",
+      surface_class:     surfacedKeys.has(c.source_key) ? "task" : "suppressed",
       score:             c._score,
       surfaced:          surfacedKeys.has(c.source_key),
       suppression_reason: !surfacedKeys.has(c.source_key) ? "score_below_threshold" : null,

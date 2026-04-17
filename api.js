@@ -4053,7 +4053,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     .is("completed_at", null)
     .not("status", "eq", "expired")
     .lte("due_date", weekEnd) // only today + this week
-    .neq("surface_class", "insight"); // exclude insights — not actionable tasks
+    .neq("surface_class", "suppressed"); // exclude fully suppressed tasks only
 
   const hasUsefulTasks = (usefulTasks || []).length > 0;
 
@@ -4245,9 +4245,11 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     finalTasks = freshTasks || tasks;
   }
 
-  // Separate real tasks from insights — insights are informational, not actionable
-  const actionableTasks = finalTasks.filter(t => t.surface_class !== "insight");
-  const insightTasks    = finalTasks.filter(t => t.surface_class === "insight");
+  // All tasks are actionable — insight surface_class is treated as task until
+  // a dedicated insight UI surface exists. Old DB rows with surface_class="insight"
+  // will now be included in the main feed.
+  const actionableTasks = finalTasks.filter(t => t.surface_class !== "suppressed");
+  const insightTasks    = finalTasks.filter(t => t.surface_class === "insight"); // kept for future use
 
   res.json({
     user:             profile?.name,
@@ -4255,12 +4257,12 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     plan:             profile?.plan || "free",
     engine_ran_sync:  engineRanSync,
     tasks: {
-      tasks:     actionableTasks, // actionable only — insights excluded from main feed
+      tasks:     actionableTasks,
       today:     actionableTasks.filter(t => !t.record_type || t.record_type !== "alert").filter(t => t.due_date <= today),
       this_week: actionableTasks.filter(t => !t.record_type || t.record_type !== "alert").filter(t => t.due_date > today && t.due_date <= weekEnd),
       coming_up: actionableTasks.filter(t => !t.record_type || t.record_type !== "alert").filter(t => t.due_date > weekEnd),
       alerts:    actionableTasks.filter(t => t.record_type === "alert"),
-      insights:  insightTasks, // separate bucket — frontend can show these differently
+      insights:  insightTasks, // preserved bucket — frontend can surface separately in future
     },
     crop_count:       crops.length,
     crops_with_flags: crops.filter(c => c.missed_task_note).map(c => ({ id: c.id, name: c.name, missed_task_note: c.missed_task_note })),
