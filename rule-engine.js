@@ -1606,14 +1606,13 @@ class RuleEngine {
     }
 
     // ── Run-level logging — always emit so suppression rates are visible ────────
-    const nTask      = surfaced.length;
-    const nInsight   = insights.length;
+    const nTask       = surfaced.length;
     const nSuppressed = suppressed.length;
-    const nFallback  = (finalCandidates.length === 1 && finalCandidates[0]._score < 30) ? 1 : 0;
+    const nFallback   = (finalCandidates.length === 1 && finalCandidates[0]._score < 30) ? 1 : 0;
     console.log(
       `[RuleEngine] user=${userId} ` +
       `total=${scoredCandidates.length} ` +
-      `task=${nTask} insight=${nInsight} suppressed=${nSuppressed} fallback=${nFallback}`
+      `task=${nTask} suppressed=${nSuppressed} fallback=${nFallback}`
     );
 
     // Decision logging — strictly best-effort, never blocks task generation
