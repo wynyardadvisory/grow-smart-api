@@ -301,14 +301,21 @@ function matchFeed(cropFeedType, userFeeds) {
   const scored = userFeeds.map(feed => {
     let score = 0;
     const ft = (feed.feed_type || "").toLowerCase();
-    if (ft.includes("high_potash")       && keywords.includes("potash"))    score += 10;
-    if (ft.includes("high_nitrogen")     && keywords.includes("nitrogen"))  score += 10;
-    if (ft.includes("balanced")          && keywords.includes("balanced"))  score += 10;
-    if (ft.includes("specialist_tomato") && keywords.includes("potash"))    score += 15;
-    if (ft.includes("seaweed"))                                              score += 2;
-    if (ft.includes("organic_general"))                                      score += 3;
-    if (keywords.includes("potash")  && ft.includes("potash"))              score += 5;
-    if (keywords.includes("general") && ft.includes("balanced"))            score += 5;
+    if (ft.includes("high_potash")           && keywords.includes("potash"))                   score += 10;
+    if (ft.includes("high_nitrogen")          && (keywords.includes("nitrogen") || keywords.includes("nitrogen-rich"))) score += 10;
+    if (ft.includes("balanced")               && (keywords.includes("balanced") || keywords.includes("general")))      score += 10;
+    if (ft.includes("specialist_tomato")      && keywords.includes("potash"))                   score += 15;
+    if (ft.includes("specialist_ericaceous")  && keywords.includes("ericaceous"))               score += 15;
+    if (ft.includes("ericaceous")             && keywords.includes("ericaceous"))               score += 10;
+    if (ft.includes("organic_general")        && keywords.includes("nitrogen"))                 score += 8;
+    if (ft.includes("seaweed"))                                                                  score += 2;
+    if (ft.includes("organic_general"))                                                          score += 3;
+    if (keywords.includes("potash")           && ft.includes("potash"))                         score += 5;
+    if (keywords.includes("general")          && ft.includes("balanced"))                       score += 5;
+    if (keywords.includes("fruit")            && ft.includes("high_potash"))                    score += 8;
+    if (keywords.includes("fruit")            && ft.includes("specialist_tomato"))              score += 8;
+    if (keywords.includes("fruit")            && ft.includes("balanced"))                       score += 5;
+    if (keywords.includes("nitrogen")         && ft.includes("high_nitrogen"))                  score += 8;
     return { feed, score };
   }).filter(s => s.score > 0).sort((a, b) => b.score - a.score);
   return scored[0]?.feed || null;
@@ -1947,7 +1954,7 @@ class RuleEngine {
     const { data } = await this.supabase
       .from("user_feeds")
       .select("id, brand, product_name, form, feed_type, npk, dilution_ml_per_litre, frequency_days, suitable_crop_types, application_method, notes, enriched")
-      .eq("user_id", userId).eq("active", true).eq("enriched", true);
+      .eq("user_id", userId).eq("active", true).eq("deleted", false).eq("enriched", true);
     return data || [];
   }
 
