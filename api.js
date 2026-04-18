@@ -1901,7 +1901,7 @@ app.post("/tasks/:id/complete", requireAuth, async (req, res) => {
   const today       = completedAt.split("T")[0];
 
   const { data, error } = await req.db.from("tasks")
-    .update({ completed_at: completedAt })
+    .update({ completed_at: completedAt, status: "completed" })
     .eq("id", req.params.id).eq("user_id", req.user.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
 
@@ -1981,7 +1981,7 @@ app.post("/tasks/:id/complete", requireAuth, async (req, res) => {
 
 app.post("/tasks/:id/uncomplete", requireAuth, async (req, res) => {
   const { data, error } = await req.db.from("tasks")
-    .update({ completed_at: null })
+    .update({ completed_at: null, status: "due" })
     .eq("id", req.params.id).eq("user_id", req.user.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
 
