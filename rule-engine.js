@@ -472,13 +472,16 @@ function scoreCandidate(ctx, candidate) {
   // sow_prompt and transplant_prompt are calendar-gated — if generated they're valid
   // and must surface as tasks regardless of confidence score.
   const bypassRules = [
-    "pest_slugs_snails",   // dynamic pest risk — already gated by weather/season
-    "pest_flea_beetle",    // dynamic pest risk
-    "frost_alert",         // real-time weather alert — always urgent
-    "watering_due",        // area-level, already gated by rain/dry logic
-    "struggling_flag",     // user has flagged a problem — must surface
-    "sow_prompt",          // calendar-gated sowing window — always actionable
-    "transplant_prompt",   // calendar-gated transplant window — always actionable
+    "pest_slugs_snails",      // dynamic pest risk — already gated by weather/season
+    "pest_flea_beetle",       // dynamic pest risk
+    "frost_alert",            // real-time weather alert — always urgent
+    "watering_due",           // area-level, already gated by rain/dry logic
+    "struggling_flag",        // user has flagged a problem — must surface
+    "sow_prompt",             // calendar-gated sowing window — always actionable
+    "transplant_prompt",      // calendar-gated transplant window — always actionable
+    "perennial_spring_feed",  // calendar-gated March/April — always actionable in season
+    "perennial_summer_feed",  // calendar-gated June/July — always actionable in season
+    "feed_scheduled",         // interval-based — only fires when genuinely due
   ];
   if (bypassRules.includes(candidate.rule_id)) score = Math.max(score, 55);
 
