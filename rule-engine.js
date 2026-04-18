@@ -1718,7 +1718,7 @@ class RuleEngine {
     try {
       const { data: activeCrops, error } = await this.supabase
         .from("crop_instances").select("id")
-        .eq("user_id", userId).eq("active", true);
+        .eq("user_id", userId).eq("active", true).eq("deleted", false);
       if (error || !activeCrops) return;
 
       const activeIds = activeCrops.map(c => c.id);
@@ -1794,7 +1794,7 @@ class RuleEngine {
       .from("crop_instances")
       .select("id, succession_group_id, succession_index, sown_date, status")
       .in("succession_group_id", groupIds)
-      .eq("active", true)
+      .eq("active", true).eq("deleted", false)
       .order("succession_index", { ascending: false });
 
     const sowingsByGroup = {};
@@ -1889,7 +1889,7 @@ class RuleEngine {
         )
       `)
       .eq("user_id", userId)
-      .eq("active", true);
+      .eq("active", true).eq("deleted", false);
     if (error) throw error;
     return data || [];
   }
@@ -1944,7 +1944,7 @@ class RuleEngine {
     const { data } = await this.supabase
       .from("user_feeds")
       .select("id, brand, product_name, form, feed_type, npk, dilution_ml_per_litre, frequency_days, suitable_crop_types, application_method, notes, enriched")
-      .eq("user_id", userId).eq("active", true).eq("enriched", true);
+      .eq("user_id", userId).eq("active", true).eq("deleted", false).eq("enriched", true);
     return data || [];
   }
 

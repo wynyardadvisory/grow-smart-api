@@ -1353,7 +1353,7 @@ For soil temperature fields: use null for perennial crops where soil temp is not
 app.get("/crops", requireAuth, async (req, res) => {
   const { data, error } = await req.db.from("crop_instances")
     .select("*, area:area_id(name, type, location_id, location:location_id(name)), crop_def:crop_def_id(name, harvest_month_start, harvest_month_end, harvest_month_start, harvest_month_end, days_to_maturity_min, days_to_maturity_max, sow_method, is_perennial, default_establishment, pest_window_start, pest_window_end), variety:variety_id(name, days_to_maturity_min, days_to_maturity_max)")
-    .eq("user_id", req.user.id).eq("active", true)
+    .eq("user_id", req.user.id).eq("active", true).eq("deleted", false)
     .order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
@@ -1556,9 +1556,16 @@ app.delete("/crops/:id", requireAuth, async (req, res) => {
     .select("area_id, succession_group_id").eq("id", req.params.id).eq("user_id", req.user.id).single();
 
   const { error } = await req.db.from("crop_instances")
-    .update({ active: false, updated_at: new Date().toISOString() })
+    .update({ deleted: true, active: false, updated_at: new Date().toISOString() })
     .eq("id", req.params.id).eq("user_id", req.user.id);
   if (error) return res.status(500).json({ error: error.message });
+
+  // Delete any open tasks for this crop so they don't surface on Today/feed
+  await supabaseService.from("tasks")
+    .delete()
+    .eq("crop_instance_id", req.params.id)
+    .eq("user_id", req.user.id)
+    .is("completed_at", null);
 
   // Auto-delete empty succession group if this was the last active sowing
   if (crop?.succession_group_id) {
@@ -2418,7 +2425,8 @@ app.post("/areas/:id/suggestions/generate", requireAuth, async (req, res) => {
   const { data: history } = await db.from("crop_instances")
     .select("name, variety")
     .eq("area_id", req.params.id)
-    .eq("active", false)
+    .eq("status", "harvested")
+    .eq("deleted", false)
     .order("created_at", { ascending: false })
     .limit(6);
 
