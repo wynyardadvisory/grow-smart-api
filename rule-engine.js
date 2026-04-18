@@ -297,27 +297,50 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = []) 
 
 function matchFeed(cropFeedType, userFeeds) {
   if (!cropFeedType || !userFeeds?.length) return null;
-  const keywords = cropFeedType.toLowerCase();
+
+  // Suppress crops that explicitly need no feed
+  const k = cropFeedType.toLowerCase();
+  if (k.startsWith("none")) return null;
+
   const scored = userFeeds.map(feed => {
     let score = 0;
     const ft = (feed.feed_type || "").toLowerCase();
-    if (ft.includes("high_potash")           && keywords.includes("potash"))                   score += 10;
-    if (ft.includes("high_nitrogen")          && (keywords.includes("nitrogen") || keywords.includes("nitrogen-rich"))) score += 10;
-    if (ft.includes("balanced")               && (keywords.includes("balanced") || keywords.includes("general")))      score += 10;
-    if (ft.includes("specialist_tomato")      && keywords.includes("potash"))                   score += 15;
-    if (ft.includes("specialist_ericaceous")  && keywords.includes("ericaceous"))               score += 15;
-    if (ft.includes("ericaceous")             && keywords.includes("ericaceous"))               score += 10;
-    if (ft.includes("organic_general")        && keywords.includes("nitrogen"))                 score += 8;
-    if (ft.includes("seaweed"))                                                                  score += 2;
-    if (ft.includes("organic_general"))                                                          score += 3;
-    if (keywords.includes("potash")           && ft.includes("potash"))                         score += 5;
-    if (keywords.includes("general")          && ft.includes("balanced"))                       score += 5;
-    if (keywords.includes("fruit")            && ft.includes("high_potash"))                    score += 8;
-    if (keywords.includes("fruit")            && ft.includes("specialist_tomato"))              score += 8;
-    if (keywords.includes("fruit")            && ft.includes("balanced"))                       score += 5;
-    if (keywords.includes("nitrogen")         && ft.includes("high_nitrogen"))                  score += 8;
+
+    // ── Exact / specialist matches (highest priority) ──────────────────────
+    if (ft.includes("specialist_ericaceous") && k.includes("ericaceous"))         score += 20;
+    if (ft.includes("ericaceous")            && k.includes("ericaceous"))         score += 15;
+    if (ft.includes("specialist_tomato")     && k.includes("potash"))             score += 18;
+    if (ft.includes("specialist_tomato")     && k.includes("tomato"))             score += 20;
+    if (ft.includes("specialist_rose")       && k.includes("rose"))               score += 20;
+    if (ft.includes("specialist_citrus")     && k.includes("citrus"))             score += 20;
+    if (ft.includes("citrus")               && k.includes("citrus"))              score += 15;
+
+    // ── Potash matching ────────────────────────────────────────────────────
+    if (ft.includes("high_potash") && k.includes("potash"))                       score += 15;
+    if (ft.includes("high_potash") && k.includes("fruit"))                        score += 10;
+    if (ft.includes("specialist_tomato") && k.includes("fruit"))                  score += 8;
+
+    // ── Nitrogen matching ──────────────────────────────────────────────────
+    if (ft.includes("high_nitrogen") && (k.includes("nitrogen") || k.includes("nitrogen-rich"))) score += 15;
+    if (ft.includes("organic_general") && k.includes("nitrogen"))                 score += 8;
+
+    // ── Low nitrogen ───────────────────────────────────────────────────────
+    if (ft.includes("low_nitrogen") && k.includes("low nitrogen"))                score += 20;
+    if (ft.includes("balanced")     && k.includes("low nitrogen"))                score += 8;
+
+    // ── Balanced / general matching ────────────────────────────────────────
+    if (ft.includes("balanced") && (k.includes("balanced") || k.includes("general") || k.includes("general purpose"))) score += 10;
+    if (ft.includes("organic_general") && (k.includes("balanced") || k.includes("general"))) score += 7;
+
+    // ── Fruit tree / fruit specific ────────────────────────────────────────
+    if (ft.includes("balanced") && k.includes("fruit"))                           score += 6;
+
+    // ── Seaweed — broad spectrum, low priority ─────────────────────────────
+    if (ft.includes("seaweed"))                                                    score += 2;
+
     return { feed, score };
   }).filter(s => s.score > 0).sort((a, b) => b.score - a.score);
+
   return scored[0]?.feed || null;
 }
 
