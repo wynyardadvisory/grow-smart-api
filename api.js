@@ -4030,6 +4030,24 @@ app.get("/weather", requireAuth, async (req, res) => {
       expires_at:             new Date(Date.now() + 3600000).toISOString(),
     };
     await supabaseService.from("weather_cache").upsert(weather);
+
+    // Write to weather_history for 7-day lookback (non-fatal)
+    try {
+      await supabaseService.from("weather_history").insert({
+        postcode,
+        temp_c:      weather.temp_c,
+        rain_mm:     weather.rain_mm,
+        recorded_at: new Date().toISOString(),
+      });
+      // Prune rows older than 30 days for this postcode
+      await supabaseService.from("weather_history")
+        .delete()
+        .eq("postcode", postcode)
+        .lt("recorded_at", new Date(Date.now() - 30 * 86400000).toISOString());
+    } catch (histErr) {
+      console.error("[WeatherHistory] Insert failed:", histErr.message);
+    }
+
     const { data: _raw, ...clean } = weather;
     res.json(clean);
   } catch (err) {
@@ -4227,6 +4245,23 @@ app.get("/dashboard", requireAuth, async (req, res) => {
             expires_at:            new Date(Date.now() + 3600000).toISOString(),
           };
           await supabaseService.from("weather_cache").upsert(weather);
+
+          // Write to weather_history for 7-day lookback (non-fatal)
+          try {
+            await supabaseService.from("weather_history").insert({
+              postcode,
+              temp_c:      weather.temp_c,
+              rain_mm:     weather.rain_mm,
+              recorded_at: new Date().toISOString(),
+            });
+            // Prune rows older than 30 days for this postcode
+            await supabaseService.from("weather_history")
+              .delete()
+              .eq("postcode", postcode)
+              .lt("recorded_at", new Date(Date.now() - 30 * 86400000).toISOString());
+          } catch (histErr) {
+            console.error("[WeatherHistory] Insert failed:", histErr.message);
+          }
         }
       }
     }
