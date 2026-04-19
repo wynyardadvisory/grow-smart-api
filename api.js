@@ -2099,11 +2099,17 @@ If the product is not a real plant feed, return: { "valid": false }`;
   }
 }
 
-// GET /feed-catalog — return the full product catalog for dropdowns
+// GET /feed-catalog — return the product catalog filtered by user's country
 app.get("/feed-catalog", requireAuth, async (req, res) => {
+  // Get user's country to filter feed catalog to relevant products
+  const { data: profile } = await req.db.from("profiles")
+    .select("country").eq("id", req.user.id).single();
+  const country = profile?.country || "GB";
+
   const { data, error } = await req.db.from("feed_catalog")
     .select("brand, product_name, form, feed_type, npk, dilution_ml_per_litre, frequency_days, suitable_crop_types, application_method, notes")
     .eq("active", true)
+    .contains("countries", [country])
     .order("brand").order("product_name");
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
