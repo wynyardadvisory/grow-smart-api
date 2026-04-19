@@ -1595,6 +1595,9 @@ class RuleEngine {
     const phAdvisories = this._phAdvisories(userId, crops);
     allCandidates.push(...phAdvisories);
 
+    const soilTempAdvisories = this._soilTempAdvisories(userId, crops);
+    allCandidates.push(...soilTempAdvisories);
+
     // ── Confidence scoring + surface_class assignment ───────────────────────
     // Score every candidate. Assign surface_class based on score.
     // Suppress candidates below threshold, with new-user fallback.
@@ -1992,6 +1995,92 @@ class RuleEngine {
     }
 
     if (tasks.length) console.log(`[PhAdvisory] ${tasks.length} stale pH advisory(s) for user=${userId}`);
+    return tasks;
+  }
+
+  // ── Soil temperature stale advisory generator ────────────────────────────
+  // Fires one advisory per area where:
+  //   - soil_temperature_c was previously logged (field is not null)
+  //   - the reading is older than SOIL_TEMP_VALIDITY_DAYS (14)
+  //   - current month is in a season where soil temp actually matters:
+  //     Feb–May (sowing/transplanting) or Sep–Oct (late season, frost-sensitive)
+  //   - area has at least one crop that is frost-sensitive OR in an early stage
+  //     (seed/seedling/vegetative) where soil temp is most relevant
+  // Suppressed Jun–Aug when soil is reliably warm and temp is rarely a concern.
+  // Urgency: medium if frost-sensitive crops present; low otherwise.
+
+  _soilTempAdvisories(userId, crops) {
+    const SOIL_TEMP_VALIDITY_DAYS = 14;
+    const today = todayISO();
+    const m     = currentMonth();
+
+    // Only fire in months where soil temp materially affects decisions
+    const tempMattersMonths = [2, 3, 4, 5, 9, 10];
+    if (!tempMattersMonths.includes(m)) return [];
+
+    const seen  = new Set();
+    const tasks = [];
+
+    // Group crops by area for frost-sensitive and stage checks
+    const cropsByArea = new Map();
+    for (const crop of crops) {
+      if (!crop.area_id) continue;
+      if (!cropsByArea.has(crop.area_id)) cropsByArea.set(crop.area_id, []);
+      cropsByArea.get(crop.area_id).push(crop);
+    }
+
+    for (const crop of crops) {
+      const area = crop.area;
+      if (!area) continue;
+      const areaId = crop.area_id;
+      if (seen.has(areaId)) continue;
+
+      // Only fire if user has ever logged soil temp for this area
+      const soilTemp       = area.soil_temperature_c           ?? null;
+      const tempLoggedAt   = area.soil_temperature_logged_at   ?? null;
+      if (soilTemp === null || !tempLoggedAt) continue;
+
+      // Check reading is stale
+      const ageDays = daysSince(tempLoggedAt);
+      if (ageDays === null || ageDays <= SOIL_TEMP_VALIDITY_DAYS) continue;
+
+      // Check area has at least one frost-sensitive crop or an early-stage crop
+      const areaCrops      = cropsByArea.get(areaId) || [];
+      const hasFrostRisk   = areaCrops.some(c => c.crop_def?.frost_sensitive === true);
+      const hasEarlyStage  = areaCrops.some(c => ['seed', 'seedling', 'vegetative'].includes(c.stage));
+      if (!hasFrostRisk && !hasEarlyStage) continue;
+
+      seen.add(areaId);
+
+      const areaName = area.name || 'your area';
+      const urgency  = hasFrostRisk ? 'medium' : 'low';
+      const keyDate  = windowAnchor(today, 7); // snap to week
+
+      tasks.push({
+        user_id:          userId,
+        crop_instance_id: null,
+        area_id:          areaId,
+        action:           `Update soil temperature for ${areaName} — your last reading (${soilTemp}°C) was ${ageDays} days ago`,
+        task_type:        'check',
+        urgency,
+        due_date:         today,
+        scheduled_for:    today,
+        visible_from:     today,
+        expires_at:       new Date(addDays(today, 3) + 'T23:59:59Z').toISOString(),
+        status:           'due',
+        engine_type:      'scheduled',
+        record_type:      'task',
+        source:           'rule_engine',
+        rule_id:          'soil_temp_stale',
+        source_key:       sourceKey({ u: userId, a: areaId, r: 'soil_temp_stale', d: keyDate }),
+        date_confidence:  'approximate',
+        meta:             JSON.stringify({ last_temp_c: soilTemp, age_days: ageDays, has_frost_risk: hasFrostRisk }),
+        risk_payload:     null,
+        _score:           55,
+      });
+    }
+
+    if (tasks.length) console.log(`[SoilTempAdvisory] ${tasks.length} stale soil temp advisory(s) for user=${userId}`);
     return tasks;
   }
 
