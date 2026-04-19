@@ -439,25 +439,8 @@ async function sendNotification(supabase, userId, candidate, preloadedTokens) {
     console.warn(`[Push] ${nativeTokens.length} native token(s) for ${userId} have no OneSignal subscription ID — skipping`);
   }
 
-  // ── Web send via OneSignal ───────────────────────────────────────────────
-  // Web tokens store the OneSignal subscription ID in onesignal_subscription_id
-  // after migration. Fall back to VAPID for any tokens not yet migrated.
-  const webOsIds = webTokens.map(t => t.onesignal_subscription_id).filter(Boolean);
-  const webVapidTokens = webTokens.filter(t => !t.onesignal_subscription_id);
-
-  if (webOsIds.length) {
-    try {
-      const osResult = await sendViaOneSignal(webOsIds, candidate);
-      const osSent = osResult.recipients || 0;
-      sentCount += osSent;
-      console.log(`[Push] OneSignal web sent to ${userId}: ${candidate.notification_type} — "${candidate.title}" — recipients=${osSent}`);
-    } catch (err) {
-      console.error(`[Push] OneSignal web send failed for ${userId}:`, err.message);
-    }
-  }
-
-  // VAPID fallback for tokens not yet migrated to OneSignal
-  for (const token of webVapidTokens) {
+  // ── Web send via VAPID ────────────────────────────────────────────────────
+  for (const token of webTokens) {
     try {
       const subscription = JSON.parse(token.push_token);
       const payload = JSON.stringify({
@@ -471,7 +454,7 @@ async function sendNotification(supabase, userId, candidate, preloadedTokens) {
       });
       await webpush.sendNotification(subscription, payload);
       sentCount++;
-      console.log(`[Push] VAPID web sent to ${userId}: ${candidate.notification_type} — "${candidate.title}"`);
+      console.log(`[Push] Web sent to ${userId}: ${candidate.notification_type} — "${candidate.title}"`);
     } catch (err) {
       console.error(`[Push] VAPID web send failed for ${userId}:`, err.statusCode, err.body);
       if (err.statusCode === 410 || err.statusCode === 404) {
