@@ -1486,8 +1486,19 @@ class RuleEngine {
       }
       if (moistureActive && soilMoisture === "wet") continue; // soil wet — skip watering
 
-      // Suppress if it rained more than 5mm today — but not for indoors areas (rain irrelevant)
+      // Pull rain signals for this area's location
+      const areaLocId          = areaCrops[0]?.area?.location_id || areaCrops[0]?.location_id || null;
+      const rainMm7dayActual   = areaLocId ? (rainHistoryByLocation?.[areaLocId] ?? null) : null;
+      const rainForecast5day   = weather?.rain_mm_forecast_5day ?? null;
+      const isOutdoor          = areaType !== "indoors" && areaType !== "greenhouse";
+
+      // Suppress if it rained more than 5mm today (existing gate)
       if (areaType !== "indoors" && rainMm !== null && rainMm >= 5) continue;
+
+      // Suppress if it's been a genuinely wet week for outdoor areas — ground is already moist.
+      // Greenhouse and indoors unaffected — rain doesn't reach them.
+      // Guard: only apply if rainMm7dayActual is populated (first 7 days after deploy it will be null)
+      if (isOutdoor && rainMm7dayActual !== null && rainMm7dayActual > 20) continue;
 
       // Dry day thresholds per area type
       const BASE_THRESHOLD = areaType === "greenhouse" || areaType === "indoors" ? 1
@@ -1542,10 +1553,24 @@ class RuleEngine {
       const atRiskText = atRiskCrops.length > 0 ? " — pay particular attention to: " + atRiskCrops.join(", ") : "";
 
       const daysText = daysSinceWatered !== null ? " (" + daysSinceWatered + " days since last watered)" : "";
-      // Dry soil reading → always high urgency; otherwise escalate at threshold+2
+
+      // Urgency calculation — four signals in priority order:
+      // 1. Dry soil reading logged recently → always high
+      // 2. Rain forecast in next 5 days (>15mm) → downgrade to low (relief coming)
+      // 3. No rain forecast and overdue by threshold+2 → high (no relief coming)
+      // 4. Default escalation at threshold+2 → high
+      const rainComingSoon = isOutdoor && rainForecast5day !== null && rainForecast5day > 15;
+      const noDryRelief    = isOutdoor && (rainForecast5day === null || rainForecast5day < 2);
+
       const urgency = (moistureActive && soilMoisture === "dry")
         ? "high"
-        : daysSinceWatered !== null && daysSinceWatered >= DRY_DAY_THRESHOLD + 2 ? "high" : "medium";
+        : rainComingSoon
+          ? "low"
+          : (noDryRelief && daysSinceWatered !== null && daysSinceWatered >= DRY_DAY_THRESHOLD)
+            ? "high"
+            : daysSinceWatered !== null && daysSinceWatered >= DRY_DAY_THRESHOLD + 2
+              ? "high"
+              : "medium";
 
       // Use first crop in area for context (area_id, user_id)
       const refCrop = areaCrops[0];
