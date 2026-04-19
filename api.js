@@ -5857,7 +5857,8 @@ app.post("/activity/log", requireAuth, async (req, res) => {
         .select("id, crop_def_id")
         .in("area_id", ownedIds)
         .eq("user_id", userId)
-        .eq("active", true);
+        .eq("active", true)
+        .eq("deleted", false);
       if (crops?.length) {
         await supabaseService.from("crop_instances")
           .update({ last_fed_at: now, updated_at: now })
@@ -5895,7 +5896,8 @@ app.post("/activity/log", requireAuth, async (req, res) => {
         .select("id")
         .eq("location_id", scopeIds[0])
         .eq("user_id", userId)
-        .eq("active", true);
+        .eq("active", true)
+        .eq("deleted", false);
       if (crops?.length) {
         await supabaseService.from("crop_instances")
           .update({ last_fed_at: now, updated_at: now })
