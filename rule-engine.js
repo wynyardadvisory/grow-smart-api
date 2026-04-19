@@ -133,7 +133,7 @@ function windowAnchor(dateStr, expiryDays) {
 
 // ── Crop Context Builder ──────────────────────────────────────────────────────
 
-function buildCropContext(crop, weather, envMods, userFeeds, observations = []) {
+function buildCropContext(crop, weather, envMods, userFeeds, observations = [], rainMm7dayActual = null) {
   const def = crop.crop_def || {};
   const variety = crop.variety || {};
 
@@ -227,10 +227,13 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = []) 
   const isProtected = envMods?.frost_protection?.protected || false;
 
   // Weather summary
-  const frostRisk     = weather?.frost_risk === true;
-  const frostRisk7day = weather?.frost_risk_7day ?? null;
-  const tempC         = weather?.temp_c ?? null;
-  const rainMm        = weather?.rain_mm ?? null;
+  const frostRisk           = weather?.frost_risk === true;
+  const frostRisk7day       = weather?.frost_risk_7day ?? null;
+  const tempC               = weather?.temp_c ?? null;
+  const rainMm              = weather?.rain_mm ?? null;              // next 24h forecast (mm)
+  const rainMmForecast5day  = weather?.rain_mm_forecast_5day ?? null; // next 5 days forecast (mm)
+  // rainMm7dayActual — passed in from _loadRainHistory (sum of hourly cache writes over 7 days)
+  // null until weather_history has accumulated data (first 7 days after deploy)
 
   // Soil pH — valid for 365 days. Only active if user has ever logged a reading.
   // null field = never logged = no effect on scoring (falls back to normal logic).
@@ -289,6 +292,8 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = []) 
 
     // Weather
     frostRisk, frostRisk7day, tempC, rainMm, lastWateredAt,
+    rainMmForecast5day,   // next 5 days forecast total (mm) — null if cache miss
+    rainMm7dayActual,     // last 7 days actual total (mm) — null until history accumulates
     areaType,
 
     // Feed
@@ -1370,10 +1375,11 @@ class RuleEngine {
       await this._expireStaleItems(userId);
     }
 
-    const [crops, rules, weatherByLocation, envModifiers, userFeeds, pestRules, recentObservations] = await Promise.all([
+    const [crops, rules, weatherByLocation, rainHistoryByLocation, envModifiers, userFeeds, pestRules, recentObservations] = await Promise.all([
       this._loadCrops(userId),
       this._loadRules(),
       this._loadWeatherByLocation(userId),
+      this._loadRainHistory(userId),
       this._loadEnvModifiers(),
       this._loadUserFeeds(userId),
       this._loadPestRules(),
@@ -1394,7 +1400,8 @@ class RuleEngine {
 
       // Build normalised context once per crop
       const cropObs = recentObservations.filter(o => o.crop_id === crop.id);
-      const ctx = buildCropContext(crop, weather, envMods, userFeeds, cropObs);
+      const rainMm7dayActual = rainHistoryByLocation[locId] ?? null;
+      const ctx = buildCropContext(crop, weather, envMods, userFeeds, cropObs, rainMm7dayActual);
       ctxMap.set(crop.id, ctx);
 
       // Scheduled engine — future tasks
@@ -2233,11 +2240,34 @@ class RuleEngine {
       if (!loc.postcode) continue;
       const { data: cached } = await this.supabase
         .from("weather_cache")
-        .select("temp_c, frost_risk, frost_risk_7day, rain_mm, condition")
+        .select("temp_c, frost_risk, frost_risk_7day, rain_mm, rain_mm_forecast_5day, condition")
         .eq("postcode", loc.postcode)
         .gt("expires_at", new Date().toISOString())
         .single();
       if (cached) result[loc.id] = cached;
+    }
+    return result;
+  }
+
+  // Returns total rainfall (mm) over the last 7 days per location_id.
+  // Queries weather_history which accumulates one row per cache refresh.
+  // Returns {} if table is empty or not yet populated.
+  async _loadRainHistory(userId) {
+    if (!this.supabase) return {};
+    const { data: locations } = await this.supabase
+      .from("locations").select("id, postcode").eq("user_id", userId);
+    const result = {};
+    const cutoff = new Date(Date.now() - 7 * 86400000).toISOString();
+    for (const loc of locations || []) {
+      if (!loc.postcode) continue;
+      const { data: rows } = await this.supabase
+        .from("weather_history")
+        .select("rain_mm")
+        .eq("postcode", loc.postcode)
+        .gte("recorded_at", cutoff);
+      if (rows?.length) {
+        result[loc.id] = rows.reduce((sum, r) => sum + (r.rain_mm || 0), 0);
+      }
     }
     return result;
   }
