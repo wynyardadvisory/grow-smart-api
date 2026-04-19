@@ -290,6 +290,9 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = [], 
     stage: inferredStage, stageBoundaries,
     daysSown, pctGrown,
 
+    // Activity timestamps from area
+    lastPrunedOrMulchedAt: crop.area?.last_pruned_or_mulched_at || null,
+
     // Weather
     frostRisk, frostRisk7day, tempC, rainMm, lastWateredAt,
     rainMmForecast5day,   // next 5 days forecast total (mm) — null if cache miss
@@ -778,9 +781,14 @@ class ScheduledRuleEngine {
     const results = [];
     const name = ctx.cropName.toLowerCase();
 
+    // Suppression — if user logged pruned/mulched recently, skip tasks whose
+    // expiryDays window would not yet have elapsed.
+    // last_pruned_or_mulched_at sits on the area; close enough for perennial care.
+    const daysSincePrune = ctx.lastPrunedOrMulchedAt ? daysSince(ctx.lastPrunedOrMulchedAt) : null;
+
     // Strawberry runners — July/August
     if (name.includes("strawberry") && m >= 7 && m <= 8) {
-      results.push(candidate(ctx, {
+      if (daysSincePrune === null || daysSincePrune >= 21) results.push(candidate(ctx, {
         ruleId:       "strawberry_runners",
         dedupeByName: true,
         taskType:     "prune",
@@ -794,7 +802,7 @@ class ScheduledRuleEngine {
 
     // Strawberry renovation — August after harvest
     if (name.includes("strawberry") && m === 8) {
-      results.push(candidate(ctx, {
+      if (daysSincePrune === null || daysSincePrune >= 21) results.push(candidate(ctx, {
         ruleId:       "strawberry_renovate",
         dedupeByName: true,
         taskType:     "prune",
@@ -808,7 +816,7 @@ class ScheduledRuleEngine {
 
     // Raspberry cane management — August/September (summer fruiting)
     if (name.includes("raspberry") && m >= 8 && m <= 9) {
-      results.push(candidate(ctx, {
+      if (daysSincePrune === null || daysSincePrune >= 28) results.push(candidate(ctx, {
         ruleId:       "raspberry_cane_prune",
         dedupeByName: true,
         taskType:     "prune",
@@ -822,7 +830,7 @@ class ScheduledRuleEngine {
 
     // Apple/pear summer prune — July/August for trained forms
     if ((name.includes("apple") || name.includes("pear")) && m >= 7 && m <= 8) {
-      results.push(candidate(ctx, {
+      if (daysSincePrune === null || daysSincePrune >= 28) results.push(candidate(ctx, {
         ruleId:       "apple_pear_summer_prune",
         dedupeByName: true,
         taskType:     "prune",
@@ -837,7 +845,7 @@ class ScheduledRuleEngine {
     // Apple/pear winter prune — December/January
     if ((name.includes("apple") || name.includes("pear")) && (m === 12 || m === 1)) {
       const pruneDate = m === 12 ? monthToDate(12, year, 15) : today;
-      results.push(candidate(ctx, {
+      if (daysSincePrune === null || daysSincePrune >= 42) results.push(candidate(ctx, {
         ruleId:       "apple_pear_winter_prune",
         dedupeByName: true,
         taskType:     "prune",
@@ -851,7 +859,7 @@ class ScheduledRuleEngine {
 
     // Blueberry/currant winter prune — January/February
     if ((name.includes("blueberry") || name.includes("currant") || name.includes("gooseberry")) && (m === 1 || m === 2)) {
-      results.push(candidate(ctx, {
+      if (daysSincePrune === null || daysSincePrune >= 42) results.push(candidate(ctx, {
         ruleId:       "berry_winter_prune",
         dedupeByName: true,
         taskType:     "prune",
@@ -866,7 +874,7 @@ class ScheduledRuleEngine {
     // Mulching — March for most perennials
     const mulchCrops = ["strawberry","raspberry","blueberry","blackcurrant","redcurrant","gooseberry","apple","pear","blackberry"];
     if (mulchCrops.some(k => name.includes(k)) && m >= 3 && m <= 4) {
-      results.push(candidate(ctx, {
+      if (daysSincePrune === null || daysSincePrune >= 28) results.push(candidate(ctx, {
         ruleId:       "perennial_mulch",
         dedupeByName: true,
         taskType:     "mulch",
@@ -2298,7 +2306,8 @@ class RuleEngine {
       .from("crop_instances")
       .select(`
         *,
-        area:area_id ( type, location_id, name, last_watered_at, soil_moisture, soil_moisture_logged_at,
+        area:area_id ( type, location_id, name, last_watered_at, last_pruned_or_mulched_at,
+          soil_moisture, soil_moisture_logged_at,
           soil_ph, soil_ph_logged_at, soil_temperature_c, soil_temperature_logged_at,
           location:location_id ( last_watered_at )
         ),
