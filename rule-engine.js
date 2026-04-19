@@ -1605,6 +1605,10 @@ class RuleEngine {
     const soilTempAdvisories = this._soilTempAdvisories(userId, crops);
     allCandidates.push(...soilTempAdvisories);
 
+    // ── Weeding maintenance rhythm ────────────────────────────────────────────
+    const weedingTasks = this._weedingAdvisories(userId, crops, rainHistoryByLocation, weatherByLocation);
+    allCandidates.push(...weedingTasks);
+
     // ── Confidence scoring + surface_class assignment ───────────────────────
     // Score every candidate. Assign surface_class based on score.
     // Suppress candidates below threshold, with new-user fallback.
@@ -1847,6 +1851,90 @@ class RuleEngine {
     } catch (err) {
       console.error("[RuleEngine] Cleanup error:", err.message);
     }
+  }
+
+  // ── Weeding maintenance rhythm ───────────────────────────────────────────
+  // One area-level weeding check task per area on a rolling cadence.
+  // Cadence:
+  //   greenhouse / container / pot / indoors : 10 days year-round
+  //   raised bed / open ground               : 14 days in season (Mar–Oct)
+  //                                            21 days off season (Nov–Feb)
+  // Suppressed if last_weeded_at is within the cadence window.
+  // Urgency: medium if wet week (actual >15mm or forecast >20mm); low otherwise.
+
+  _weedingAdvisories(userId, crops, rainHistoryByLocation, weatherByLocation) {
+    const today    = todayISO();
+    const m        = currentMonth();
+    const inSeason = m >= 3 && m <= 10;
+    const seen     = new Set();
+    const tasks    = [];
+
+    for (const crop of crops) {
+      const area = crop.area;
+      if (!area) continue;
+      const areaId = crop.area_id;
+      if (seen.has(areaId)) continue;
+
+      const areaType = area.type || null;
+      const areaName = area.name || 'your area';
+
+      const intensiveTypes = ['greenhouse', 'container', 'pot', 'indoors'];
+      const cadenceDays = intensiveTypes.includes(areaType)
+        ? 10
+        : inSeason ? 14 : 21;
+
+      // Suppress if weeded recently enough
+      const lastWeeded    = area.last_weeded_at || null;
+      const daysSinceWeed = lastWeeded ? daysSince(lastWeeded) : null;
+      if (daysSinceWeed !== null && daysSinceWeed < cadenceDays) continue;
+
+      seen.add(areaId);
+
+      // Weather signals for urgency
+      const locId            = crop.location_id || area.location_id;
+      const rainActual7day   = rainHistoryByLocation?.[locId] ?? null;
+      const weather          = weatherByLocation?.[locId]    ?? null;
+      const rainForecast5day = weather?.rain_mm_forecast_5day ?? null;
+      const wetRecent        = rainActual7day   !== null && rainActual7day   > 15;
+      const wetForecast      = rainForecast5day !== null && rainForecast5day > 20 && inSeason;
+      const urgency          = (wetRecent || wetForecast) ? 'medium' : 'low';
+
+      const lastWeededNote = daysSinceWeed !== null ? ` — last weeded ${daysSinceWeed} days ago` : '';
+      const wetNote        = wetRecent ? ' — recent rain will have encouraged weed growth' : '';
+      const keyDate        = windowAnchor(today, cadenceDays);
+
+      tasks.push({
+        user_id:          userId,
+        crop_instance_id: null,
+        area_id:          areaId,
+        action:           `Check for weeds in ${areaName}${lastWeededNote}${wetNote}`,
+        task_type:        'check',
+        urgency,
+        due_date:         today,
+        scheduled_for:    today,
+        visible_from:     today,
+        expires_at:       new Date(addDays(today, Math.floor(cadenceDays / 2)) + 'T23:59:59Z').toISOString(),
+        status:           'due',
+        engine_type:      'scheduled',
+        record_type:      'task',
+        source:           'rule_engine',
+        rule_id:          'weeding_due',
+        source_key:       sourceKey({ u: userId, a: areaId, r: 'weeding_due', d: keyDate }),
+        date_confidence:  'approximate',
+        meta:             JSON.stringify({
+          cadence_days:        cadenceDays,
+          days_since_weeded:   daysSinceWeed,
+          rain_actual_7day_mm: rainActual7day,
+          rain_forecast_5day:  rainForecast5day,
+          in_season:           inSeason,
+        }),
+        risk_payload:     null,
+        _score:           55,
+      });
+    }
+
+    if (tasks.length) console.log(`[Weeding] ${tasks.length} weeding advisory(s) for user=${userId}`);
+    return tasks;
   }
 
   // ── Soil moisture stale advisory generator ───────────────────────────────
