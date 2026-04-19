@@ -232,6 +232,24 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = []) 
   const tempC         = weather?.temp_c ?? null;
   const rainMm        = weather?.rain_mm ?? null;
 
+  // Soil pH — valid for 365 days. Only active if user has ever logged a reading.
+  // null field = never logged = no effect on scoring (falls back to normal logic).
+  const PH_VALIDITY_DAYS = 365;
+  const rawPh       = crop.area?.soil_ph           ?? null;
+  const phLoggedAt  = crop.area?.soil_ph_logged_at ?? null;
+  const phAgeDays   = phLoggedAt ? daysSince(phLoggedAt) : null;
+  const ph          = (rawPh !== null && phAgeDays !== null && phAgeDays <= PH_VALIDITY_DAYS) ? rawPh : null;
+  const phMin       = def.soil_ph_min ?? null;
+  const phMax       = def.soil_ph_max ?? null;
+
+  // Soil temperature — valid for 14 days. Only active if user has ever logged a reading.
+  const SOIL_TEMP_VALIDITY_DAYS = 14;
+  const rawSoilTemp      = crop.area?.soil_temperature_c           ?? null;
+  const soilTempLoggedAt = crop.area?.soil_temperature_logged_at   ?? null;
+  const soilTempAgeDays  = soilTempLoggedAt ? daysSince(soilTempLoggedAt) : null;
+  const soilTemp         = (rawSoilTemp !== null && soilTempAgeDays !== null && soilTempAgeDays <= SOIL_TEMP_VALIDITY_DAYS) ? rawSoilTemp : null;
+  const soilTempMin      = def.soil_temp_min_c ?? null;
+
   // Feed matching
   const matchedFeed = feedType ? matchFeed(feedType, userFeeds) : null;
 
@@ -275,6 +293,10 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = []) 
 
     // Feed
     matchedFeed,
+
+    // Soil state (freshness-gated — null if never logged or reading has expired)
+    ph, phMin, phMax,
+    soilTemp, soilTempMin,
 
     // Potato type
     potatoType: variety.potato_type || null,
@@ -1901,6 +1923,7 @@ class RuleEngine {
       .select(`
         *,
         area:area_id ( type, location_id, name, last_watered_at, soil_moisture, soil_moisture_logged_at,
+          soil_ph, soil_ph_logged_at, soil_temperature_c, soil_temperature_logged_at,
           location:location_id ( last_watered_at )
         ),
         crop_def:crop_def_id (
@@ -1910,7 +1933,8 @@ class RuleEngine {
           sow_window_start, sow_window_end,
           transplant_window_start, transplant_window_end,
           harvest_month_start, harvest_month_end, feed_type,
-          default_establishment
+          default_establishment,
+          soil_ph_min, soil_ph_max, soil_temp_min_c
         ),
         variety:variety_id (
           days_to_maturity_min, days_to_maturity_max,
