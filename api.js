@@ -3989,15 +3989,18 @@ app.get("/weather", requireAuth, async (req, res) => {
   const { location_id } = req.query;
   let postcode;
 
+  let weatherCountry = "GB";
   if (location_id) {
     const { data } = await req.db.from("locations")
-      .select("postcode").eq("id", location_id).single();
+      .select("postcode, country").eq("id", location_id).single();
     postcode = data?.postcode;
+    if (data?.country) weatherCountry = data.country;
   }
   if (!postcode) {
     const { data } = await req.db.from("profiles")
-      .select("postcode").eq("id", req.user.id).single();
+      .select("postcode, country").eq("id", req.user.id).single();
     postcode = data?.postcode;
+    if (data?.country) weatherCountry = data.country;
   }
   if (!postcode) return res.status(400).json({ error: "No postcode set" });
 
@@ -4012,7 +4015,7 @@ app.get("/weather", requireAuth, async (req, res) => {
   // Fetch fresh
   try {
     const apiKey = process.env.OPENWEATHER_API_KEY;
-    const r    = await fetch(`https://api.openweathermap.org/data/2.5/forecast?q=${postcode},GB&appid=${apiKey}&units=metric`);
+    const r    = await fetch(`https://api.openweathermap.org/data/2.5/forecast?q=${postcode},${weatherCountry}&appid=${apiKey}&units=metric`);
     const json = await r.json();
     if (!json.list) return res.status(502).json({ error: "Weather API error" });
 
@@ -4123,7 +4126,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     req.db.from("crop_instances")
       .select("id, name, variety, variety_id, sown_date, stage, timeline_offset_days, area_id, missed_task_note, succession_index, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, days_to_maturity_max, pest_window_start, pest_window_end, pest_notes, is_perennial)")
       .eq("user_id", req.user.id).eq("active", true),
-    req.db.from("profiles").select("name, plan, postcode, photo_url").eq("id", req.user.id).single(),
+    req.db.from("profiles").select("name, plan, postcode, country, photo_url").eq("id", req.user.id).single(),
     req.db.from("harvest_log")
       .select("id, harvested_at, quantity_g, crop:crop_instance_id(name)")
       .eq("user_id", req.user.id)
@@ -4206,7 +4209,8 @@ app.get("/dashboard", requireAuth, async (req, res) => {
   // ── Weather + frost risk (7-day) ──────────────────────────────────────────
   let weather = null;
   try {
-    const rawPostcode = profile?.postcode;
+    const rawPostcode      = profile?.postcode;
+    const dashboardCountry = profile?.country || "GB";
     if (rawPostcode) {
       // Always use outward code only (e.g. "TS22" not "TS22 5BQ") — OpenWeather requires it
       const postcode = rawPostcode.trim().split(" ")[0].toUpperCase();
@@ -4223,7 +4227,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       } else {
         // Fetch fresh from OpenWeather forecast API
         const apiKey = process.env.OPENWEATHER_API_KEY;
-        const r    = await fetch(`https://api.openweathermap.org/data/2.5/forecast?q=${postcode},GB&appid=${apiKey}&units=metric&cnt=40`);
+        const r    = await fetch(`https://api.openweathermap.org/data/2.5/forecast?q=${postcode},${dashboardCountry}&appid=${apiKey}&units=metric&cnt=40`);
         const json = await r.json();
 
         if (json.list) {
