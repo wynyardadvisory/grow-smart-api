@@ -4003,7 +4003,7 @@ app.get("/weather", requireAuth, async (req, res) => {
 
   // Return cached if valid
   const { data: cached } = await supabaseService.from("weather_cache")
-    .select("temp_c, frost_risk, rain_mm, condition, expires_at")
+    .select("temp_c, frost_risk, rain_mm, rain_mm_forecast_5day, condition, expires_at")
     .eq("postcode", postcode)
     .gt("expires_at", new Date().toISOString())
     .single();
@@ -4016,16 +4016,18 @@ app.get("/weather", requireAuth, async (req, res) => {
     const json = await r.json();
     if (!json.list) return res.status(502).json({ error: "Weather API error" });
 
-    const next24  = json.list.slice(0, 8);
-    const minTemp = Math.min(...next24.map(f => f.main.temp_min));
+    const allSlots1  = json.list;
+    const next24     = allSlots1.slice(0, 8);
+    const minTemp    = Math.min(...next24.map(f => f.main.temp_min));
     const weather = {
       postcode,
-      temp_c:     json.list[0].main.temp,
-      frost_risk: minTemp <= 2,
-      rain_mm:    next24.reduce((s, f) => s + (f.rain?.["3h"] || 0), 0),
-      condition:  json.list[0].weather[0].description,
-      data:       json,
-      expires_at: new Date(Date.now() + 3600000).toISOString(),
+      temp_c:                 json.list[0].main.temp,
+      frost_risk:             minTemp <= 2,
+      rain_mm:                next24.reduce((s, f) => s + (f.rain?.["3h"] || 0), 0),
+      rain_mm_forecast_5day:  allSlots1.reduce((s, f) => s + (f.rain?.["3h"] || 0), 0),
+      condition:              json.list[0].weather[0].description,
+      data:                   json,
+      expires_at:             new Date(Date.now() + 3600000).toISOString(),
     };
     await supabaseService.from("weather_cache").upsert(weather);
     const { data: _raw, ...clean } = weather;
@@ -4193,7 +4195,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
 
       // Check cache first
       const { data: cached } = await supabaseService.from("weather_cache")
-        .select("temp_c, condition, frost_risk, frost_risk_7day, icon_code, expires_at")
+        .select("temp_c, condition, frost_risk, frost_risk_7day, rain_mm_forecast_5day, icon_code, expires_at")
         .eq("postcode", postcode)
         .gt("expires_at", new Date().toISOString())
         .single();
@@ -4214,14 +4216,15 @@ app.get("/dashboard", requireAuth, async (req, res) => {
 
           weather = {
             postcode,
-            temp_c:          Math.round(json.list[0].main.temp),
-            condition:       json.list[0].weather[0].description,
-            icon_code:       json.list[0].weather[0].icon,
-            frost_risk:      minTemp24h <= 2,
-            frost_risk_7day: minTemp7d,
-            rain_mm:         allSlots.slice(0, 8).reduce((s, f) => s + (f.rain?.["3h"] || 0), 0),
-            data:            json,
-            expires_at:      new Date(Date.now() + 3600000).toISOString(),
+            temp_c:                Math.round(json.list[0].main.temp),
+            condition:             json.list[0].weather[0].description,
+            icon_code:             json.list[0].weather[0].icon,
+            frost_risk:            minTemp24h <= 2,
+            frost_risk_7day:       minTemp7d,
+            rain_mm:               allSlots.slice(0, 8).reduce((s, f) => s + (f.rain?.["3h"] || 0), 0),
+            rain_mm_forecast_5day: allSlots.reduce((s, f) => s + (f.rain?.["3h"] || 0), 0),
+            data:                  json,
+            expires_at:            new Date(Date.now() + 3600000).toISOString(),
           };
           await supabaseService.from("weather_cache").upsert(weather);
         }
