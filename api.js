@@ -6623,42 +6623,49 @@ async function buildEligibleUserSet(window) {
 app.post("/cron/push-morning", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-  try {
-    const { eligible, counts: preCounts, tokenMap, tasksByUser } = await buildEligibleUserSet("morning");
-    console.log(`[PushMorning] Pre-filter: ${JSON.stringify(preCounts)}`);
-    let sendCounts = { sent: 0, failed: 0, no_candidate: 0 };
-    if (!eligible.length) {
-      console.log("[PushMorning] No eligible users — done.");
-    } else {
-      sendCounts = await sendBulkNotifications(supabaseService, eligible, "morning", tokenMap, tasksByUser);
+
+  // Respond immediately so cron-job.org does not time out.
+  // Notification sending runs in the background.
+  res.json({ ok: true, status: "processing" });
+
+  setImmediate(async () => {
+    try {
+      const { eligible, counts: preCounts, tokenMap, tasksByUser } = await buildEligibleUserSet("morning");
+      console.log(`[PushMorning] Pre-filter: ${JSON.stringify(preCounts)}`);
+      if (!eligible.length) {
+        console.log("[PushMorning] No eligible users — done.");
+        return;
+      }
+      const sendCounts = await sendBulkNotifications(supabaseService, eligible, "morning", tokenMap, tasksByUser);
       console.log(`[PushMorning] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
+    } catch(e) {
+      captureError("PushMorning", e);
     }
-    // Email fallback removed — now handled by POST /cron/weekly-digest (Sundays only)
-    res.json({ ok: true, eligible: eligible.length, ...sendCounts });
-  } catch(e) {
-    captureError("PushMorning", e);
-    res.status(500).json({ error: e.message });
-  }
+  });
 });
 
 app.post("/cron/push-evening", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-  try {
-    const { eligible, counts: preCounts, tokenMap, tasksByUser } = await buildEligibleUserSet("evening");
-    console.log(`[PushEvening] Pre-filter: ${JSON.stringify(preCounts)}`);
-    let sendCounts = { sent: 0, failed: 0, no_candidate: 0 };
-    if (!eligible.length) {
-      console.log("[PushEvening] No eligible users — done.");
-    } else {
-      sendCounts = await sendBulkNotifications(supabaseService, eligible, "evening", tokenMap, tasksByUser);
+
+  // Respond immediately so cron-job.org does not time out.
+  // Notification sending runs in the background.
+  res.json({ ok: true, status: "processing" });
+
+  setImmediate(async () => {
+    try {
+      const { eligible, counts: preCounts, tokenMap, tasksByUser } = await buildEligibleUserSet("evening");
+      console.log(`[PushEvening] Pre-filter: ${JSON.stringify(preCounts)}`);
+      if (!eligible.length) {
+        console.log("[PushEvening] No eligible users — done.");
+        return;
+      }
+      const sendCounts = await sendBulkNotifications(supabaseService, eligible, "evening", tokenMap, tasksByUser);
       console.log(`[PushEvening] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
+    } catch(e) {
+      captureError("PushEvening", e);
     }
-    res.json({ ok: true, eligible: eligible.length, ...sendCounts });
-  } catch(e) {
-    captureError("PushEvening", e);
-    res.status(500).json({ error: e.message });
-  }
+  });
 });
 
 // POST /cron/push-dry-run — verify eligibility without sending anything
@@ -6796,13 +6803,23 @@ app.post("/cron/daily", async (req, res) => {
   }
   const { data: profiles } = await supabaseService.from("profiles").select("id");
   if (!profiles?.length) return res.json({ processed: 0 });
-  let total = 0;
-  for (const p of profiles) {
-    const tasks = await runRuleEngine(p.id);
-    total += tasks.length;
-  }
-  console.log(`[Cron] ${total} tasks generated across ${profiles.length} users`);
-  res.json({ processed: profiles.length, tasks_generated: total });
+
+  // Respond immediately so cron-job.org does not time out.
+  // Rule engine runs in the background for all users.
+  res.json({ ok: true, queued: profiles.length });
+
+  setImmediate(async () => {
+    let total = 0;
+    for (const p of profiles) {
+      try {
+        const tasks = await runRuleEngine(p.id);
+        total += tasks.length;
+      } catch (err) {
+        console.error(`[CronDaily] Engine error for user ${p.id}:`, err.message);
+      }
+    }
+    console.log(`[CronDaily] ${total} tasks generated across ${profiles.length} users`);
+  });
 });
 
 // =============================================================================
