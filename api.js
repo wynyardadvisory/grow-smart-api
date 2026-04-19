@@ -6776,14 +6776,18 @@ app.post("/cron/reengagement", async (req, res) => {
 app.post("/cron/weekly-digest", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-  try {
-    const result = await runWeeklyEmailDigest(supabaseService);
-    console.log("[WeeklyDigest]", result);
-    res.json({ ok: true, ...result });
-  } catch(e) {
-    captureError("WeeklyDigest", e);
-    res.status(500).json({ error: e.message });
-  }
+
+  // Respond immediately so cron-job.org does not time out.
+  res.json({ ok: true, status: "processing" });
+
+  setImmediate(async () => {
+    try {
+      const result = await runWeeklyEmailDigest(supabaseService);
+      console.log("[WeeklyDigest]", result);
+    } catch(e) {
+      captureError("WeeklyDigest", e);
+    }
+  });
 });
 
 // =============================================================================

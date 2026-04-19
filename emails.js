@@ -23,6 +23,24 @@ function getResend() {
 }
 
 const FROM = "Vercro <hello@vercro.com>";
+
+// ── Paginated auth user loader ────────────────────────────────────────────────
+// supabase.auth.admin.listUsers has a hard perPage cap of 1000.
+// With 1,100+ users this silently drops users. Fetch all pages.
+async function listAllAuthUsers(supabase) {
+  const users = [];
+  let page = 1;
+  const perPage = 1000;
+  while (true) {
+    const { data, error } = await supabase.auth.admin.listUsers({ page, perPage });
+    if (error) { console.error('[listAllAuthUsers] Error:', error.message); break; }
+    const batch = data?.users || [];
+    users.push(...batch);
+    if (batch.length < perPage) break;
+    page++;
+  }
+  return users;
+}
 const APP_URL = "https://app.vercro.com";
 
 // ── Email templates ───────────────────────────────────────────────────────────
@@ -289,7 +307,7 @@ async function sendEmail(to, template, emailType) {
 async function runNudgeUnactivated(supabase) {
   // Find users who confirmed email but never completed onboarding (no profile row)
   // Only nudge once — check email_logs table, or use a simple time window
-  const { data: { users } } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+  const users = await listAllAuthUsers(supabase);
 
   // Get all profile IDs (users who completed onboarding)
   const { data: profiles } = await supabase.from("profiles").select("id, email_unsubscribed");
@@ -340,7 +358,7 @@ async function runNudgeUnconfirmed(supabase) {
   // Fetch unsubscribed profile IDs
   const { data: _unsubProfiles } = await supabase.from("profiles").select("id, email_unsubscribed");
   const _unsubIds = new Set((_unsubProfiles || []).filter(p => p.email_unsubscribed).map(p => p.id));
-  const { data: { users } } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+  const users = await listAllAuthUsers(supabase);
 
   const { data: alreadySent } = await supabase
     .from("email_log")
@@ -384,7 +402,7 @@ async function runFeedbackSequence(supabase) {
     .select("id, name, email_unsubscribed")
     .order("created_at");
 
-  const { data: { users } } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+  const users = await listAllAuthUsers(supabase);
   const userMap = {};
   (users || []).forEach(u => { userMap[u.id] = u; });
 
@@ -582,7 +600,7 @@ async function runWaitlistNudges(supabase) {
   if (!invited?.length) return { sent: 0, skipped: 0 };
 
   // Get all auth user emails so we can skip people who already signed up
-  const { data: { users } } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+  const users = await listAllAuthUsers(supabase);
   const signedUpEmails = new Set((users || []).map(u => u.email?.toLowerCase()));
 
   let sent = 0, skipped = 0;
@@ -805,7 +823,7 @@ async function runWaitlistNudges2(supabase) {
 
   if (!invited?.length) return { sent: 0, skipped: 0 };
 
-  const { data: { users } } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+  const users = await listAllAuthUsers(supabase);
   const signedUpEmails = new Set((users || []).map(u => u.email?.toLowerCase()));
 
   let sent = 0, skipped = 0;
@@ -839,7 +857,7 @@ async function runWaitlistNudges3(supabase) {
 
   if (!invited?.length) return { sent: 0, skipped: 0 };
 
-  const { data: { users } } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+  const users = await listAllAuthUsers(supabase);
   const signedUpEmails = new Set((users || []).map(u => u.email?.toLowerCase()));
 
   let sent = 0, skipped = 0;
@@ -863,7 +881,7 @@ async function runWaitlistNudges3(supabase) {
 
 async function runReengagement(supabase) {
   const { data: profiles } = await supabase.from("profiles").select("id, name, email_unsubscribed").order("created_at");
-  const { data: { users } } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+  const users = await listAllAuthUsers(supabase);
   const userMap = {};
   (users || []).forEach(u => { userMap[u.id] = u; });
 
@@ -1011,7 +1029,7 @@ async function runOnboardingRecovery(supabase) {
   const resend = getResend();
   if (!resend) return { sent: 0, skipped: 0, reason: "resend_not_configured" };
 
-  const { data: { users } } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+  const users = await listAllAuthUsers(supabase);
   const userMap = {};
   (users || []).forEach(u => { userMap[u.id] = u; });
 
@@ -1103,7 +1121,7 @@ async function runWeeklyEmailDigest(supabase) {
     return { sent: 0, skipped: 0, reason: "not_sunday" };
   }
 
-  const { data: { users } } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+  const users = await listAllAuthUsers(supabase);
   const userMap = {};
   (users || []).forEach(u => { userMap[u.id] = u; });
 
