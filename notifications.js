@@ -439,8 +439,25 @@ async function sendNotification(supabase, userId, candidate, preloadedTokens) {
     console.warn(`[Push] ${nativeTokens.length} native token(s) for ${userId} have no OneSignal subscription ID — skipping`);
   }
 
-  // ── Web send via VAPID ────────────────────────────────────────────────────
-  for (const token of webTokens) {
+  // ── Web send via OneSignal ───────────────────────────────────────────────
+  // Web tokens store the OneSignal subscription ID in onesignal_subscription_id
+  // after migration. Fall back to VAPID for any tokens not yet migrated.
+  const webOsIds = webTokens.map(t => t.onesignal_subscription_id).filter(Boolean);
+  const webVapidTokens = webTokens.filter(t => !t.onesignal_subscription_id);
+
+  if (webOsIds.length) {
+    try {
+      const osResult = await sendViaOneSignal(webOsIds, candidate);
+      const osSent = osResult.recipients || 0;
+      sentCount += osSent;
+      console.log(`[Push] OneSignal web sent to ${userId}: ${candidate.notification_type} — "${candidate.title}" — recipients=${osSent}`);
+    } catch (err) {
+      console.error(`[Push] OneSignal web send failed for ${userId}:`, err.message);
+    }
+  }
+
+  // VAPID fallback for tokens not yet migrated to OneSignal
+  for (const token of webVapidTokens) {
     try {
       const subscription = JSON.parse(token.push_token);
       const payload = JSON.stringify({
@@ -454,9 +471,9 @@ async function sendNotification(supabase, userId, candidate, preloadedTokens) {
       });
       await webpush.sendNotification(subscription, payload);
       sentCount++;
-      console.log(`[Push] Web sent to ${userId}: ${candidate.notification_type} — "${candidate.title}"`);
+      console.log(`[Push] VAPID web sent to ${userId}: ${candidate.notification_type} — "${candidate.title}"`);
     } catch (err) {
-      console.error(`[Push] Web send failed for ${userId}:`, err.statusCode, err.body);
+      console.error(`[Push] VAPID web send failed for ${userId}:`, err.statusCode, err.body);
       if (err.statusCode === 410 || err.statusCode === 404) {
         await supabase.from("device_push_tokens")
           .update({ is_active: false })
@@ -479,25 +496,21 @@ async function sendNotification(supabase, userId, candidate, preloadedTokens) {
 // Accepts pre-fetched data — no DB calls except the actual send + event insert.
 async function sendBulkNotifications(supabase, eligible, window, tokenMap, tasksByUser) {
   if (!setupVapid()) return { sent: 0, reason: "vapid_not_configured" };
-
-  // Fire all per-user sends in parallel — avoids sequential timeout on large user bases.
-  // Each user gets their own personalised candidate; users with no candidate are skipped.
-  const results = await Promise.all(eligible.map(async (userId) => {
+  const counts = { sent: 0, failed: 0, no_candidate: 0 };
+  for (const userId of eligible) {
     try {
       const candidates = buildCandidatesFromCache(userId, window, tasksByUser);
       const candidate  = selectCandidate(candidates);
-      if (!candidate) return "no_candidate";
+      if (!candidate) { counts.no_candidate++; continue; }
       const tokens = tokenMap[userId] || [];
       const result = await sendNotification(supabase, userId, candidate, tokens);
-      return result.sent ? "sent" : "failed";
+      if (result.sent) counts.sent++;
+      else counts.failed++;
     } catch(e) {
       console.error(`[Push] Bulk send error for ${userId}:`, e.message);
-      return "failed";
+      counts.failed++;
     }
-  }));
-
-  const counts = { sent: 0, failed: 0, no_candidate: 0 };
-  for (const r of results) counts[r] = (counts[r] || 0) + 1;
+  }
   return counts;
 }
 
