@@ -479,21 +479,25 @@ async function sendNotification(supabase, userId, candidate, preloadedTokens) {
 // Accepts pre-fetched data — no DB calls except the actual send + event insert.
 async function sendBulkNotifications(supabase, eligible, window, tokenMap, tasksByUser) {
   if (!setupVapid()) return { sent: 0, reason: "vapid_not_configured" };
-  const counts = { sent: 0, failed: 0, no_candidate: 0 };
-  for (const userId of eligible) {
+
+  // Fire all per-user sends in parallel — avoids sequential timeout on large user bases.
+  // Each user gets their own personalised candidate; users with no candidate are skipped.
+  const results = await Promise.all(eligible.map(async (userId) => {
     try {
       const candidates = buildCandidatesFromCache(userId, window, tasksByUser);
       const candidate  = selectCandidate(candidates);
-      if (!candidate) { counts.no_candidate++; continue; }
+      if (!candidate) return "no_candidate";
       const tokens = tokenMap[userId] || [];
       const result = await sendNotification(supabase, userId, candidate, tokens);
-      if (result.sent) counts.sent++;
-      else counts.failed++;
+      return result.sent ? "sent" : "failed";
     } catch(e) {
       console.error(`[Push] Bulk send error for ${userId}:`, e.message);
-      counts.failed++;
+      return "failed";
     }
-  }
+  }));
+
+  const counts = { sent: 0, failed: 0, no_candidate: 0 };
+  for (const r of results) counts[r] = (counts[r] || 0) + 1;
   return counts;
 }
 
