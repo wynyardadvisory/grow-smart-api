@@ -4842,6 +4842,90 @@ app.post("/run-rules", requireAuth, async (req, res) => {
 });
 
 // =============================================================================
+// ADMIN — migrate existing web push tokens to OneSignal
+// One-time migration. Fetches all active web tokens without an onesignal_subscription_id
+// and registers each with OneSignal, storing the returned subscription ID.
+// Safe to run multiple times — skips tokens that already have a subscription ID.
+// POST /admin/migrate-web-push
+// =============================================================================
+
+app.post("/admin/migrate-web-push", requireAuth, requireAdmin, async (req, res) => {
+  // Respond immediately — process in background
+  res.json({ ok: true, status: "processing" });
+
+  setImmediate(async () => {
+    try {
+      const { data: tokens } = await supabaseService
+        .from("device_push_tokens")
+        .select("id, user_id, push_token, endpoint")
+        .eq("platform", "web")
+        .eq("is_active", true)
+        .is("onesignal_subscription_id", null);
+
+      if (!tokens?.length) {
+        console.log("[MigrateWebPush] No tokens to migrate");
+        return;
+      }
+
+      console.log(`[MigrateWebPush] Migrating ${tokens.length} web tokens to OneSignal`);
+      let success = 0, failed = 0;
+
+      await Promise.all(tokens.map(async (token) => {
+        try {
+          const subscription = JSON.parse(token.push_token);
+          const endpoint = subscription.endpoint || "";
+
+          // Determine browser type from endpoint URL
+          const subType = endpoint.includes("googleapis") ? "ChromePush"
+            : endpoint.includes("mozilla") ? "FirefoxPush"
+            : endpoint.includes("apple") ? "SafariPush"
+            : "ChromePush"; // default
+
+          const osRes = await fetch(`https://api.onesignal.com/apps/${process.env.ONESIGNAL_APP_ID}/users`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Key ${process.env.ONESIGNAL_API_KEY}`,
+            },
+            body: JSON.stringify({
+              properties: { external_id: token.user_id },
+              subscriptions: [{
+                type:    subType,
+                token:   endpoint,
+                enabled: true,
+                web_auth: subscription.keys?.auth || null,
+                web_p256: subscription.keys?.p256dh || null,
+              }],
+            }),
+          });
+
+          const osData = await osRes.json();
+          const osSubId = osData?.subscriptions?.[0]?.id || null;
+
+          if (osSubId) {
+            await supabaseService.from("device_push_tokens")
+              .update({ onesignal_subscription_id: osSubId, updated_at: new Date().toISOString() })
+              .eq("id", token.id);
+            success++;
+            console.log(`[MigrateWebPush] Migrated token ${token.id} → ${osSubId}`);
+          } else {
+            failed++;
+            console.warn(`[MigrateWebPush] No sub ID returned for token ${token.id}:`, JSON.stringify(osData));
+          }
+        } catch (err) {
+          failed++;
+          console.error(`[MigrateWebPush] Error for token ${token.id}:`, err.message);
+        }
+      }));
+
+      console.log(`[MigrateWebPush] Done. Success: ${success}, Failed: ${failed}`);
+    } catch (err) {
+      console.error("[MigrateWebPush] Fatal error:", err.message);
+    }
+  });
+});
+
+// =============================================================================
 // ADMIN — reset all tasks and regenerate for every user
 // Hit this once after deploying rule engine fixes to clear stale dedup locks
 // =============================================================================
