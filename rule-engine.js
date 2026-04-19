@@ -1584,6 +1584,14 @@ class RuleEngine {
       }
     }
 
+    // ── Soil moisture stale advisories ──────────────────────────────────────
+    // Generates a low-urgency 'check soil moisture' task per area where the
+    // user previously logged a reading that has now gone stale (> 7 days).
+    // Only fires if the user has ever logged moisture for that area.
+    // No extra DB query — derived from crops already in memory.
+    const soilAdvisories = this._soilAdvisories(userId, crops);
+    allCandidates.push(...soilAdvisories);
+
     // ── Confidence scoring + surface_class assignment ───────────────────────
     // Score every candidate. Assign surface_class based on score.
     // Suppress candidates below threshold, with new-user fallback.
@@ -1826,6 +1834,80 @@ class RuleEngine {
     } catch (err) {
       console.error("[RuleEngine] Cleanup error:", err.message);
     }
+  }
+
+  // ── Soil moisture stale advisory generator ───────────────────────────────
+  // Derives stale areas from the crops already loaded — no extra DB call.
+  // Fires one advisory per area where:
+  //   - soil_moisture was previously logged (field is not null)
+  //   - the reading is older than MOISTURE_VALIDITY_DAYS (7)
+  //   - no recent watering logged within 2 days (advisory would be redundant)
+  //   - area has at least one active crop (guaranteed by crops list)
+  // Urgency: medium for greenhouse/container/pot; low otherwise.
+
+  _soilAdvisories(userId, crops) {
+    const MOISTURE_VALIDITY_DAYS = 7;
+    const RECENT_WATERING_DAYS   = 2;
+    const today = todayISO();
+    const seen  = new Set(); // dedupe by area_id
+    const tasks = [];
+
+    for (const crop of crops) {
+      const area = crop.area;
+      if (!area) continue;
+      const areaId = crop.area_id;
+      if (seen.has(areaId)) continue;
+
+      // Only fire if user has ever logged moisture for this area
+      const moisture          = area.soil_moisture        || null;
+      const moistureLoggedAt  = area.soil_moisture_logged_at || null;
+      if (!moisture || !moistureLoggedAt) continue;
+
+      // Check the reading is stale
+      const ageDays = daysSince(moistureLoggedAt);
+      if (ageDays === null || ageDays <= MOISTURE_VALIDITY_DAYS) continue;
+
+      // Suppress if user watered very recently — they're clearly active
+      const lastWatered = area.last_watered_at || null;
+      const daysSinceWatered = lastWatered ? daysSince(lastWatered) : null;
+      if (daysSinceWatered !== null && daysSinceWatered <= RECENT_WATERING_DAYS) continue;
+
+      seen.add(areaId);
+
+      const areaName  = area.name || 'your area';
+      const areaType  = area.type || null;
+      const thirsty   = ['greenhouse', 'container', 'pot', 'indoors'].includes(areaType);
+      const urgency   = thirsty ? 'medium' : 'low';
+
+      // Key snaps to week so task doesn't regenerate daily after being dismissed
+      const keyDate = windowAnchor(today, 7);
+
+      tasks.push({
+        user_id:          userId,
+        crop_instance_id: null,
+        area_id:          areaId,
+        action:           `Check soil moisture in ${areaName} — your last reading was ${ageDays} days ago`,
+        task_type:        'check',
+        urgency,
+        due_date:         today,
+        scheduled_for:    today,
+        visible_from:     today,
+        expires_at:       new Date(addDays(today, 3) + 'T23:59:59Z').toISOString(),
+        status:           'due',
+        engine_type:      'scheduled',
+        record_type:      'task',
+        source:           'rule_engine',
+        rule_id:          'soil_moisture_stale',
+        source_key:       sourceKey({ u: userId, a: areaId, r: 'soil_moisture_stale', d: keyDate }),
+        date_confidence:  'approximate',
+        meta:             JSON.stringify({ last_moisture: moisture, age_days: ageDays, area_type: areaType }),
+        risk_payload:     null,
+        _score:           55,
+      });
+    }
+
+    if (tasks.length) console.log(`[SoilAdvisory] ${tasks.length} stale moisture advisory(s) for user=${userId}`);
+    return tasks;
   }
 
   // ── Succession next-sow reminder generator ────────────────────────────────
