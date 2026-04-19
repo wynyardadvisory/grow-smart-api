@@ -1592,6 +1592,9 @@ class RuleEngine {
     const soilAdvisories = this._soilAdvisories(userId, crops);
     allCandidates.push(...soilAdvisories);
 
+    const phAdvisories = this._phAdvisories(userId, crops);
+    allCandidates.push(...phAdvisories);
+
     // ── Confidence scoring + surface_class assignment ───────────────────────
     // Score every candidate. Assign surface_class based on score.
     // Suppress candidates below threshold, with new-user fallback.
@@ -1907,6 +1910,88 @@ class RuleEngine {
     }
 
     if (tasks.length) console.log(`[SoilAdvisory] ${tasks.length} stale moisture advisory(s) for user=${userId}`);
+    return tasks;
+  }
+
+  // ── Soil pH stale advisory generator ─────────────────────────────────────
+  // Fires one advisory per area where:
+  //   - soil_ph was previously logged (field is not null)
+  //   - the reading is older than PH_VALIDITY_DAYS (180)
+  //   - at least one crop in the area has ph_min/ph_max defined AND the logged
+  //     pH is outside that crop's acceptable range — if everything is in range
+  //     the advisory is low value and is suppressed
+  //   - if no crop in the area has pH thresholds defined, still fire (generic)
+  // Urgency always low — pH changes slowly and this is informational.
+
+  _phAdvisories(userId, crops) {
+    const PH_VALIDITY_DAYS = 180;
+    const today = todayISO();
+    const seen  = new Set();
+    const tasks = [];
+
+    // Group crops by area_id for out-of-range check
+    const cropsByArea = new Map();
+    for (const crop of crops) {
+      if (!crop.area_id) continue;
+      if (!cropsByArea.has(crop.area_id)) cropsByArea.set(crop.area_id, []);
+      cropsByArea.get(crop.area_id).push(crop);
+    }
+
+    for (const crop of crops) {
+      const area = crop.area;
+      if (!area) continue;
+      const areaId = crop.area_id;
+      if (seen.has(areaId)) continue;
+
+      // Only fire if user has ever logged pH for this area
+      const ph           = area.soil_ph            ?? null;
+      const phLoggedAt   = area.soil_ph_logged_at  ?? null;
+      if (ph === null || !phLoggedAt) continue;
+
+      // Check the reading is stale
+      const ageDays = daysSince(phLoggedAt);
+      if (ageDays === null || ageDays <= PH_VALIDITY_DAYS) continue;
+
+      // Check whether any crop in this area has pH thresholds defined
+      // and whether the logged pH is outside range for at least one of them.
+      // If all crops with thresholds are in range, suppress the advisory.
+      const areaCrops     = cropsByArea.get(areaId) || [];
+      const cropsWithPh   = areaCrops.filter(c => c.crop_def?.soil_ph_min != null && c.crop_def?.soil_ph_max != null);
+      const anyOutOfRange = cropsWithPh.some(c => ph < c.crop_def.soil_ph_min || ph > c.crop_def.soil_ph_max);
+
+      // If crops have pH thresholds and all are in range — not worth flagging
+      if (cropsWithPh.length > 0 && !anyOutOfRange) continue;
+
+      seen.add(areaId);
+
+      const areaName = area.name || 'your area';
+      const keyDate  = windowAnchor(today, 30); // snap to month — no need to nag weekly
+
+      tasks.push({
+        user_id:          userId,
+        crop_instance_id: null,
+        area_id:          areaId,
+        action:           `Retest soil pH in ${areaName} — your last reading (pH ${ph}) was ${ageDays} days ago`,
+        task_type:        'check',
+        urgency:          'low',
+        due_date:         today,
+        scheduled_for:    today,
+        visible_from:     today,
+        expires_at:       new Date(addDays(today, 14) + 'T23:59:59Z').toISOString(),
+        status:           'due',
+        engine_type:      'scheduled',
+        record_type:      'task',
+        source:           'rule_engine',
+        rule_id:          'soil_ph_stale',
+        source_key:       sourceKey({ u: userId, a: areaId, r: 'soil_ph_stale', d: keyDate }),
+        date_confidence:  'approximate',
+        meta:             JSON.stringify({ last_ph: ph, age_days: ageDays, any_out_of_range: anyOutOfRange }),
+        risk_payload:     null,
+        _score:           55,
+      });
+    }
+
+    if (tasks.length) console.log(`[PhAdvisory] ${tasks.length} stale pH advisory(s) for user=${userId}`);
     return tasks;
   }
 
