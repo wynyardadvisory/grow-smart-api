@@ -6899,24 +6899,31 @@ app.post("/cron/daily", async (req, res) => {
   if (req.headers["x-cron-secret"] !== process.env.CRON_SECRET) {
     return res.status(403).json({ error: "Forbidden" });
   }
-  const { data: profiles } = await supabaseService.from("profiles").select("id");
-  if (!profiles?.length) return res.json({ processed: 0 });
 
   // Respond immediately so cron-job.org does not time out.
-  // Rule engine runs in the background for all users.
-  res.json({ ok: true, queued: profiles.length });
+  // Profile fetch and rule engine run entirely in the background.
+  res.json({ ok: true, status: "processing" });
 
   setImmediate(async () => {
-    let total = 0;
-    for (const p of profiles) {
-      try {
-        const tasks = await runRuleEngine(p.id);
-        total += tasks.length;
-      } catch (err) {
-        console.error(`[CronDaily] Engine error for user ${p.id}:`, err.message);
+    try {
+      const { data: profiles } = await supabaseService.from("profiles").select("id");
+      if (!profiles?.length) {
+        console.log("[CronDaily] No profiles found — nothing to process.");
+        return;
       }
+      let total = 0;
+      for (const p of profiles) {
+        try {
+          const tasks = await runRuleEngine(p.id);
+          total += tasks.length;
+        } catch (err) {
+          console.error(`[CronDaily] Engine error for user ${p.id}:`, err.message);
+        }
+      }
+      console.log(`[CronDaily] ${total} tasks generated across ${profiles.length} users`);
+    } catch (err) {
+      console.error("[CronDaily] Fatal error:", err.message);
     }
-    console.log(`[CronDaily] ${total} tasks generated across ${profiles.length} users`);
   });
 });
 
