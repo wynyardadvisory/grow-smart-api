@@ -3119,6 +3119,92 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
         ? (feedbackRatings.reduce((s, f) => s + (f.rating || 0), 0) / feedbackRatings.length).toFixed(1)
         : null,
       totalFeedback: feedbackRatings?.length || 0,
+
+      // Revenue — populated below via Stripe + profiles queries
+      revenue: await (async () => {
+        try {
+          // All non-demo pro users from profiles
+          const { data: proProfiles } = await db
+            .from("profiles")
+            .select("id, plan, pro_source, pro_expires_at, price_tier, stripe_customer_id, created_at")
+            .eq("plan", "pro")
+            .eq("is_demo", false);
+
+          // Previously paid users (have stripe_customer_id but now on free)
+          const { data: churnedProfiles } = await db
+            .from("profiles")
+            .select("id, plan, stripe_customer_id, pro_expires_at")
+            .eq("plan", "free")
+            .eq("is_demo", false)
+            .not("stripe_customer_id", "is", null);
+
+          const stripeProfiles  = (proProfiles || []).filter(p => p.pro_source === "stripe" || p.stripe_customer_id);
+          const rcProfiles      = (proProfiles || []).filter(p => p.pro_source && p.pro_source.startsWith("revenuecat") && !p.stripe_customer_id);
+          const totalPro        = (proProfiles || []).length;
+          const churnedCount    = (churnedProfiles || []).length;
+
+          // Fetch subscriptions from Stripe for interval split (monthly vs annual)
+          let monthlyCount = 0;
+          let annualCount  = 0;
+          let trialCount   = 0;
+          let pastDueCount = 0;
+          let mrr          = 0; // pence
+
+          const ANNUAL_PRICE_IDS  = new Set(Object.values(STRIPE_PRICES).map(p => p.annual));
+          const MONTHLY_PRICE_IDS = new Set(Object.values(STRIPE_PRICES).map(p => p.monthly));
+
+          // Pull active subscriptions from Stripe (up to 100 — sufficient for current scale)
+          const subs = await stripe.subscriptions.list({ status: "active", limit: 100 });
+          for (const sub of subs.data || []) {
+            const priceId = sub.items?.data?.[0]?.price?.id;
+            const amount  = sub.items?.data?.[0]?.price?.unit_amount || 0;
+            if (ANNUAL_PRICE_IDS.has(priceId)) {
+              annualCount++;
+              mrr += Math.round(amount / 12); // annualise → monthly
+            } else if (MONTHLY_PRICE_IDS.has(priceId)) {
+              monthlyCount++;
+              mrr += amount;
+            }
+            if (sub.status === "trialing") trialCount++;
+          }
+
+          // Past due (failed payment but not yet cancelled)
+          const pastDueSubs = await stripe.subscriptions.list({ status: "past_due", limit: 100 });
+          pastDueCount = pastDueSubs.data?.length || 0;
+
+          // % of activated users paying
+          const { count: activatedCount } = await db
+            .from("profiles")
+            .select("*", { count: "exact", head: true })
+            .eq("is_demo", false)
+            .not("postcode", "is", null);
+
+          const conversionRate = activatedCount > 0
+            ? Math.round((totalPro / activatedCount) * 100)
+            : null;
+
+          const mrrGBP = (mrr / 100).toFixed(2);
+
+          return {
+            totalPro,
+            stripeCount:    stripeProfiles.length,
+            rcCount:        rcProfiles.length,
+            monthlyCount,
+            annualCount,
+            trialCount,
+            pastDueCount,
+            churnedCount,
+            conversionRate,
+            mrrGBP,
+            earlySupporter: (proProfiles || []).filter(p => p.price_tier === "early_supporter").length,
+            loyalty:        (proProfiles || []).filter(p => p.price_tier === "loyalty").length,
+            standard:       (proProfiles || []).filter(p => p.price_tier === "standard").length,
+          };
+        } catch (revenueErr) {
+          console.error("[Metrics] Revenue query failed:", revenueErr.message);
+          return null;
+        }
+      })(),
     });
   } catch (e) {
     console.error("[Metrics]", e.message);
