@@ -440,7 +440,7 @@ async function runFeedbackSequence(supabase) {
     const isActive = tasksCompleted >= 3; // completed 3+ tasks = engaged user
 
     // Day 3 email — different tone for active vs quiet users
-    if (daysSince >= 3 && daysSince < 4 && !userSent.has("feedback_day3")) {
+    if (daysSince >= 3 && daysSince < 6 && !userSent.has("feedback_day3")) {
       const template = isActive
         ? templateFeedbackDay3Active(profile.name, tasksCompleted)
         : templateFeedbackDay3Quiet(profile.name);
@@ -456,7 +456,7 @@ async function runFeedbackSequence(supabase) {
     }
 
     // Day 7 email — different tone for active vs quiet users
-    if (daysSince >= 7 && daysSince < 8 && !userSent.has("feedback_day7")) {
+    if (daysSince >= 7 && daysSince < 10 && !userSent.has("feedback_day7")) {
       const template = isActive
         ? templateFeedbackDay7Active(profile.name, tasksCompleted)
         : templateFeedbackDay7Quiet(profile.name);
@@ -910,7 +910,7 @@ async function runReengagement(supabase) {
     const userSent  = sentMap[profile.id] || new Set();
 
     // Day 14
-    if (daysSince >= 14 && daysSince < 15 && !userSent.has("reengage_day14")) {
+    if (daysSince >= 14 && daysSince < 17 && !userSent.has("reengage_day14")) {
       const result = await sendEmail(user.email, templateReengageDay14(profile.name), "reengage_day14");
       if (result.sent) {
         await supabase.from("email_log").insert({ user_id: profile.id, email: user.email, email_type: "reengage_day14", sent_at: new Date().toISOString(), resend_email_id: result.id || null });
@@ -919,7 +919,7 @@ async function runReengagement(supabase) {
     }
 
     // Day 30
-    if (daysSince >= 30 && daysSince < 31 && !userSent.has("reengage_day30")) {
+    if (daysSince >= 30 && daysSince < 33 && !userSent.has("reengage_day30")) {
       const result = await sendEmail(user.email, templateReengageDay30(profile.name), "reengage_day30");
       if (result.sent) {
         await supabase.from("email_log").insert({ user_id: profile.id, email: user.email, email_type: "reengage_day30", sent_at: new Date().toISOString(), resend_email_id: result.id || null });
