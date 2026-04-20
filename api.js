@@ -5561,8 +5561,11 @@ app.post("/crops/:id/observe", requireAuth, async (req, res) => {
     }
   }
 
-  await runRuleEngine(req.user.id);
+  // Respond immediately — rule engine runs in background to avoid Cloudflare 10s timeout
   res.json({ observation: obs, crop_updated: Object.keys(updates).length > 0, engine_actions: engineActions });
+  setImmediate(() => {
+    runRuleEngine(req.user.id).catch(err => console.error("[Observe] Rule engine error:", err.message));
+  });
 });
 
 app.get("/crops/:id/observations", requireAuth, async (req, res) => {
@@ -6841,26 +6844,32 @@ app.post("/cron/push-morning", async (req, res) => {
   res.json({ ok: true, status: "processing" });
 
   setImmediate(async () => {
+    let eligible = [], sendCounts = { sent: 0, failed: 0, no_candidate: 0 };
     try {
-      const { eligible, counts: preCounts, tokenMap, tasksByUser } = await buildEligibleUserSet("morning");
-      console.log(`[PushMorning] Pre-filter: ${JSON.stringify(preCounts)}`);
+      const result = await buildEligibleUserSet("morning");
+      eligible = result.eligible;
+      const { tokenMap, tasksByUser } = result;
+      console.log(`[PushMorning] Pre-filter: ${JSON.stringify(result.counts)}`);
       if (!eligible.length) {
         console.log("[PushMorning] No eligible users — done.");
-        return;
+      } else {
+        console.log(`[PushMorning] Starting send for ${eligible.length} users`);
+        sendCounts = await sendBulkNotifications(supabaseService, eligible, "morning", tokenMap, tasksByUser);
+        console.log(`[PushMorning] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
       }
-      const sendCounts = await sendBulkNotifications(supabaseService, eligible, "morning", tokenMap, tasksByUser);
-      console.log(`[PushMorning] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
-      await supabaseService.from("push_cron_log").insert({
-        push_window:  "morning",
-        eligible:     eligible.length,
-        sent:         sendCounts.sent         || 0,
-        failed:       sendCounts.failed       || 0,
-        no_candidate: sendCounts.no_candidate || 0,
-        ran_at:       new Date().toISOString(),
-      }).catch(e => console.error("[PushMorning] Failed to write cron log:", e.message));
     } catch(e) {
+      console.error("[PushMorning] Error:", e.message);
       captureError("PushMorning", e);
     }
+    // Always write cron log — even on error, so we have visibility
+    await supabaseService.from("push_cron_log").insert({
+      push_window:  "morning",
+      eligible:     eligible.length,
+      sent:         sendCounts.sent         || 0,
+      failed:       sendCounts.failed       || 0,
+      no_candidate: sendCounts.no_candidate || 0,
+      ran_at:       new Date().toISOString(),
+    }).catch(e => console.error("[PushMorning] Failed to write cron log:", e.message));
   });
 });
 
@@ -6873,26 +6882,32 @@ app.post("/cron/push-evening", async (req, res) => {
   res.json({ ok: true, status: "processing" });
 
   setImmediate(async () => {
+    let eligible = [], sendCounts = { sent: 0, failed: 0, no_candidate: 0 };
     try {
-      const { eligible, counts: preCounts, tokenMap, tasksByUser } = await buildEligibleUserSet("evening");
-      console.log(`[PushEvening] Pre-filter: ${JSON.stringify(preCounts)}`);
+      const result = await buildEligibleUserSet("evening");
+      eligible = result.eligible;
+      const { tokenMap, tasksByUser } = result;
+      console.log(`[PushEvening] Pre-filter: ${JSON.stringify(result.counts)}`);
       if (!eligible.length) {
         console.log("[PushEvening] No eligible users — done.");
-        return;
+      } else {
+        console.log(`[PushEvening] Starting send for ${eligible.length} users`);
+        sendCounts = await sendBulkNotifications(supabaseService, eligible, "evening", tokenMap, tasksByUser);
+        console.log(`[PushEvening] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
       }
-      const sendCounts = await sendBulkNotifications(supabaseService, eligible, "evening", tokenMap, tasksByUser);
-      console.log(`[PushEvening] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
-      await supabaseService.from("push_cron_log").insert({
-        push_window:  "evening",
-        eligible:     eligible.length,
-        sent:         sendCounts.sent         || 0,
-        failed:       sendCounts.failed       || 0,
-        no_candidate: sendCounts.no_candidate || 0,
-        ran_at:       new Date().toISOString(),
-      }).catch(e => console.error("[PushEvening] Failed to write cron log:", e.message));
     } catch(e) {
+      console.error("[PushEvening] Error:", e.message);
       captureError("PushEvening", e);
     }
+    // Always write cron log — even on error, so we have visibility
+    await supabaseService.from("push_cron_log").insert({
+      push_window:  "evening",
+      eligible:     eligible.length,
+      sent:         sendCounts.sent         || 0,
+      failed:       sendCounts.failed       || 0,
+      no_candidate: sendCounts.no_candidate || 0,
+      ran_at:       new Date().toISOString(),
+    }).catch(e => console.error("[PushEvening] Failed to write cron log:", e.message));
   });
 });
 
