@@ -3131,11 +3131,14 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
             .eq("is_demo", false);
 
           // Previously paid users (have stripe_customer_id but now on free)
+          // Churned = previously paid via Stripe (pro_source = 'stripe') but now on free.
+          // Excludes users who created a Stripe customer ID but never completed payment.
           const { data: churnedProfiles } = await db
             .from("profiles")
             .select("id, plan, stripe_customer_id, pro_expires_at")
             .eq("plan", "free")
             .eq("is_demo", false)
+            .eq("pro_source", "stripe")
             .not("stripe_customer_id", "is", null);
 
           const stripeProfiles  = (proProfiles || []).filter(p => p.pro_source === "stripe" || p.stripe_customer_id);
