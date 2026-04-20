@@ -5,19 +5,5 @@
   ],
   "routes": [
     { "src": "/(.*)", "dest": "api.js" }
-  ],
-  "crons": [
-    { "path": "/cron/daily",              "schedule": "0 6 * * *"  },
-    { "path": "/cron/push-morning",       "schedule": "0 6 * * *"  },
-    { "path": "/cron/push-evening",       "schedule": "0 17 * * *" },
-    { "path": "/cron/nudge-unactivated",  "schedule": "0 8 * * *"  },
-    { "path": "/cron/nudge-unconfirmed",  "schedule": "0 8 * * *"  },
-    { "path": "/cron/feedback-sequence",  "schedule": "0 9 * * *"  },
-    { "path": "/cron/waitlist-invites",   "schedule": "0 8 * * *"  },
-    { "path": "/cron/waitlist-nudges",    "schedule": "0 8 * * *"  },
-    { "path": "/cron/waitlist-nudges-2",  "schedule": "0 8 * * *"  },
-    { "path": "/cron/waitlist-nudges-3",  "schedule": "0 8 * * *"  },
-    { "path": "/cron/reengagement",       "schedule": "0 9 * * *"  },
-    { "path": "/cron/weekly-digest",      "schedule": "0 8 * * 0"  }
   ]
 }

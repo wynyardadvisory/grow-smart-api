@@ -6791,96 +6791,109 @@ app.post("/cron/nudge-unactivated", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
   res.json({ ok: true, status: "processing" });
-  try {
-    const result = await runNudgeUnactivated(supabaseService);
-    console.log("[NudgeUnactivated]", result);
-  } catch(e) { captureError("NudgeUnactivated", e); }
+  setImmediate(async () => {
+    try {
+      const result = await runNudgeUnactivated(supabaseService);
+      console.log("[NudgeUnactivated]", result);
+    } catch(e) { captureError("NudgeUnactivated", e); }
+  });
 });
 
 app.post("/cron/nudge-unconfirmed", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
   res.json({ ok: true, status: "processing" });
-  try {
-    const result = await runNudgeUnconfirmed(supabaseService);
-    console.log("[NudgeUnconfirmed]", result);
-  } catch(e) { captureError("NudgeUnconfirmed", e); }
+  setImmediate(async () => {
+    try {
+      const result = await runNudgeUnconfirmed(supabaseService);
+      console.log("[NudgeUnconfirmed]", result);
+    } catch(e) { captureError("NudgeUnconfirmed", e); }
+  });
 });
 
 app.post("/cron/feedback-sequence", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
   res.json({ ok: true, status: "processing" });
-  try {
-    const result = await runFeedbackSequence(supabaseService);
-    console.log("[FeedbackSequence]", result);
-  } catch(e) { captureError("FeedbackSequence", e); }
+  setImmediate(async () => {
+    try {
+      const result = await runFeedbackSequence(supabaseService);
+      console.log("[FeedbackSequence]", result);
+    } catch(e) { captureError("FeedbackSequence", e); }
+  });
 });
 
 app.post("/cron/waitlist-invites", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
   res.json({ ok: true, status: "processing" });
-  try {
-    const result = await runWaitlistInvites(supabaseService);
-    console.log("[WaitlistInvites]", result);
-  } catch(e) { captureError("WaitlistInvites", e); }
+  setImmediate(async () => {
+    try {
+      const result = await runWaitlistInvites(supabaseService);
+      console.log("[WaitlistInvites]", result);
+    } catch(e) { captureError("WaitlistInvites", e); }
+  });
 });
 
 app.post("/cron/waitlist-nudges", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-  try {
-    const result = await runWaitlistNudges(supabaseService);
-    res.json({ ok: true, ...result });
-  } catch(e) { captureError("WaitlistNudges", e); res.status(500).json({ error: e.message }); }
+  res.json({ ok: true, status: "processing" });
+  setImmediate(async () => {
+    try {
+      const result = await runWaitlistNudges(supabaseService);
+      console.log("[WaitlistNudges]", result);
+    } catch(e) { captureError("WaitlistNudges", e); }
+  });
 });
 
 app.post("/cron/waitlist-nudges-2", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-  try {
-    const result = await runWaitlistNudges2(supabaseService);
-    res.json({ ok: true, ...result });
-  } catch(e) { captureError("WaitlistNudges2", e); res.status(500).json({ error: e.message }); }
+  res.json({ ok: true, status: "processing" });
+  setImmediate(async () => {
+    try {
+      const result = await runWaitlistNudges2(supabaseService);
+      console.log("[WaitlistNudges2]", result);
+    } catch(e) { captureError("WaitlistNudges2", e); }
+  });
 });
 
 app.post("/cron/waitlist-nudges-3", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-  try {
-    const result = await runWaitlistNudges3(supabaseService);
-    res.json({ ok: true, ...result });
-  } catch(e) { captureError("WaitlistNudges3", e); res.status(500).json({ error: e.message }); }
+  res.json({ ok: true, status: "processing" });
+  setImmediate(async () => {
+    try {
+      const result = await runWaitlistNudges3(supabaseService);
+      console.log("[WaitlistNudges3]", result);
+    } catch(e) { captureError("WaitlistNudges3", e); }
+  });
 });
 
 app.post("/cron/reengagement", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
   res.json({ ok: true, status: "processing" });
-  try {
-    const result = await runReengagement(supabaseService);
-    console.log("[Reengagement]", result);
-  } catch(e) { captureError("Reengagement", e); }
+  setImmediate(async () => {
+    try {
+      const result = await runReengagement(supabaseService);
+      console.log("[Reengagement]", result);
+    } catch(e) { captureError("Reengagement", e); }
+  });
 });
 
 // POST /cron/weekly-digest — Sunday weekly email digest for no-push users with due tasks
-// Schedule in vercel.json: { "path": "/cron/weekly-digest", "schedule": "0 8 * * 0" }
-// (08:00 UTC every Sunday)
+// Managed by cron-job.org (08:00 UTC every Sunday)
 app.post("/cron/weekly-digest", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-
-  // Respond immediately so cron-job.org does not time out.
   res.json({ ok: true, status: "processing" });
-
   setImmediate(async () => {
     try {
       const result = await runWeeklyEmailDigest(supabaseService);
       console.log("[WeeklyDigest]", result);
-    } catch(e) {
-      captureError("WeeklyDigest", e);
-    }
+    } catch(e) { captureError("WeeklyDigest", e); }
   });
 });
 
