@@ -1408,7 +1408,7 @@ class RuleEngine {
 
       // Build normalised context once per crop
       const cropObs = recentObservations.filter(o => o.crop_id === crop.id);
-      const rainMm7dayActual = rainHistoryByLocation[locId] ?? null;
+      const rainMm7dayActual = rainHistoryByLocation[locId]?.total7day ?? null;
       const ctx = buildCropContext(crop, weather, envMods, userFeeds, cropObs, rainMm7dayActual);
       ctxMap.set(crop.id, ctx);
 
@@ -1496,12 +1496,19 @@ class RuleEngine {
 
       // Pull rain signals for this area's location
       const areaLocId          = areaCrops[0]?.area?.location_id || areaCrops[0]?.location_id || null;
-      const rainMm7dayActual   = areaLocId ? (rainHistoryByLocation?.[areaLocId] ?? null) : null;
+      const rainHistory        = areaLocId ? (rainHistoryByLocation?.[areaLocId] ?? null) : null;
+      const rainMm7dayActual   = rainHistory?.total7day ?? null;
+      const rainMm24hMax       = rainHistory?.max24h    ?? null;
       const rainForecast5day   = weather?.rain_mm_forecast_5day ?? null;
       const isOutdoor          = areaType !== "indoors" && areaType !== "greenhouse";
 
-      // Suppress if it rained more than 5mm today (existing gate)
+      // Suppress if it rained more than 5mm today (next 24h forecast gate)
       if (areaType !== "indoors" && rainMm !== null && rainMm >= 5) continue;
+
+      // Suppress if any forecast write in the last 24h predicted >= 5mm.
+      // This catches overnight rain that was forecast but has now passed —
+      // the next 24h forward forecast would show 0mm even though it just rained.
+      if (isOutdoor && rainMm24hMax !== null && rainMm24hMax >= 5) continue;
 
       // Suppress if it's been a genuinely wet week for outdoor areas — ground is already moist.
       // Greenhouse and indoors unaffected — rain doesn't reach them.
@@ -1925,7 +1932,7 @@ class RuleEngine {
 
       // Weather signals for urgency
       const locId            = crop.location_id || area.location_id;
-      const rainActual7day   = rainHistoryByLocation?.[locId] ?? null;
+      const rainActual7day   = rainHistoryByLocation?.[locId]?.total7day ?? null;
       const weather          = weatherByLocation?.[locId]    ?? null;
       const rainForecast5day = weather?.rain_mm_forecast_5day ?? null;
       const wetRecent        = rainActual7day   !== null && rainActual7day   > 15;
@@ -2373,22 +2380,30 @@ class RuleEngine {
 
   // Returns total rainfall (mm) over the last 7 days per location_id.
   // Queries weather_history which accumulates one row per cache refresh.
+  // Returns { [locId]: { total7day, max24h } } per location.
+  // max24h = the highest single rain_mm forecast value written in the last 24h.
+  // If any write predicted >= 5mm in the last 24h, it likely rained or was about to.
   // Returns {} if table is empty or not yet populated.
   async _loadRainHistory(userId) {
     if (!this.supabase) return {};
     const { data: locations } = await this.supabase
       .from("locations").select("id, postcode").eq("user_id", userId);
     const result = {};
-    const cutoff = new Date(Date.now() - 7 * 86400000).toISOString();
+    const cutoff7day = new Date(Date.now() - 7 * 86400000).toISOString();
+    const cutoff24h  = new Date(Date.now() - 24 * 3600000).toISOString();
     for (const loc of locations || []) {
       if (!loc.postcode) continue;
       const { data: rows } = await this.supabase
         .from("weather_history")
-        .select("rain_mm")
+        .select("rain_mm, recorded_at")
         .eq("postcode", loc.postcode)
-        .gte("recorded_at", cutoff);
+        .gte("recorded_at", cutoff7day);
       if (rows?.length) {
-        result[loc.id] = rows.reduce((sum, r) => sum + (r.rain_mm || 0), 0);
+        const total7day = rows.reduce((sum, r) => sum + (r.rain_mm || 0), 0);
+        const max24h    = rows
+          .filter(r => r.recorded_at >= cutoff24h)
+          .reduce((max, r) => Math.max(max, r.rain_mm || 0), 0);
+        result[loc.id] = { total7day, max24h };
       }
     }
     return result;
