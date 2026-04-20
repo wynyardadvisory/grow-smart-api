@@ -2913,6 +2913,9 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
       { data: pushOpenedRows },
       { data: pushByType },
 
+      // Push cron log — last 7 days
+      { data: pushCronLogRows },
+
       // Email analytics — last 30 days from email_events
       { data: emailDeliveredRows },
       { data: emailOpenedRows },
@@ -2961,6 +2964,9 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
       db.from("notification_events").select("id, notification_type").eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
       db.from("notification_events").select("id, notification_type").not("opened_at", "is", null).gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
       db.from("notification_events").select("notification_type, status").eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
+
+      // Push cron log — last 7 days
+      db.from("push_cron_log").select("push_window, eligible, sent, failed, no_candidate, ran_at").gte("ran_at", new Date(Date.now() - 7 * 86400000).toISOString()).order("ran_at", { ascending: true }),
 
       // Email analytics — last 30 days from email_events
       db.from("email_events").select("email_type").eq("event_type", "email.delivered").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
@@ -3074,6 +3080,16 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
         acc[r.notification_type] = (acc[r.notification_type] || 0) + 1;
         return acc;
       }, {}),
+
+      // Push cron log — 7-day breakdown by window
+      pushCronLog7d: (pushCronLogRows || []).map(r => ({
+        window:       r.push_window,
+        eligible:     r.eligible,
+        sent:         r.sent,
+        failed:       r.failed,
+        no_candidate: r.no_candidate,
+        ran_at:       r.ran_at,
+      })),
 
       // Email analytics — last 30 days
       emailDelivered30d: emailDeliveredRows?.length || 0,
@@ -6732,6 +6748,14 @@ app.post("/cron/push-morning", async (req, res) => {
       }
       const sendCounts = await sendBulkNotifications(supabaseService, eligible, "morning", tokenMap, tasksByUser);
       console.log(`[PushMorning] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
+      await supabaseService.from("push_cron_log").insert({
+        push_window:  "morning",
+        eligible:     eligible.length,
+        sent:         sendCounts.sent         || 0,
+        failed:       sendCounts.failed       || 0,
+        no_candidate: sendCounts.no_candidate || 0,
+        ran_at:       new Date().toISOString(),
+      }).catch(e => console.error("[PushMorning] Failed to write cron log:", e.message));
     } catch(e) {
       captureError("PushMorning", e);
     }
@@ -6756,6 +6780,14 @@ app.post("/cron/push-evening", async (req, res) => {
       }
       const sendCounts = await sendBulkNotifications(supabaseService, eligible, "evening", tokenMap, tasksByUser);
       console.log(`[PushEvening] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
+      await supabaseService.from("push_cron_log").insert({
+        push_window:  "evening",
+        eligible:     eligible.length,
+        sent:         sendCounts.sent         || 0,
+        failed:       sendCounts.failed       || 0,
+        no_candidate: sendCounts.no_candidate || 0,
+        ran_at:       new Date().toISOString(),
+      }).catch(e => console.error("[PushEvening] Failed to write cron log:", e.message));
     } catch(e) {
       captureError("PushEvening", e);
     }
