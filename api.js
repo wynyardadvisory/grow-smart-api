@@ -651,13 +651,13 @@ app.post("/locations", requireAuth,
   [body("name").trim().notEmpty()],
   async (req, res) => {
     if (!validate(req, res)) return;
-    const { name, postcode, latitude, longitude, orientation, notes } = req.body;
+    const { name, postcode, latitude, longitude, orientation, notes, country } = req.body;
     const width_m  = req.body.width_m  !== "" && req.body.width_m  != null ? Number(req.body.width_m)  : null;
     const length_m = req.body.length_m !== "" && req.body.length_m != null ? Number(req.body.length_m) : null;
     if (width_m  !== null && (isNaN(width_m)  || width_m  <= 0)) return res.status(400).json({ error: "width_m must be a positive number" });
     if (length_m !== null && (isNaN(length_m) || length_m <= 0)) return res.status(400).json({ error: "length_m must be a positive number" });
     const { data, error } = await req.db.from("locations")
-      .insert({ user_id: req.user.id, name, postcode, latitude, longitude, orientation, notes, width_m, length_m })
+      .insert({ user_id: req.user.id, name, postcode, latitude, longitude, orientation, notes, width_m, length_m, country: country || "GB" })
       .select().single();
     if (error) return res.status(500).json({ error: error.message });
     res.status(201).json(data);
@@ -5141,6 +5141,7 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
   const userId = req.user.id;
   const {
     name, postcode,
+    country,     // "GB" or "IE" — from frontend country picker
     crops,       // [{ name, crop_def_id, stage }]
     area_type,
     area_name,
@@ -5154,10 +5155,12 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "name, postcode, crops and area_type required" });
   }
 
+  const resolvedCountry = (country && COUNTRY_CONFIG[country]) ? country : "GB";
+
   try {
     // 1. Save profile — use supabaseService so it bypasses RLS and definitely commits
     // locations.user_id FK references profiles.id so profile MUST exist before location insert
-    const profileData = { id: userId, name, postcode };
+    const profileData = { id: userId, name, postcode, country: resolvedCountry, market: resolvedCountry };
     if (signup_source)               profileData.signup_source               = signup_source;
     if (signup_medium)               profileData.signup_medium               = signup_medium;
     if (signup_campaign)             profileData.signup_campaign             = signup_campaign;
@@ -5174,7 +5177,7 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
       locationId = existingLocs[0].id;
     } else {
       const { data: loc, error: locErr } = await supabaseService.from("locations").insert({
-        user_id: userId, name: "My garden", postcode,
+        user_id: userId, name: "My garden", postcode, country: resolvedCountry,
       }).select("id").single();
       if (locErr) throw new Error("Location: " + locErr.message);
       locationId = loc.id;
@@ -7303,11 +7306,39 @@ app.get("/subscription/status", requireAuth, async (req, res) => {
 // STRIPE — WEB SUBSCRIPTION CHECKOUT
 // =============================================================================
 
+// ── Country config — single source of truth for all market settings ───────────
+const COUNTRY_CONFIG = {
+  GB: {
+    postcodeLabel:       "Postcode",
+    postcodePlaceholder: "e.g. TS22",
+    postcodeHint:        "First part only — e.g. TS22, not TS22 5BQ",
+    postcodeRegex:       /^[A-Z]{1,2}[0-9][0-9A-Z]?$/i,
+    currency:            "GBP",
+    currencySymbol:      "£",
+    hemisphere:          "north",
+  },
+  IE: {
+    postcodeLabel:       "Eircode",
+    postcodePlaceholder: "e.g. A65 F4E2",
+    postcodeHint:        "Full Eircode — e.g. A65 F4E2",
+    postcodeRegex:       /^[A-Z][0-9]{2}\s?[A-Z0-9]{4}$/i,
+    currency:            "EUR",
+    currencySymbol:      "€",
+    hemisphere:          "north",
+  },
+};
+
 // ── Stripe price IDs — all tiers and intervals ───────────────────────────────
 const STRIPE_PRICES = {
-  loyalty:        { monthly: "price_1TL2MGD44o8wCiOZpMYxjCJV", annual: "price_1TL2MeD44o8wCiOZGML8xig4" },
-  early_supporter:{ monthly: "price_1TGz5jD44o8wCiOZIsEcIwBT", annual: "price_1TGz47D44o8wCiOZ9mG7HREJ" },
-  standard:       { monthly: "price_1TL2MyD44o8wCiOZQlbK4l1e", annual: "price_1TL2NGD44o8wCiOZG5yJjCKE" },
+  GB: {
+    loyalty:        { monthly: "price_1TL2MGD44o8wCiOZpMYxjCJV", annual: "price_1TL2MeD44o8wCiOZGML8xig4" },
+    early_supporter:{ monthly: "price_1TGz5jD44o8wCiOZIsEcIwBT", annual: "price_1TGz47D44o8wCiOZ9mG7HREJ" },
+    standard:       { monthly: "price_1TL2MyD44o8wCiOZQlbK4l1e", annual: "price_1TL2NGD44o8wCiOZG5yJjCKE" },
+  },
+  IE: {
+    early_supporter:{ monthly: "price_1TOH6bD44o8wCiOZgz2WO2TC", annual: "price_1TOH8AD44o8wCiOZVkASR5DW" },
+    standard:       { monthly: "price_1TOH8rD44o8wCiOZGM9rY0Nb", annual: "price_1TOH9SD44o8wCiOZ4haISlfZ" },
+  },
 };
 
 // ── Launch date ───────────────────────────────────────────────────────────────
@@ -7337,25 +7368,43 @@ function resolveUserPriceTier(profilePriceTier) {
 
 // GET /subscription/pricing
 // Returns the correct prices to show this user in the paywall.
+// Country-aware — IE users get EUR prices and € display.
 app.get("/subscription/pricing", requireAuth, async (req, res) => {
   try {
     const { data: profile } = await supabaseService
-      .from("profiles").select("price_tier").eq("id", req.user.id).single();
+      .from("profiles").select("price_tier, country").eq("id", req.user.id).single();
 
-    const tier   = resolveUserPriceTier(profile?.price_tier || "standard");
-    const prices = STRIPE_PRICES[tier] || STRIPE_PRICES.standard;
+    const country  = profile?.country || "GB";
+    const config   = COUNTRY_CONFIG[country] || COUNTRY_CONFIG.GB;
+    const sym      = config.currencySymbol;
+    const tier     = resolveUserPriceTier(profile?.price_tier || "standard");
+
+    // IE has no loyalty tier — fall back to early_supporter
+    const countryPrices = STRIPE_PRICES[country] || STRIPE_PRICES.GB;
+    const prices        = countryPrices[tier] || countryPrices.early_supporter || countryPrices.standard;
 
     const DISPLAY = {
-      loyalty:         { monthly: "£2.99", annual: "£29",  label: "Loyalty offer",         badge: "Your special price" },
-      early_supporter: { monthly: "£4.99", annual: "£49",  label: "Early supporter offer", badge: "Best value" },
-      standard:        { monthly: "£5.99", annual: "£59",  label: null,                    badge: "Best value" },
+      GB: {
+        loyalty:         { monthly: "£2.99", annual: "£29",  label: "Loyalty offer",         badge: "Your special price" },
+        early_supporter: { monthly: "£4.99", annual: "£49",  label: "Early supporter offer", badge: "Best value" },
+        standard:        { monthly: "£5.99", annual: "£59",  label: null,                    badge: "Best value" },
+      },
+      IE: {
+        early_supporter: { monthly: "€4.99", annual: "€49",  label: "Early supporter offer", badge: "Best value" },
+        standard:        { monthly: "€5.99", annual: "€59",  label: null,                    badge: "Best value" },
+      },
     };
+
+    const displayMap = DISPLAY[country] || DISPLAY.GB;
+    const display    = displayMap[tier] || displayMap.early_supporter || displayMap.standard;
 
     res.json({
       tier,
+      country,
+      currency: config.currency,
       monthly_price_id: prices.monthly,
       annual_price_id:  prices.annual,
-      display:          DISPLAY[tier],
+      display,
     });
   } catch (err) {
     captureError("SubscriptionPricing", err);
@@ -7373,13 +7422,15 @@ app.post("/subscription/create-checkout", requireAuth, async (req, res) => {
     // Resolve correct tier and price for this user
     const { data: profile } = await supabaseService
       .from("profiles")
-      .select("email, stripe_customer_id, price_tier")
+      .select("email, stripe_customer_id, price_tier, country")
       .eq("id", req.user.id)
       .single();
 
-    const tier    = resolveUserPriceTier(profile?.price_tier || "standard");
-    const prices  = STRIPE_PRICES[tier] || STRIPE_PRICES.standard;
-    const priceId = interval === "monthly" ? prices.monthly : prices.annual;
+    const country       = profile?.country || "GB";
+    const tier          = resolveUserPriceTier(profile?.price_tier || "standard");
+    const countryPrices = STRIPE_PRICES[country] || STRIPE_PRICES.GB;
+    const prices        = countryPrices[tier] || countryPrices.early_supporter || countryPrices.standard;
+    const priceId       = interval === "monthly" ? prices.monthly : prices.annual;
 
     let customerId = profile?.stripe_customer_id;
 
