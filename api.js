@@ -6839,76 +6839,70 @@ app.post("/cron/push-morning", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
 
-  // Respond immediately so cron-job.org does not time out.
-  // Notification sending runs in the background.
-  res.json({ ok: true, status: "processing" });
-
-  setImmediate(async () => {
-    let eligible = [], sendCounts = { sent: 0, failed: 0, no_candidate: 0 };
-    try {
-      const result = await buildEligibleUserSet("morning");
-      eligible = result.eligible;
-      const { tokenMap, tasksByUser } = result;
-      console.log(`[PushMorning] Pre-filter: ${JSON.stringify(result.counts)}`);
-      if (!eligible.length) {
-        console.log("[PushMorning] No eligible users — done.");
-      } else {
-        console.log(`[PushMorning] Starting send for ${eligible.length} users`);
-        sendCounts = await sendBulkNotifications(supabaseService, eligible, "morning", tokenMap, tasksByUser);
-        console.log(`[PushMorning] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
-      }
-    } catch(e) {
-      console.error("[PushMorning] Error:", e.message);
-      captureError("PushMorning", e);
+  // Process synchronously — Promise.all in sendBulkNotifications makes this fast (~2s for 200 users)
+  // setImmediate caused Vercel to kill the process before sends completed
+  let eligible = [], sendCounts = { sent: 0, failed: 0, no_candidate: 0 };
+  try {
+    const result = await buildEligibleUserSet("morning");
+    eligible = result.eligible;
+    const { tokenMap, tasksByUser } = result;
+    console.log(`[PushMorning] Pre-filter: ${JSON.stringify(result.counts)}`);
+    if (!eligible.length) {
+      console.log("[PushMorning] No eligible users — done.");
+    } else {
+      console.log(`[PushMorning] Starting send for ${eligible.length} users`);
+      sendCounts = await sendBulkNotifications(supabaseService, eligible, "morning", tokenMap, tasksByUser);
+      console.log(`[PushMorning] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
     }
-    // Always write cron log — even on error, so we have visibility
-    await supabaseService.from("push_cron_log").insert({
-      push_window:  "morning",
-      eligible:     eligible.length,
-      sent:         sendCounts.sent         || 0,
-      failed:       sendCounts.failed       || 0,
-      no_candidate: sendCounts.no_candidate || 0,
-      ran_at:       new Date().toISOString(),
-    }).catch(e => console.error("[PushMorning] Failed to write cron log:", e.message));
-  });
+  } catch(e) {
+    console.error("[PushMorning] Error:", e.message);
+    captureError("PushMorning", e);
+  }
+  // Always write cron log — even on error
+  await supabaseService.from("push_cron_log").insert({
+    push_window:  "morning",
+    eligible:     eligible.length,
+    sent:         sendCounts.sent         || 0,
+    failed:       sendCounts.failed       || 0,
+    no_candidate: sendCounts.no_candidate || 0,
+    ran_at:       new Date().toISOString(),
+  }).catch(e => console.error("[PushMorning] Failed to write cron log:", e.message));
+  res.json({ ok: true, eligible: eligible.length, ...sendCounts });
 });
 
 app.post("/cron/push-evening", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
 
-  // Respond immediately so cron-job.org does not time out.
-  // Notification sending runs in the background.
-  res.json({ ok: true, status: "processing" });
-
-  setImmediate(async () => {
-    let eligible = [], sendCounts = { sent: 0, failed: 0, no_candidate: 0 };
-    try {
-      const result = await buildEligibleUserSet("evening");
-      eligible = result.eligible;
-      const { tokenMap, tasksByUser } = result;
-      console.log(`[PushEvening] Pre-filter: ${JSON.stringify(result.counts)}`);
-      if (!eligible.length) {
-        console.log("[PushEvening] No eligible users — done.");
-      } else {
-        console.log(`[PushEvening] Starting send for ${eligible.length} users`);
-        sendCounts = await sendBulkNotifications(supabaseService, eligible, "evening", tokenMap, tasksByUser);
-        console.log(`[PushEvening] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
-      }
-    } catch(e) {
-      console.error("[PushEvening] Error:", e.message);
-      captureError("PushEvening", e);
+  // Process synchronously — Promise.all in sendBulkNotifications makes this fast (~2s for 200 users)
+  // setImmediate caused Vercel to kill the process before sends completed
+  let eligible = [], sendCounts = { sent: 0, failed: 0, no_candidate: 0 };
+  try {
+    const result = await buildEligibleUserSet("evening");
+    eligible = result.eligible;
+    const { tokenMap, tasksByUser } = result;
+    console.log(`[PushEvening] Pre-filter: ${JSON.stringify(result.counts)}`);
+    if (!eligible.length) {
+      console.log("[PushEvening] No eligible users — done.");
+    } else {
+      console.log(`[PushEvening] Starting send for ${eligible.length} users`);
+      sendCounts = await sendBulkNotifications(supabaseService, eligible, "evening", tokenMap, tasksByUser);
+      console.log(`[PushEvening] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
     }
-    // Always write cron log — even on error, so we have visibility
-    await supabaseService.from("push_cron_log").insert({
-      push_window:  "evening",
-      eligible:     eligible.length,
-      sent:         sendCounts.sent         || 0,
-      failed:       sendCounts.failed       || 0,
-      no_candidate: sendCounts.no_candidate || 0,
-      ran_at:       new Date().toISOString(),
-    }).catch(e => console.error("[PushEvening] Failed to write cron log:", e.message));
-  });
+  } catch(e) {
+    console.error("[PushEvening] Error:", e.message);
+    captureError("PushEvening", e);
+  }
+  // Always write cron log — even on error
+  await supabaseService.from("push_cron_log").insert({
+    push_window:  "evening",
+    eligible:     eligible.length,
+    sent:         sendCounts.sent         || 0,
+    failed:       sendCounts.failed       || 0,
+    no_candidate: sendCounts.no_candidate || 0,
+    ran_at:       new Date().toISOString(),
+  }).catch(e => console.error("[PushEvening] Failed to write cron log:", e.message));
+  res.json({ ok: true, eligible: eligible.length, ...sendCounts });
 });
 
 // POST /cron/push-dry-run — verify eligibility without sending anything

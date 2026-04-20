@@ -480,11 +480,13 @@ async function sendNotification(supabase, userId, candidate, preloadedTokens) {
 async function sendBulkNotifications(supabase, eligible, window, tokenMap, tasksByUser) {
   if (!setupVapid()) return { sent: 0, reason: "vapid_not_configured" };
   const counts = { sent: 0, failed: 0, no_candidate: 0 };
-  for (const userId of eligible) {
+
+  // Process all users in parallel — sequential sends time out on Vercel at scale
+  await Promise.all(eligible.map(async (userId) => {
     try {
       const candidates = buildCandidatesFromCache(userId, window, tasksByUser);
       const candidate  = selectCandidate(candidates);
-      if (!candidate) { counts.no_candidate++; continue; }
+      if (!candidate) { counts.no_candidate++; return; }
       const tokens = tokenMap[userId] || [];
       const result = await sendNotification(supabase, userId, candidate, tokens);
       if (result.sent) counts.sent++;
@@ -493,7 +495,8 @@ async function sendBulkNotifications(supabase, eligible, window, tokenMap, tasks
       console.error(`[Push] Bulk send error for ${userId}:`, e.message);
       counts.failed++;
     }
-  }
+  }));
+
   return counts;
 }
 
