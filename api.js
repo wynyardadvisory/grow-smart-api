@@ -6859,14 +6859,16 @@ app.post("/cron/push-morning", async (req, res) => {
     captureError("PushMorning", e);
   }
   // Always write cron log — even on error
-  await supabaseService.from("push_cron_log").insert({
-    push_window:  "morning",
-    eligible:     eligible.length,
-    sent:         sendCounts.sent         || 0,
-    failed:       sendCounts.failed       || 0,
-    no_candidate: sendCounts.no_candidate || 0,
-    ran_at:       new Date().toISOString(),
-  }).catch(e => console.error("[PushMorning] Failed to write cron log:", e.message));
+  try {
+    await supabaseService.from("push_cron_log").insert({
+      push_window:  "morning",
+      eligible:     eligible.length,
+      sent:         sendCounts.sent         || 0,
+      failed:       sendCounts.failed       || 0,
+      no_candidate: sendCounts.no_candidate || 0,
+      ran_at:       new Date().toISOString(),
+    });
+  } catch(logErr) { console.error("[PushMorning] Failed to write cron log:", logErr.message); }
   res.json({ ok: true, eligible: eligible.length, ...sendCounts });
 });
 
@@ -6894,14 +6896,16 @@ app.post("/cron/push-evening", async (req, res) => {
     captureError("PushEvening", e);
   }
   // Always write cron log — even on error
-  await supabaseService.from("push_cron_log").insert({
-    push_window:  "evening",
-    eligible:     eligible.length,
-    sent:         sendCounts.sent         || 0,
-    failed:       sendCounts.failed       || 0,
-    no_candidate: sendCounts.no_candidate || 0,
-    ran_at:       new Date().toISOString(),
-  }).catch(e => console.error("[PushEvening] Failed to write cron log:", e.message));
+  try {
+    await supabaseService.from("push_cron_log").insert({
+      push_window:  "evening",
+      eligible:     eligible.length,
+      sent:         sendCounts.sent         || 0,
+      failed:       sendCounts.failed       || 0,
+      no_candidate: sendCounts.no_candidate || 0,
+      ran_at:       new Date().toISOString(),
+    });
+  } catch(logErr) { console.error("[PushEvening] Failed to write cron log:", logErr.message); }
   res.json({ ok: true, eligible: eligible.length, ...sendCounts });
 });
 
