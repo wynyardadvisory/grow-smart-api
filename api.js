@@ -1942,11 +1942,21 @@ app.post("/tasks/:id/complete", requireAuth, async (req, res) => {
     } else if (data.task_type === "mulch" || data.task_type === "prune" || data.task_type === "thin" || data.task_type === "monitor" || data.task_type === "check") {
       // These tasks use window-based source keys (month/week anchor).
       // Completing them means the current window key is marked done — engine
-      // will not regenerate until next window period. No crop state update needed.
-      // Touch updated_at so dashboard reflects activity.
-      await supabaseService.from("crop_instances")
-        .update({ updated_at: completedAt })
-        .eq("id", data.crop_instance_id).eq("user_id", req.user.id);
+      // will not regenerate until next window period.
+
+      if (data.rule_id === "weeding_due" && data.area_id) {
+        // Weeding is area-level — write last_weeded_at to growing_areas so the
+        // rule engine suppresses regeneration for the cadence window (14 days).
+        await supabaseService.from("growing_areas")
+          .update({ last_weeded_at: completedAt, updated_at: completedAt })
+          .eq("id", data.area_id);
+        await runRuleEngine(req.user.id);
+      } else if (data.crop_instance_id) {
+        // Crop-level check — touch updated_at so dashboard reflects activity.
+        await supabaseService.from("crop_instances")
+          .update({ updated_at: completedAt })
+          .eq("id", data.crop_instance_id).eq("user_id", req.user.id);
+      }
 
     } else if (data.task_type === "sow" && transition === "sown") {
       const sowMethod = meta.sow_method || "outdoors";
