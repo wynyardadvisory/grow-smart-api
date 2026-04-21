@@ -150,7 +150,8 @@ app.use(cors({ origin: (origin, cb) => {
   const allowed = !origin
     || allowedOrigins.includes(origin)
     || /^https:\/\/grow-smart-frontend-staging.*\.vercel\.app$/.test(origin)
-    || /^https:\/\/grow-smart-frontend.*wynyardadvisorys-projects\.vercel\.app$/.test(origin);
+    || /^https:\/\/grow-smart-frontend.*wynyardadvisorys-projects\.vercel\.app$/.test(origin)
+    || /^https?:\/\/localhost(:\d+)?$/.test(origin);  // Android Capacitor WebView (any port)
   cb(null, allowed);
 }}));
 // ── Stripe webhook — must be registered BEFORE express.json() ─────────────────
