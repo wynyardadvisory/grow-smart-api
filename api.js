@@ -1454,7 +1454,7 @@ app.post("/crops", requireAuth,
       establishment_method, quantity, notes,
       start_date_confidence, source, status,
       is_other_crop, is_other_variety,
-      barcode,
+      barcode, lifecycle_mode,
     } = req.body;
 
     // For "other crop" free-text entries, normalise the name.
@@ -1488,6 +1488,7 @@ app.post("/crops", requireAuth,
       photo_url:            null,
       start_date_confidence:start_date_confidence || "exact",
       source:               source || "manual",
+      lifecycle_mode:       lifecycle_mode || "seasonal",
     }).select().single();
 
     if (error) return res.status(500).json({ error: error.message });
