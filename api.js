@@ -7312,7 +7312,8 @@ app.get("/subscription/status", requireAuth, async (req, res) => {
       .from("profiles")
       .select("plan, pro_expires_at, pro_source")
       .eq("id", req.user.id)
-      .single();
+      .limit(1)
+      .maybeSingle();
 
     if (error) throw error;
 
