@@ -5180,10 +5180,7 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
     signup_source_self_reported,
   } = req.body;
 
-  // Apple Sign In does not re-submit name — fall back to auth user metadata
-  const resolvedName = name?.trim() || req.user.user_metadata?.full_name || req.user.user_metadata?.name || null;
-
-  if (!resolvedName || !postcode || !crops?.length || !area_type) {
+  if (!name || !postcode || !crops?.length || !area_type) {
     return res.status(400).json({ error: "name, postcode, crops and area_type required" });
   }
 
@@ -5192,7 +5189,7 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
   try {
     // 1. Save profile — use supabaseService so it bypasses RLS and definitely commits
     // locations.user_id FK references profiles.id so profile MUST exist before location insert
-    const profileData = { id: userId, name: resolvedName, postcode, country: resolvedCountry, market: resolvedCountry };
+    const profileData = { id: userId, name: name.trim(), postcode, country: resolvedCountry, market: resolvedCountry };
     if (signup_source)               profileData.signup_source               = signup_source;
     if (signup_medium)               profileData.signup_medium               = signup_medium;
     if (signup_campaign)             profileData.signup_campaign             = signup_campaign;
