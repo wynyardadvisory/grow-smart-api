@@ -2909,8 +2909,8 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
       { data: feedbackRatings },
 
       // Push analytics — last 7 days
-      { data: pushSentRows },
-      { data: pushOpenedRows },
+      { count: pushSent7dCount },
+      { count: pushOpened7dCount },
       { data: pushByType },
 
       // Push cron log — last 7 days
@@ -2961,9 +2961,9 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
       db.from("feedback").select("rating").not("rating", "is", null).not("user_id", "in", demoExclude),
 
       // Push analytics — last 7 days
-      db.from("notification_events").select("id, notification_type").eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
-      db.from("notification_events").select("id, notification_type").not("opened_at", "is", null).gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
-      db.from("notification_events").select("notification_type, status").eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
+      db.from("notification_events").select("*", { count: "exact", head: true }).eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
+      db.from("notification_events").select("*", { count: "exact", head: true }).not("opened_at", "is", null).gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
+      db.from("notification_events").select("notification_type, status").eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude).limit(5000),
 
       // Push cron log — last 7 days
       db.from("push_cron_log").select("push_window, eligible, sent, failed, no_candidate, ran_at").gte("ran_at", new Date(Date.now() - 7 * 86400000).toISOString()).order("ran_at", { ascending: true }),
@@ -3073,9 +3073,9 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
       pushOptIn:  totalActivated > 0 ? Math.round((pushTokens / totalActivated) * 100) : 0,
 
       // Push analytics — last 7 days
-      pushSent7d:   pushSentRows?.length || 0,
-      pushOpened7d: pushOpenedRows?.length || 0,
-      pushCTR7d:    pushSentRows?.length > 0 ? Math.round(((pushOpenedRows?.length || 0) / pushSentRows.length) * 100) : null,
+      pushSent7d:   pushSent7dCount || 0,
+      pushOpened7d: pushOpened7dCount || 0,
+      pushCTR7d:    pushSent7dCount > 0 ? Math.round(((pushOpened7dCount || 0) / pushSent7dCount) * 100) : null,
       pushByType7d: (pushByType || []).reduce((acc, r) => {
         acc[r.notification_type] = (acc[r.notification_type] || 0) + 1;
         return acc;
