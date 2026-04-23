@@ -2917,10 +2917,10 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
       { data: pushCronLogRows },
 
       // Email analytics — last 30 days from email_events
-      { data: emailDeliveredRows },
-      { data: emailOpenedRows },
-      { data: emailClickedRows },
-      { data: emailBouncedRows },
+      { count: emailDelivered30dCount },
+      { count: emailOpened30dCount },
+      { count: emailClicked30dCount },
+      { count: emailBounced30dCount },
 
       // Activity signals — all user-initiated actions with timestamps
       // Used for DAU / WAU / MAU / retention. Pulled wide (30 days) so we
@@ -2968,11 +2968,11 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
       // Push cron log — last 7 days
       db.from("push_cron_log").select("push_window, eligible, sent, failed, no_candidate, ran_at").gte("ran_at", new Date(Date.now() - 7 * 86400000).toISOString()).order("ran_at", { ascending: true }),
 
-      // Email analytics — last 30 days from email_events
-      db.from("email_events").select("email_type").eq("event_type", "email.delivered").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
-      db.from("email_events").select("email_type").eq("event_type", "email.opened").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
-      db.from("email_events").select("email_type").eq("event_type", "email.clicked").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
-      db.from("email_events").select("email_type").eq("event_type", "email.bounced").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
+      // Email analytics — last 30 days from email_events (count only to avoid 1000 row cap)
+      db.from("email_events").select("*", { count: "exact", head: true }).eq("event_type", "email.delivered").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
+      db.from("email_events").select("*", { count: "exact", head: true }).eq("event_type", "email.opened").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
+      db.from("email_events").select("*", { count: "exact", head: true }).eq("event_type", "email.clicked").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
+      db.from("email_events").select("*", { count: "exact", head: true }).eq("event_type", "email.bounced").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
 
     ]);
 
@@ -3092,17 +3092,14 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
       })),
 
       // Email analytics — last 30 days
-      emailDelivered30d: emailDeliveredRows?.length || 0,
-      emailOpened30d:    emailOpenedRows?.length || 0,
-      emailClicked30d:   emailClickedRows?.length || 0,
-      emailBounced30d:   emailBouncedRows?.length || 0,
-      emailOpenRate30d:  emailDeliveredRows?.length > 0 ? Math.round(((emailOpenedRows?.length || 0) / emailDeliveredRows.length) * 100) : null,
-      emailClickRate30d: emailDeliveredRows?.length > 0 ? Math.round(((emailClickedRows?.length || 0) / emailDeliveredRows.length) * 100) : null,
-      emailBounceRate30d: emailDeliveredRows?.length > 0 ? Math.round(((emailBouncedRows?.length || 0) / emailDeliveredRows.length) * 100) : null,
-      emailOpensByType30d: (emailOpenedRows || []).reduce((acc, r) => {
-        if (r.email_type) acc[r.email_type] = (acc[r.email_type] || 0) + 1;
-        return acc;
-      }, {}),
+      emailDelivered30d: emailDelivered30dCount || 0,
+      emailOpened30d:    emailOpened30dCount || 0,
+      emailClicked30d:   emailClicked30dCount || 0,
+      emailBounced30d:   emailBounced30dCount || 0,
+      emailOpenRate30d:  emailDelivered30dCount > 0 ? Math.round(((emailOpened30dCount || 0) / emailDelivered30dCount) * 100) : null,
+      emailClickRate30d: emailDelivered30dCount > 0 ? Math.round(((emailClicked30dCount || 0) / emailDelivered30dCount) * 100) : null,
+      emailBounceRate30d: emailDelivered30dCount > 0 ? Math.round(((emailBounced30dCount || 0) / emailDelivered30dCount) * 100) : null,
+      emailOpensByType30d: {},
 
       // Feedback
       avgRating: feedbackRatings?.length > 0
