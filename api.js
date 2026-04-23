@@ -5389,7 +5389,14 @@ app.post("/admin/onboarding-recovery-email", requireAuth, requireAdmin, async (r
 //   - Haven't already received this email
 // Safe to call multiple times — idempotent via email_log check.
 // =============================================================================
-app.post("/admin/reengagement-email", requireAuth, requireAdmin, async (req, res) => {
+app.post("/admin/reengagement-email", async (req, res) => {
+  const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET;
+  if (!cronAuth) {
+    const header = req.headers.authorization;
+    if (!header?.startsWith("Bearer ")) return res.status(401).json({ error: "Missing auth token" });
+    const { data: { user }, error } = await supabaseService.auth.getUser(header.split(" ")[1]);
+    if (error || !user || user.email !== "mark@wynyardadvisory.co.uk") return res.status(403).json({ error: "Forbidden" });
+  }
   const dryRun = req.body?.dry_run === true;
   try {
     // Get all auth users
