@@ -5379,6 +5379,201 @@ app.post("/admin/onboarding-recovery-email", requireAuth, requireAdmin, async (r
   }
 });
 
+// =============================================================================
+// ADMIN — re-engagement email for churned users with 5+ crops
+// POST /admin/reengagement-email
+// Sends a personalised re-engagement email to users who:
+//   - Have 5+ active crops
+//   - Haven't opened the app in 14+ days
+//   - Haven't unsubscribed from email
+//   - Haven't already received this email
+// Safe to call multiple times — idempotent via email_log check.
+// =============================================================================
+app.post("/admin/reengagement-email", requireAuth, requireAdmin, async (req, res) => {
+  const dryRun = req.body?.dry_run === true;
+  try {
+    // Get all auth users
+    const authUsers = await getAllAuthUsers();
+    const allUserIds = authUsers.map(u => u.id);
+
+    // Get profiles with last_seen_at
+    const { data: profiles } = await supabaseService
+      .from("profiles")
+      .select("id, name, email_unsubscribed, last_seen_at")
+      .eq("is_demo", false)
+      .in("id", allUserIds);
+
+    const FOURTEEN_DAYS_AGO = new Date(Date.now() - 14 * 86400000).toISOString();
+    const EXCLUDED = ["demo@vercro.com", "appdemo@vercro.com", "mark@wynyardadvisory.co.uk"];
+
+    // Filter to churned, reachable profiles
+    const candidateProfiles = (profiles || []).filter(p =>
+      p.last_seen_at &&
+      p.last_seen_at < FOURTEEN_DAYS_AGO &&
+      (p.email_unsubscribed === false || p.email_unsubscribed === null)
+    );
+    const candidateIds = candidateProfiles.map(p => p.id);
+
+    // Get crop counts for candidates in one query
+    const cropCounts = {};
+    if (candidateIds.length > 0) {
+      for (let i = 0; i < candidateIds.length; i += 200) {
+        const chunk = candidateIds.slice(i, i + 200);
+        const { data: crops } = await supabaseService
+          .from("crop_instances")
+          .select("user_id")
+          .in("user_id", chunk)
+          .eq("active", true);
+        for (const c of crops || []) {
+          cropCounts[c.user_id] = (cropCounts[c.user_id] || 0) + 1;
+        }
+      }
+    }
+
+    // Filter to 5+ crops
+    const eligibleProfiles = candidateProfiles.filter(p => (cropCounts[p.id] || 0) >= 5);
+    const eligibleIds = eligibleProfiles.map(p => p.id);
+
+    // Skip anyone already sent this email
+    const { data: alreadySent } = await supabaseService
+      .from("email_log")
+      .select("user_id")
+      .eq("email_type", "reengagement_march_2026")
+      .in("user_id", eligibleIds);
+    const alreadySentIds = new Set((alreadySent || []).map(e => e.user_id));
+
+    // Build final send list — join with auth users for email address
+    const authUserMap = {};
+    for (const u of authUsers) authUserMap[u.id] = u;
+
+    const toSend = eligibleProfiles.filter(p =>
+      !alreadySentIds.has(p.id) &&
+      authUserMap[p.id]?.email &&
+      !EXCLUDED.includes(authUserMap[p.id].email)
+    );
+
+    if (dryRun) {
+      return res.json({
+        dry_run: true,
+        would_send: toSend.length,
+        already_sent: alreadySentIds.size,
+        eligible: eligibleProfiles.length,
+        sample: toSend.slice(0, 5).map(p => ({
+          email: authUserMap[p.id]?.email,
+          name: p.name,
+          crop_count: cropCounts[p.id] || 0,
+        })),
+      });
+    }
+
+    const results = [];
+    for (const profile of toSend) {
+      const user = authUserMap[profile.id];
+      if (!user?.email) continue;
+
+      const firstName = (profile.name || user.email.split("@")[0]).split(" ")[0];
+      const cropCount = cropCounts[profile.id] || 0;
+
+      try {
+        const resp = await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${process.env.RESEND_API_KEY}`,
+          },
+          body: JSON.stringify({
+            from: "Mark at Vercro <hello@vercro.com>",
+            to: user.email,
+            subject: "Your garden needs attention this week 🌱",
+            html: `
+              <div style="font-family: Georgia, serif; max-width: 520px; margin: 0 auto; padding: 40px 24px; color: #1A2E28;">
+                <div style="font-size: 28px; margin-bottom: 16px;">🌱</div>
+
+                <p style="font-size: 16px; line-height: 1.7; margin: 0 0 16px; color: #333;">
+                  Hi ${firstName},
+                </p>
+
+                <p style="font-size: 16px; line-height: 1.7; margin: 0 0 16px; color: #333;">
+                  A quick nudge about your garden.
+                </p>
+
+                <p style="font-size: 16px; line-height: 1.7; margin: 0 0 16px; color: #333;">
+                  Back in March, you set up <strong>${cropCount} crops</strong> in Vercro — that's a serious amount of growing.
+                </p>
+
+                <p style="font-size: 16px; line-height: 1.7; margin: 0 0 16px; color: #333;">
+                  Right now is a key moment for those plants. Anything sown in March is likely at a stage where it needs attention — thinning out, potting on, hardening off, feeding, or just a quick check to keep things on track. Miss this window and you'll feel it come harvest time.
+                </p>
+
+                <p style="font-size: 16px; line-height: 1.7; margin: 0 0 16px; color: #333;">
+                  We had a technical issue in March that affected task plans for some users. It's fully resolved — and if you open the app today, you'll see a fresh set of tasks based on exactly where your garden should be right now. No setup needed.
+                </p>
+
+                <p style="font-size: 16px; line-height: 1.7; margin: 0 0 24px; color: #333;">
+                  The plan is more accurate than it's ever been. There's also a new photo diagnosis tool — take a picture of any plant and get an instant read on what's wrong. Useful at this time of year when pests and problems start showing up.
+                </p>
+
+                <a href="https://app.vercro.com" style="display: inline-block; background: #1E3D2F; color: #F4F0E8; text-decoration: none; padding: 14px 32px; border-radius: 10px; font-size: 16px; font-weight: 700; margin-bottom: 32px;">
+                  Open your garden →
+                </a>
+
+                <p style="font-size: 16px; line-height: 1.7; margin: 24px 0 8px; color: #333;">
+                  No pressure — just didn't want you to miss this window.
+                </p>
+
+                <p style="font-size: 16px; line-height: 1.7; margin: 0 0 32px; color: #333;">
+                  — Mark
+                </p>
+
+                <hr style="border: none; border-top: 1px solid #eee; margin: 0 0 24px;" />
+
+                <p style="font-size: 14px; color: #888; line-height: 1.6; margin: 0 0 12px;">
+                  P.S. Vercro is now on the App Store if you'd prefer it on your phone.
+                </p>
+
+                <a href="https://apps.apple.com/app/vercro/id6761921895" style="display: inline-block;">
+                  <img src="https://developer.apple.com/assets/elements/badges/download-on-the-app-store.svg" alt="Download on the App Store" style="height: 40px;" />
+                </a>
+
+                <hr style="border: none; border-top: 1px solid #eee; margin: 24px 0;" />
+                <p style="font-size: 12px; color: #aaa; margin: 0;">vercro.com · Built for home growers</p>
+              </div>
+            `,
+          }),
+        });
+
+        if (resp.ok) {
+          const resendData = await resp.json();
+          await supabaseService.from("email_log").insert({
+            user_id:        profile.id,
+            email_type:     "reengagement_march_2026",
+            sent_at:        new Date().toISOString(),
+            resend_email_id: resendData.id || null,
+          });
+          results.push({ email: user.email, status: "sent" });
+        } else {
+          const err = await resp.json();
+          results.push({ email: user.email, status: "failed", error: err });
+        }
+      } catch (e) {
+        results.push({ email: user.email, status: "error", error: e.message });
+      }
+    }
+
+    res.json({
+      eligible:     eligibleProfiles.length,
+      already_sent: alreadySentIds.size,
+      attempted:    toSend.length,
+      sent:         results.filter(r => r.status === "sent").length,
+      failed:       results.filter(r => r.status !== "sent").length,
+      results,
+    });
+  } catch (err) {
+    console.error("[ReengagementEmail]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /demo/reset — wipe and re-seed the demo account (demo users only)
 app.post("/demo/reset", requireAuth, async (req, res) => {
   const userId = req.user.id;
