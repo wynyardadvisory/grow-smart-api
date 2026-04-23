@@ -1725,6 +1725,51 @@ class RuleEngine {
       }
     }
 
+    // ── No-rules-def safety net ───────────────────────────────────────────────
+    // If a user still has zero surfaced candidates after the null-def check,
+    // they may have crops with a valid crop_def_id but no crop_rules rows behind it
+    // (e.g. Potatoes, which has potato-type-specific logic but no generic rules).
+    // The engine produces nothing and the user sees an empty Today screen.
+    // Surface one gentle check task per affected active crop (max 3) so the user
+    // always sees something after activation.
+    if (finalCandidates.length === 0) {
+      const today = todayISO();
+      // Crops that have a def (so weren't caught above) but are active and non-finished
+      const noRulesCrops = crops.filter(c =>
+        c.crop_def &&
+        c.active &&
+        c.status !== "planned" &&
+        c.status !== "finished"
+      );
+      const noRulesFallbacks = noRulesCrops.slice(0, 3).map(c => ({
+        user_id:          userId,
+        crop_instance_id: c.id,
+        area_id:          c.area_id,
+        action:           `Check on your ${c.name} — note how it's looking and log anything unusual`,
+        task_type:        "check",
+        urgency:          "low",
+        due_date:         today,
+        scheduled_for:    today,
+        visible_from:     today,
+        expires_at:       new Date(today + "T23:59:59Z").toISOString(),
+        status:           "due",
+        engine_type:      "scheduled",
+        record_type:      "task",
+        source:           "rule_engine",
+        rule_id:          "no_rules_fallback",
+        source_key:       sourceKey({ u: userId, c: c.id, r: "no_rules_fallback", d: today }),
+        date_confidence:  "approximate",
+        surface_class:    "task",
+        meta:             JSON.stringify({ no_rules: true }),
+        risk_payload:     null,
+        _score:           35,
+      }));
+      if (noRulesFallbacks.length > 0) {
+        console.log(`[RuleEngine] No-rules fallback: ${noRulesFallbacks.length} task(s) for user=${userId}`);
+        finalCandidates = noRulesFallbacks;
+      }
+    }
+
     // ── Run-level logging — always emit so suppression rates are visible ────────
     const nTask       = surfaced.length;
     const nSuppressed = suppressed.length;
