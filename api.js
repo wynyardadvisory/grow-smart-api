@@ -5424,7 +5424,9 @@ app.post("/admin/reengagement-email", async (req, res) => {
 
     // Filter to March cohort, churned, reachable profiles
     const candidateProfiles = (profiles || []).filter(p => {
-      const signupAt = authUserMap[p.id]?.created_at;
+      const rawSignup = authUserMap[p.id]?.created_at;
+      if (!rawSignup) return false;
+      const signupAt = new Date(rawSignup).toISOString();
       return (
         signupAt >= COHORT_START &&
         signupAt <= COHORT_END &&
