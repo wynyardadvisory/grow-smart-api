@@ -2963,7 +2963,7 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
       // Push analytics — last 7 days
       db.from("notification_events").select("*", { count: "exact", head: true }).eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
       db.from("notification_events").select("*", { count: "exact", head: true }).not("opened_at", "is", null).gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
-      db.from("notification_events").select("notification_type, status").eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude).limit(5000),
+      db.from("notification_events").select("notification_type, status").eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).limit(5000),
 
       // Push cron log — last 7 days
       db.from("push_cron_log").select("push_window, eligible, sent, failed, no_candidate, ran_at").gte("ran_at", new Date(Date.now() - 7 * 86400000).toISOString()).order("ran_at", { ascending: true }),
