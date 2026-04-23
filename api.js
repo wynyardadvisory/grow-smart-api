@@ -3109,6 +3109,93 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
         ? (feedbackRatings.reduce((s, f) => s + (f.rating || 0), 0) / feedbackRatings.length).toFixed(1)
         : null,
       totalFeedback: feedbackRatings?.length || 0,
+
+      // Revenue
+      revenue: await (async () => {
+        try {
+          const { data: proProfiles } = await db
+            .from("profiles")
+            .select("id, plan, pro_source, stripe_customer_id, price_tier, pro_expires_at, market")
+            .eq("plan", "pro")
+            .eq("is_demo", false);
+
+          const pros = proProfiles || [];
+
+          const stripeProfiles    = pros.filter(p => p.stripe_customer_id);
+          const rcProfiles        = pros.filter(p => p.pro_source && p.pro_source.startsWith("revenuecat") && !p.stripe_customer_id);
+          const totalPro          = pros.length;
+          const stripeCount       = stripeProfiles.length;
+          const rcCount           = rcProfiles.length;
+          const conversionRate    = totalActivated > 0 ? Math.round((totalPro / totalActivated) * 100) : null;
+
+          // Price tier breakdown
+          const loyalty           = pros.filter(p => p.price_tier === "loyalty").length;
+          const earlySupporter    = pros.filter(p => p.price_tier === "early_supporter").length;
+          const standard          = pros.filter(p => p.price_tier === "standard").length;
+
+          // Billing period — from pro_source e.g. "stripe:monthly", "revenuecat:annual"
+          const monthlyCount      = pros.filter(p => p.pro_source && p.pro_source.includes("monthly")).length;
+          const annualCount       = pros.filter(p => p.pro_source && p.pro_source.includes("annual")).length;
+          const trialCount        = pros.filter(p => p.pro_source && p.pro_source.includes("trial")).length;
+
+          // Churned — had plan=pro previously, now free, with a stripe_customer_id
+          const { count: churnedCount } = await db
+            .from("profiles")
+            .select("*", { count: "exact", head: true })
+            .eq("plan", "free")
+            .not("stripe_customer_id", "is", null)
+            .eq("is_demo", false);
+
+          // Past due — pro but pro_expires_at in the past
+          const now = new Date();
+          const pastDueCount = pros.filter(p => p.pro_expires_at && new Date(p.pro_expires_at) < now).length;
+
+          // MRR estimate (GBP) — based on price tier and billing period
+          // Loyalty monthly £3.99, annual £39 → £3.25/mo
+          // Early supporter monthly £4.99, annual £49 → £4.08/mo
+          // Standard monthly £5.99, annual £59 → £4.92/mo
+          const MRR_MAP = {
+            loyalty:        { monthly: 3.99, annual: 39 / 12 },
+            early_supporter:{ monthly: 4.99, annual: 49 / 12 },
+            standard:       { monthly: 5.99, annual: 59 / 12 },
+          };
+          let mrrGBP = 0;
+          for (const p of pros.filter(p => p.market !== "IE")) {
+            const tier   = p.price_tier || "standard";
+            const period = p.pro_source?.includes("annual") ? "annual" : "monthly";
+            mrrGBP += (MRR_MAP[tier]?.[period] || MRR_MAP.standard.monthly);
+          }
+          // EUR subscribers — convert at ~0.86 to GBP for MRR estimate
+          for (const p of pros.filter(p => p.market === "IE")) {
+            const EUR_MAP = {
+              early_supporter: { monthly: 5.99, annual: 59 / 12 },
+              standard:        { monthly: 6.99, annual: 69 / 12 },
+            };
+            const tier   = p.price_tier || "standard";
+            const period = p.pro_source?.includes("annual") ? "annual" : "monthly";
+            mrrGBP += ((EUR_MAP[tier]?.[period] || EUR_MAP.standard.monthly) * 0.86);
+          }
+
+          return {
+            totalPro,
+            stripeCount,
+            rcCount,
+            conversionRate,
+            monthlyCount,
+            annualCount,
+            trialCount,
+            loyalty,
+            earlySupporter,
+            standard,
+            mrrGBP: mrrGBP.toFixed(2),
+            pastDueCount,
+            churnedCount: churnedCount || 0,
+          };
+        } catch (revenueErr) {
+          console.error("[Metrics] Revenue query failed:", revenueErr.message);
+          return null;
+        }
+      })(),
     });
   } catch (e) {
     console.error("[Metrics]", e.message);
