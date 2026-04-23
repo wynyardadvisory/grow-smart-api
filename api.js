@@ -5411,21 +5411,28 @@ app.post("/admin/reengagement-email", async (req, res) => {
     const authUserMap = {};
     for (const u of authUsers) authUserMap[u.id] = u;
 
-    // Filter auth users to March cohort first — avoids querying all 1100+ profiles
+    // Filter auth users to March cohort first — use Date objects for reliable comparison
+    const cohortStart = new Date(COHORT_START);
+    const cohortEnd   = new Date(COHORT_END);
     const marchCohortIds = authUsers
       .filter(u => {
         if (!u.created_at || EXCLUDED.includes(u.email)) return false;
-        const signupAt = new Date(u.created_at).toISOString();
-        return signupAt >= COHORT_START && signupAt <= COHORT_END;
+        const d = new Date(u.created_at);
+        return d >= cohortStart && d <= cohortEnd;
       })
       .map(u => u.id);
 
-    // Get profiles for March cohort only (small set, no row limit risk)
-    const { data: profiles } = await supabaseService
-      .from("profiles")
-      .select("id, name, email_unsubscribed, last_seen_at")
-      .eq("is_demo", false)
-      .in("id", marchCohortIds);
+    // Get profiles for March cohort — chunk to avoid Supabase .in() row limit
+    let profiles = [];
+    for (let i = 0; i < marchCohortIds.length; i += 200) {
+      const chunk = marchCohortIds.slice(i, i + 200);
+      const { data: batch } = await supabaseService
+        .from("profiles")
+        .select("id, name, email_unsubscribed, last_seen_at")
+        .eq("is_demo", false)
+        .in("id", chunk);
+      if (batch) profiles = profiles.concat(batch);
+    }
 
     // Filter to churned and reachable
     const candidateProfiles = (profiles || []).filter(p =>
