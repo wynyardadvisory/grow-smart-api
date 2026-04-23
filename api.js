@@ -5406,12 +5406,26 @@ app.post("/admin/reengagement-email", requireAuth, requireAdmin, async (req, res
     const FOURTEEN_DAYS_AGO = new Date(Date.now() - 14 * 86400000).toISOString();
     const EXCLUDED = ["demo@vercro.com", "appdemo@vercro.com", "mark@wynyardadvisory.co.uk"];
 
-    // Filter to churned, reachable profiles
-    const candidateProfiles = (profiles || []).filter(p =>
-      p.last_seen_at &&
-      p.last_seen_at < FOURTEEN_DAYS_AGO &&
-      (p.email_unsubscribed === false || p.email_unsubscribed === null)
-    );
+    // March cohort window — signed up 14th March to 25th March 2026
+    // This is the cohort affected by the rule engine incident on 18th March
+    const COHORT_START = "2026-03-14T00:00:00.000Z";
+    const COHORT_END   = "2026-03-25T23:59:59.000Z";
+
+    // Build auth user map for signup date lookups
+    const authUserMap = {};
+    for (const u of authUsers) authUserMap[u.id] = u;
+
+    // Filter to March cohort, churned, reachable profiles
+    const candidateProfiles = (profiles || []).filter(p => {
+      const signupAt = authUserMap[p.id]?.created_at;
+      return (
+        signupAt >= COHORT_START &&
+        signupAt <= COHORT_END &&
+        p.last_seen_at &&
+        p.last_seen_at < FOURTEEN_DAYS_AGO &&
+        (p.email_unsubscribed === false || p.email_unsubscribed === null)
+      );
+    });
     const candidateIds = candidateProfiles.map(p => p.id);
 
     // Get crop counts for candidates in one query
@@ -5442,10 +5456,7 @@ app.post("/admin/reengagement-email", requireAuth, requireAdmin, async (req, res
       .in("user_id", eligibleIds);
     const alreadySentIds = new Set((alreadySent || []).map(e => e.user_id));
 
-    // Build final send list — join with auth users for email address
-    const authUserMap = {};
-    for (const u of authUsers) authUserMap[u.id] = u;
-
+    // Build final send list
     const toSend = eligibleProfiles.filter(p =>
       !alreadySentIds.has(p.id) &&
       authUserMap[p.id]?.email &&
@@ -5453,15 +5464,27 @@ app.post("/admin/reengagement-email", requireAuth, requireAdmin, async (req, res
     );
 
     if (dryRun) {
+      const oldestLastSeen = candidateProfiles.length
+        ? candidateProfiles.map(p => p.last_seen_at).sort()[0]
+        : null;
+      const newestLastSeen = candidateProfiles.length
+        ? candidateProfiles.map(p => p.last_seen_at).sort().reverse()[0]
+        : null;
       return res.json({
         dry_run: true,
-        would_send: toSend.length,
-        already_sent: alreadySentIds.size,
+        cohort_window: { start: COHORT_START, end: COHORT_END },
+        matched_cohort: candidateProfiles.length,
+        excluded_below_5_crops: candidateProfiles.length - eligibleProfiles.length,
         eligible: eligibleProfiles.length,
+        already_sent: alreadySentIds.size,
+        would_send: toSend.length,
+        last_seen_range: { oldest: oldestLastSeen, newest: newestLastSeen },
         sample: toSend.slice(0, 5).map(p => ({
           email: authUserMap[p.id]?.email,
           name: p.name,
           crop_count: cropCounts[p.id] || 0,
+          last_seen: p.last_seen_at,
+          signed_up: authUserMap[p.id]?.created_at,
         })),
       });
     }
@@ -5484,7 +5507,7 @@ app.post("/admin/reengagement-email", requireAuth, requireAdmin, async (req, res
           body: JSON.stringify({
             from: "Mark at Vercro <hello@vercro.com>",
             to: user.email,
-            subject: "Your garden needs attention this week 🌱",
+            subject: `You set up ${cropCount} crops — check on them today 🌱`,
             html: `
               <div style="font-family: Georgia, serif; max-width: 520px; margin: 0 auto; padding: 40px 24px; color: #1A2E28;">
                 <div style="font-size: 28px; margin-bottom: 16px;">🌱</div>
