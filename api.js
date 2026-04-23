@@ -5401,40 +5401,38 @@ app.post("/admin/reengagement-email", async (req, res) => {
   try {
     // Get all auth users
     const authUsers = await getAllAuthUsers();
-    const allUserIds = authUsers.map(u => u.id);
 
-    // Get profiles with last_seen_at
+    const FOURTEEN_DAYS_AGO = new Date(Date.now() - 14 * 86400000).toISOString();
+    const EXCLUDED = ["demo@vercro.com", "appdemo@vercro.com", "mark@wynyardadvisory.co.uk"];
+    const COHORT_START = "2026-03-14T00:00:00.000Z";
+    const COHORT_END   = "2026-03-25T23:59:59.000Z";
+
+    // Build auth user map
+    const authUserMap = {};
+    for (const u of authUsers) authUserMap[u.id] = u;
+
+    // Filter auth users to March cohort first — avoids querying all 1100+ profiles
+    const marchCohortIds = authUsers
+      .filter(u => {
+        if (!u.created_at || EXCLUDED.includes(u.email)) return false;
+        const signupAt = new Date(u.created_at).toISOString();
+        return signupAt >= COHORT_START && signupAt <= COHORT_END;
+      })
+      .map(u => u.id);
+
+    // Get profiles for March cohort only (small set, no row limit risk)
     const { data: profiles } = await supabaseService
       .from("profiles")
       .select("id, name, email_unsubscribed, last_seen_at")
       .eq("is_demo", false)
-      .in("id", allUserIds);
+      .in("id", marchCohortIds);
 
-    const FOURTEEN_DAYS_AGO = new Date(Date.now() - 14 * 86400000).toISOString();
-    const EXCLUDED = ["demo@vercro.com", "appdemo@vercro.com", "mark@wynyardadvisory.co.uk"];
-
-    // March cohort window — signed up 14th March to 25th March 2026
-    // This is the cohort affected by the rule engine incident on 18th March
-    const COHORT_START = "2026-03-14T00:00:00.000Z";
-    const COHORT_END   = "2026-03-25T23:59:59.000Z";
-
-    // Build auth user map for signup date lookups
-    const authUserMap = {};
-    for (const u of authUsers) authUserMap[u.id] = u;
-
-    // Filter to March cohort, churned, reachable profiles
-    const candidateProfiles = (profiles || []).filter(p => {
-      const rawSignup = authUserMap[p.id]?.created_at;
-      if (!rawSignup) return false;
-      const signupAt = new Date(rawSignup).toISOString();
-      return (
-        signupAt >= COHORT_START &&
-        signupAt <= COHORT_END &&
-        p.last_seen_at &&
-        p.last_seen_at < FOURTEEN_DAYS_AGO &&
-        (p.email_unsubscribed === false || p.email_unsubscribed === null)
-      );
-    });
+    // Filter to churned and reachable
+    const candidateProfiles = (profiles || []).filter(p =>
+      p.last_seen_at &&
+      p.last_seen_at < FOURTEEN_DAYS_AGO &&
+      (p.email_unsubscribed === false || p.email_unsubscribed === null)
+    );
     const candidateIds = candidateProfiles.map(p => p.id);
 
     // Get crop counts for candidates in one query
