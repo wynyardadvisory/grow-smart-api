@@ -3289,8 +3289,8 @@ app.get("/admin/metrics/funnel", requireAuth, requireMetricsAccess, async (req, 
       // Crops: active only. Tasks: ever created (any status) — answers "did rule engine fire at onboarding?"
       const postFixCropSet = new Set();
       const postFixTaskSet = new Set();
-      for (let i = 0; i < postFixUsers.length; i += 200) {
-        const chunk = postFixUsers.slice(i, i + 200);
+      for (let i = 0; i < postFixUsers.length; i += 50) {
+        const chunk = postFixUsers.slice(i, i + 50);
         const { data: cropChunk } = await db.from("crop_instances").select("user_id").eq("active", true).in("user_id", chunk).limit(50000);
         const { data: taskChunk } = await db.from("tasks").select("user_id").in("user_id", chunk).limit(50000);
         for (const r of cropChunk || []) postFixCropSet.add(r.user_id);
