@@ -3138,12 +3138,13 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
           const annualCount       = pros.filter(p => p.pro_source && p.pro_source.includes("annual")).length;
           const trialCount        = pros.filter(p => p.pro_source && p.pro_source.includes("trial")).length;
 
-          // Churned — had plan=pro previously, now free, with a stripe_customer_id
+          // Churned — actually completed a payment (pro_source set) but now back on free
           const { count: churnedCount } = await db
             .from("profiles")
             .select("*", { count: "exact", head: true })
             .eq("plan", "free")
             .not("stripe_customer_id", "is", null)
+            .not("pro_source", "is", null)
             .eq("is_demo", false);
 
           // Past due — pro but pro_expires_at in the past
