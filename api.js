@@ -150,8 +150,7 @@ app.use(cors({ origin: (origin, cb) => {
   const allowed = !origin
     || allowedOrigins.includes(origin)
     || /^https:\/\/grow-smart-frontend-staging.*\.vercel\.app$/.test(origin)
-    || /^https:\/\/grow-smart-frontend.*wynyardadvisorys-projects\.vercel\.app$/.test(origin)
-    || /^https?:\/\/localhost(:\d+)?$/.test(origin);  // Android Capacitor WebView (any port)
+    || /^https:\/\/grow-smart-frontend.*wynyardadvisorys-projects\.vercel\.app$/.test(origin);
   cb(null, allowed);
 }}));
 // ── Stripe webhook — must be registered BEFORE express.json() ─────────────────
@@ -652,13 +651,13 @@ app.post("/locations", requireAuth,
   [body("name").trim().notEmpty()],
   async (req, res) => {
     if (!validate(req, res)) return;
-    const { name, postcode, latitude, longitude, orientation, notes, country } = req.body;
+    const { name, postcode, latitude, longitude, orientation, notes } = req.body;
     const width_m  = req.body.width_m  !== "" && req.body.width_m  != null ? Number(req.body.width_m)  : null;
     const length_m = req.body.length_m !== "" && req.body.length_m != null ? Number(req.body.length_m) : null;
     if (width_m  !== null && (isNaN(width_m)  || width_m  <= 0)) return res.status(400).json({ error: "width_m must be a positive number" });
     if (length_m !== null && (isNaN(length_m) || length_m <= 0)) return res.status(400).json({ error: "length_m must be a positive number" });
     const { data, error } = await req.db.from("locations")
-      .insert({ user_id: req.user.id, name, postcode, latitude, longitude, orientation, notes, width_m, length_m, country: country || "GB" })
+      .insert({ user_id: req.user.id, name, postcode, latitude, longitude, orientation, notes, width_m, length_m })
       .select().single();
     if (error) return res.status(500).json({ error: error.message });
     res.status(201).json(data);
@@ -1455,7 +1454,7 @@ app.post("/crops", requireAuth,
       establishment_method, quantity, notes,
       start_date_confidence, source, status,
       is_other_crop, is_other_variety,
-      barcode, lifecycle_mode,
+      barcode,
     } = req.body;
 
     // For "other crop" free-text entries, normalise the name.
@@ -1489,7 +1488,6 @@ app.post("/crops", requireAuth,
       photo_url:            null,
       start_date_confidence:start_date_confidence || "exact",
       source:               source || "manual",
-      lifecycle_mode:       lifecycle_mode || "seasonal",
     }).select().single();
 
     if (error) return res.status(500).json({ error: error.message });
@@ -1944,21 +1942,11 @@ app.post("/tasks/:id/complete", requireAuth, async (req, res) => {
     } else if (data.task_type === "mulch" || data.task_type === "prune" || data.task_type === "thin" || data.task_type === "monitor" || data.task_type === "check") {
       // These tasks use window-based source keys (month/week anchor).
       // Completing them means the current window key is marked done — engine
-      // will not regenerate until next window period.
-
-      if (data.rule_id === "weeding_due" && data.area_id) {
-        // Weeding is area-level — write last_weeded_at to growing_areas so the
-        // rule engine suppresses regeneration for the cadence window (14 days).
-        await supabaseService.from("growing_areas")
-          .update({ last_weeded_at: completedAt, updated_at: completedAt })
-          .eq("id", data.area_id);
-        await runRuleEngine(req.user.id);
-      } else if (data.crop_instance_id) {
-        // Crop-level check — touch updated_at so dashboard reflects activity.
-        await supabaseService.from("crop_instances")
-          .update({ updated_at: completedAt })
-          .eq("id", data.crop_instance_id).eq("user_id", req.user.id);
-      }
+      // will not regenerate until next window period. No crop state update needed.
+      // Touch updated_at so dashboard reflects activity.
+      await supabaseService.from("crop_instances")
+        .update({ updated_at: completedAt })
+        .eq("id", data.crop_instance_id).eq("user_id", req.user.id);
 
     } else if (data.task_type === "sow" && transition === "sown") {
       const sowMethod = meta.sow_method || "outdoors";
@@ -2972,19 +2960,19 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
       // Feedback avg rating
       db.from("feedback").select("rating").not("rating", "is", null).not("user_id", "in", demoExclude),
 
-      // Push analytics — last 7 days (use count:exact to avoid 1000-row cap)
-      db.from("notification_events").select("id, notification_type", { count: "exact" }).eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude).limit(1000),
-      db.from("notification_events").select("id, notification_type", { count: "exact" }).not("opened_at", "is", null).gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude).limit(1000),
-      db.from("notification_events").select("notification_type, status", { count: "exact" }).eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude).limit(1000),
+      // Push analytics — last 7 days
+      db.from("notification_events").select("id, notification_type").eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
+      db.from("notification_events").select("id, notification_type").not("opened_at", "is", null).gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
+      db.from("notification_events").select("notification_type, status").eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
 
       // Push cron log — last 7 days
       db.from("push_cron_log").select("push_window, eligible, sent, failed, no_candidate, ran_at").gte("ran_at", new Date(Date.now() - 7 * 86400000).toISOString()).order("ran_at", { ascending: true }),
 
-      // Email analytics — last 30 days from email_events (use count:exact to avoid 1000-row cap)
-      db.from("email_events").select("email_type", { count: "exact" }).eq("event_type", "email.delivered").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()).limit(5000),
-      db.from("email_events").select("email_type", { count: "exact" }).eq("event_type", "email.opened").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()).limit(5000),
-      db.from("email_events").select("email_type", { count: "exact" }).eq("event_type", "email.clicked").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()).limit(5000),
-      db.from("email_events").select("email_type", { count: "exact" }).eq("event_type", "email.bounced").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()).limit(5000),
+      // Email analytics — last 30 days from email_events
+      db.from("email_events").select("email_type").eq("event_type", "email.delivered").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
+      db.from("email_events").select("email_type").eq("event_type", "email.opened").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
+      db.from("email_events").select("email_type").eq("event_type", "email.clicked").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
+      db.from("email_events").select("email_type").eq("event_type", "email.bounced").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
 
     ]);
 
@@ -3121,95 +3109,6 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
         ? (feedbackRatings.reduce((s, f) => s + (f.rating || 0), 0) / feedbackRatings.length).toFixed(1)
         : null,
       totalFeedback: feedbackRatings?.length || 0,
-
-      // Revenue — populated below via Stripe + profiles queries
-      revenue: await (async () => {
-        try {
-          // All non-demo pro users from profiles
-          const { data: proProfiles } = await db
-            .from("profiles")
-            .select("id, plan, pro_source, pro_expires_at, price_tier, stripe_customer_id, created_at")
-            .eq("plan", "pro")
-            .eq("is_demo", false);
-
-          // Previously paid users (have stripe_customer_id but now on free)
-          // Churned = previously paid via Stripe (pro_source = 'stripe') but now on free.
-          // Excludes users who created a Stripe customer ID but never completed payment.
-          const { data: churnedProfiles } = await db
-            .from("profiles")
-            .select("id, plan, stripe_customer_id, pro_expires_at")
-            .eq("plan", "free")
-            .eq("is_demo", false)
-            .eq("pro_source", "stripe")
-            .not("stripe_customer_id", "is", null);
-
-          const stripeProfiles  = (proProfiles || []).filter(p => p.pro_source === "stripe" || p.stripe_customer_id);
-          const rcProfiles      = (proProfiles || []).filter(p => p.pro_source && p.pro_source.startsWith("revenuecat") && !p.stripe_customer_id);
-          const totalPro        = (proProfiles || []).length;
-          const churnedCount    = (churnedProfiles || []).length;
-
-          // Fetch subscriptions from Stripe for interval split (monthly vs annual)
-          let monthlyCount = 0;
-          let annualCount  = 0;
-          let trialCount   = 0;
-          let pastDueCount = 0;
-          let mrr          = 0; // pence
-
-          const ANNUAL_PRICE_IDS  = new Set(Object.values(STRIPE_PRICES).map(p => p.annual));
-          const MONTHLY_PRICE_IDS = new Set(Object.values(STRIPE_PRICES).map(p => p.monthly));
-
-          // Pull active subscriptions from Stripe (up to 100 — sufficient for current scale)
-          const subs = await stripe.subscriptions.list({ status: "active", limit: 100 });
-          for (const sub of subs.data || []) {
-            const priceId = sub.items?.data?.[0]?.price?.id;
-            const amount  = sub.items?.data?.[0]?.price?.unit_amount || 0;
-            if (ANNUAL_PRICE_IDS.has(priceId)) {
-              annualCount++;
-              mrr += Math.round(amount / 12); // annualise → monthly
-            } else if (MONTHLY_PRICE_IDS.has(priceId)) {
-              monthlyCount++;
-              mrr += amount;
-            }
-            if (sub.status === "trialing") trialCount++;
-          }
-
-          // Past due (failed payment but not yet cancelled)
-          const pastDueSubs = await stripe.subscriptions.list({ status: "past_due", limit: 100 });
-          pastDueCount = pastDueSubs.data?.length || 0;
-
-          // % of activated users paying
-          const { count: activatedCount } = await db
-            .from("profiles")
-            .select("*", { count: "exact", head: true })
-            .eq("is_demo", false)
-            .not("postcode", "is", null);
-
-          const conversionRate = activatedCount > 0
-            ? Math.round((totalPro / activatedCount) * 100)
-            : null;
-
-          const mrrGBP = (mrr / 100).toFixed(2);
-
-          return {
-            totalPro,
-            stripeCount:    stripeProfiles.length,
-            rcCount:        rcProfiles.length,
-            monthlyCount,
-            annualCount,
-            trialCount,
-            pastDueCount,
-            churnedCount,
-            conversionRate,
-            mrrGBP,
-            earlySupporter: (proProfiles || []).filter(p => p.price_tier === "early_supporter").length,
-            loyalty:        (proProfiles || []).filter(p => p.price_tier === "loyalty").length,
-            standard:       (proProfiles || []).filter(p => p.price_tier === "standard").length,
-          };
-        } catch (revenueErr) {
-          console.error("[Metrics] Revenue query failed:", revenueErr.message);
-          return null;
-        }
-      })(),
     });
   } catch (e) {
     console.error("[Metrics]", e.message);
@@ -3387,23 +3286,14 @@ app.get("/admin/metrics/funnel", requireAuth, requireMetricsAccess, async (req, 
     let noTasksPostFix = 0;
 
     if (postFixUsers.length > 0) {
-      // For crops: reuse usersWithCropsSet — already chunked with active=true filter above.
-      // For tasks: build a fresh set scoped to post-fix users, active tasks only (not expired, not completed).
-      // This mirrors the crops logic exactly but for tasks.
-      const postFixActiveTaskSet = new Set();
-      for (let i = 0; i < postFixUsers.length; i += 200) {
-        const chunk = postFixUsers.slice(i, i + 200);
-        const { data: taskChunk } = await db
-          .from("tasks")
-          .select("user_id")
-          .in("user_id", chunk)
-          .not("status", "eq", "expired")
-          .is("completed_at", null);
-        for (const r of taskChunk || []) postFixActiveTaskSet.add(r.user_id);
-      }
+      // Scope to specific IDs to avoid 1000-row Supabase limit
+      const { data: postFixCrops } = await db.from("crop_instances").select("user_id").in("user_id", postFixUsers);
+      const { data: postFixTasks } = await db.from("tasks").select("user_id").in("user_id", postFixUsers);
+      const postFixCropSet = new Set((postFixCrops || []).map(r => r.user_id));
+      const postFixTaskSet = new Set((postFixTasks || []).map(r => r.user_id));
       const postFixActivated = postFixUsers.filter(id => activatedIds.has(id));
-      noCropsPostFix = postFixActivated.filter(id => !usersWithCropsSet.has(id)).length;
-      noTasksPostFix = postFixActivated.filter(id => !postFixActiveTaskSet.has(id)).length;
+      noCropsPostFix = postFixActivated.filter(id => !postFixCropSet.has(id)).length;
+      noTasksPostFix = postFixActivated.filter(id => !postFixTaskSet.has(id)).length;
     }
 
     res.json({
@@ -3545,33 +3435,6 @@ app.get("/admin/feedback", requireAuth, requireAdmin, async (req, res) => {
 // =============================================================================
 // ADMIN ENDPOINTS — restricted to mark@wynyardadvisory.co.uk
 // =============================================================================
-
-// POST /admin/rank-feedback — proxy Claude API call for feedback ranking
-// Keeps API key server-side, never exposed to browser
-app.post("/admin/rank-feedback", requireAuth, requireAdmin, async (req, res) => {
-  const { prompt } = req.body;
-  if (!prompt) return res.status(400).json({ error: "prompt required" });
-  try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type":            "application/json",
-        "x-api-key":               process.env.ANTHROPIC_API_KEY,
-        "anthropic-version":       "2023-06-01",
-      },
-      body: JSON.stringify({
-        model:      "claude-sonnet-4-20250514",
-        max_tokens: 1000,
-        messages:   [{ role: "user", content: prompt }],
-      }),
-    });
-    const data = await response.json();
-    res.json(data);
-  } catch (err) {
-    captureError("RankFeedback", err);
-    res.status(500).json({ error: err.message });
-  }
-});
 
 // GET /admin/crop-queue — AI-added crop_definitions pending review
 app.get("/admin/crop-queue", requireAuth, requireAdmin, async (req, res) => {
@@ -5179,7 +5042,6 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
   const userId = req.user.id;
   const {
     name, postcode,
-    country,     // "GB" or "IE" — from frontend country picker
     crops,       // [{ name, crop_def_id, stage }]
     area_type,
     area_name,
@@ -5193,12 +5055,10 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "name, postcode, crops and area_type required" });
   }
 
-  const resolvedCountry = (country && COUNTRY_CONFIG[country]) ? country : "GB";
-
   try {
     // 1. Save profile — use supabaseService so it bypasses RLS and definitely commits
     // locations.user_id FK references profiles.id so profile MUST exist before location insert
-    const profileData = { id: userId, name: name.trim(), postcode, country: resolvedCountry, market: resolvedCountry };
+    const profileData = { id: userId, name, postcode };
     if (signup_source)               profileData.signup_source               = signup_source;
     if (signup_medium)               profileData.signup_medium               = signup_medium;
     if (signup_campaign)             profileData.signup_campaign             = signup_campaign;
@@ -5215,7 +5075,7 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
       locationId = existingLocs[0].id;
     } else {
       const { data: loc, error: locErr } = await supabaseService.from("locations").insert({
-        user_id: userId, name: "My garden", postcode, country: resolvedCountry,
+        user_id: userId, name: "My garden", postcode,
       }).select("id").single();
       if (locErr) throw new Error("Location: " + locErr.message);
       locationId = loc.id;
@@ -5384,247 +5244,6 @@ app.post("/admin/onboarding-recovery-email", requireAuth, requireAdmin, async (r
     });
   } catch (err) {
     console.error("[OnboardingRecovery]", err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// =============================================================================
-// ADMIN — re-engagement email for churned users with 5+ crops
-// POST /admin/reengagement-email
-// Sends a personalised re-engagement email to users who:
-//   - Have 5+ active crops
-//   - Haven't opened the app in 14+ days
-//   - Haven't unsubscribed from email
-//   - Haven't already received this email
-// Safe to call multiple times — idempotent via email_log check.
-// =============================================================================
-app.post("/admin/reengagement-email", async (req, res) => {
-  const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET;
-  if (!cronAuth) {
-    const header = req.headers.authorization;
-    if (!header?.startsWith("Bearer ")) return res.status(401).json({ error: "Missing auth token" });
-    const { data: { user }, error } = await supabaseService.auth.getUser(header.split(" ")[1]);
-    if (error || !user || user.email !== "mark@wynyardadvisory.co.uk") return res.status(403).json({ error: "Forbidden" });
-  }
-  const dryRun = req.body?.dry_run === true;
-  try {
-    // Get all auth users
-    const authUsers = await getAllAuthUsers();
-
-    const FOURTEEN_DAYS_AGO = new Date(Date.now() - 14 * 86400000).toISOString();
-    const EXCLUDED = ["demo@vercro.com", "appdemo@vercro.com", "mark@wynyardadvisory.co.uk"];
-    const COHORT_START = "2026-03-14T00:00:00.000Z";
-    const COHORT_END   = "2026-03-25T23:59:59.000Z";
-
-    // Build auth user map
-    const authUserMap = {};
-    for (const u of authUsers) authUserMap[u.id] = u;
-
-    // Filter auth users to March cohort first — use Date objects for reliable comparison
-    const cohortStart = new Date(COHORT_START);
-    const cohortEnd   = new Date(COHORT_END);
-    const marchCohortIds = authUsers
-      .filter(u => {
-        if (!u.created_at || EXCLUDED.includes(u.email)) return false;
-        const d = new Date(u.created_at);
-        return d >= cohortStart && d <= cohortEnd;
-      })
-      .map(u => u.id);
-
-    // Get profiles for March cohort — chunk to avoid Supabase .in() row limit
-    let profiles = [];
-    for (let i = 0; i < marchCohortIds.length; i += 200) {
-      const chunk = marchCohortIds.slice(i, i + 200);
-      const { data: batch } = await supabaseService
-        .from("profiles")
-        .select("id, name, email_unsubscribed, last_seen_at")
-        .eq("is_demo", false)
-        .in("id", chunk);
-      if (batch) profiles = profiles.concat(batch);
-    }
-
-    // Filter to churned and reachable
-    const candidateProfiles = (profiles || []).filter(p =>
-      p.last_seen_at &&
-      p.last_seen_at < FOURTEEN_DAYS_AGO &&
-      (p.email_unsubscribed === false || p.email_unsubscribed === null)
-    );
-    const candidateIds = candidateProfiles.map(p => p.id);
-
-    // Get crop counts for candidates in one query
-    const cropCounts = {};
-    if (candidateIds.length > 0) {
-      for (let i = 0; i < candidateIds.length; i += 200) {
-        const chunk = candidateIds.slice(i, i + 200);
-        const { data: crops } = await supabaseService
-          .from("crop_instances")
-          .select("user_id")
-          .in("user_id", chunk)
-          .eq("active", true);
-        for (const c of crops || []) {
-          cropCounts[c.user_id] = (cropCounts[c.user_id] || 0) + 1;
-        }
-      }
-    }
-
-    // Filter to 5+ crops
-    const eligibleProfiles = candidateProfiles.filter(p => (cropCounts[p.id] || 0) >= 5);
-    const eligibleIds = eligibleProfiles.map(p => p.id);
-
-    // Skip anyone already sent this email
-    const { data: alreadySent } = await supabaseService
-      .from("email_log")
-      .select("user_id")
-      .eq("email_type", "reengagement_march_2026")
-      .in("user_id", eligibleIds);
-    const alreadySentIds = new Set((alreadySent || []).map(e => e.user_id));
-
-    // Build final send list
-    const toSend = eligibleProfiles.filter(p =>
-      !alreadySentIds.has(p.id) &&
-      authUserMap[p.id]?.email &&
-      !EXCLUDED.includes(authUserMap[p.id].email)
-    );
-
-    if (dryRun) {
-      const oldestLastSeen = candidateProfiles.length
-        ? candidateProfiles.map(p => p.last_seen_at).sort()[0]
-        : null;
-      const newestLastSeen = candidateProfiles.length
-        ? candidateProfiles.map(p => p.last_seen_at).sort().reverse()[0]
-        : null;
-      return res.json({
-        dry_run: true,
-        cohort_window: { start: COHORT_START, end: COHORT_END },
-        debug: {
-          total_auth_users: authUsers.length,
-          march_cohort_ids_count: marchCohortIds.length,
-          sample_auth_user: authUsers[0] ? { id: authUsers[0].id, created_at: authUsers[0].created_at, email: authUsers[0].email } : null,
-          profiles_returned: (profiles || []).length,
-        },
-        matched_cohort: candidateProfiles.length,
-        excluded_below_5_crops: candidateProfiles.length - eligibleProfiles.length,
-        eligible: eligibleProfiles.length,
-        already_sent: alreadySentIds.size,
-        would_send: toSend.length,
-        last_seen_range: { oldest: oldestLastSeen, newest: newestLastSeen },
-        sample: toSend.slice(0, 5).map(p => ({
-          email: authUserMap[p.id]?.email,
-          name: p.name,
-          crop_count: cropCounts[p.id] || 0,
-          last_seen: p.last_seen_at,
-          signed_up: authUserMap[p.id]?.created_at,
-        })),
-      });
-    }
-
-    const results = [];
-    for (const profile of toSend) {
-      const user = authUserMap[profile.id];
-      if (!user?.email) continue;
-
-      const firstName = (profile.name || user.email.split("@")[0]).split(" ")[0];
-      const cropCount = cropCounts[profile.id] || 0;
-
-      try {
-        const resp = await fetch("https://api.resend.com/emails", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${process.env.RESEND_API_KEY}`,
-          },
-          body: JSON.stringify({
-            from: "Mark at Vercro <hello@vercro.com>",
-            to: user.email,
-            subject: `You set up ${cropCount} crops — check on them today 🌱`,
-            html: `
-              <div style="font-family: Georgia, serif; max-width: 520px; margin: 0 auto; padding: 40px 24px; color: #1A2E28;">
-                <div style="font-size: 28px; margin-bottom: 16px;">🌱</div>
-
-                <p style="font-size: 16px; line-height: 1.7; margin: 0 0 16px; color: #333;">
-                  Hi ${firstName},
-                </p>
-
-                <p style="font-size: 16px; line-height: 1.7; margin: 0 0 16px; color: #333;">
-                  A quick nudge about your garden.
-                </p>
-
-                <p style="font-size: 16px; line-height: 1.7; margin: 0 0 16px; color: #333;">
-                  Back in March, you set up <strong>${cropCount} crops</strong> in Vercro — that's a serious amount of growing.
-                </p>
-
-                <p style="font-size: 16px; line-height: 1.7; margin: 0 0 16px; color: #333;">
-                  Right now is a key moment for those plants. Anything sown in March is likely at a stage where it needs attention — thinning out, potting on, hardening off, feeding, or just a quick check to keep things on track. Miss this window and you'll feel it come harvest time.
-                </p>
-
-                <p style="font-size: 16px; line-height: 1.7; margin: 0 0 16px; color: #333;">
-                  We had a technical issue in March that affected task plans for some users. It's fully resolved — and if you open the app today, you'll see a fresh set of tasks based on exactly where your garden should be right now. No setup needed.
-                </p>
-
-                <p style="font-size: 16px; line-height: 1.7; margin: 0 0 24px; color: #333;">
-                  The plan is more accurate than it's ever been. There's also a new photo diagnosis tool — take a picture of any plant and get an instant read on what's wrong. Useful at this time of year when pests and problems start showing up.
-                </p>
-
-                <a href="https://app.vercro.com" style="display: inline-block; background: #1E3D2F; color: #F4F0E8; text-decoration: none; padding: 14px 32px; border-radius: 10px; font-size: 16px; font-weight: 700; margin-bottom: 32px;">
-                  Open your garden →
-                </a>
-
-                <p style="font-size: 16px; line-height: 1.7; margin: 24px 0 8px; color: #333;">
-                  No pressure — just didn't want you to miss this window.
-                </p>
-
-                <p style="font-size: 16px; line-height: 1.7; margin: 0 0 32px; color: #333;">
-                  — Mark
-                </p>
-
-                <hr style="border: none; border-top: 1px solid #eee; margin: 0 0 24px;" />
-
-                <p style="font-size: 14px; color: #888; line-height: 1.6; margin: 0 0 12px;">
-                  P.S. Vercro is now on the App Store if you'd prefer it on your phone.
-                </p>
-
-                <a href="https://apps.apple.com/app/vercro/id6761921895" style="display: inline-block;">
-                  <img src="https://developer.apple.com/assets/elements/badges/download-on-the-app-store.svg" alt="Download on the App Store" style="height: 40px;" />
-                </a>
-
-                <hr style="border: none; border-top: 1px solid #eee; margin: 24px 0;" />
-                <p style="font-size: 12px; color: #aaa; margin: 0;">vercro.com · Built for home growers</p>
-              </div>
-            `,
-          }),
-        });
-
-        if (resp.ok) {
-          const resendData = await resp.json();
-          await supabaseService.from("email_log").insert({
-            user_id:         profile.id,
-            email:           user.email,
-            email_type:      "reengagement_march_2026",
-            sent_at:         new Date().toISOString(),
-            resend_email_id: resendData.id || null,
-          });
-          results.push({ email: user.email, status: "sent" });
-          // Respect Resend rate limit of 5 req/sec
-          await new Promise(r => setTimeout(r, 220));
-        } else {
-          const err = await resp.json();
-          results.push({ email: user.email, status: "failed", error: err });
-        }
-      } catch (e) {
-        results.push({ email: user.email, status: "error", error: e.message });
-      }
-    }
-
-    res.json({
-      eligible:     eligibleProfiles.length,
-      already_sent: alreadySentIds.size,
-      attempted:    toSend.length,
-      sent:         results.filter(r => r.status === "sent").length,
-      failed:       results.filter(r => r.status !== "sent").length,
-      results,
-    });
-  } catch (err) {
-    console.error("[ReengagementEmail]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -5840,11 +5459,8 @@ app.post("/crops/:id/observe", requireAuth, async (req, res) => {
     }
   }
 
-  // Respond immediately — rule engine runs in background to avoid Cloudflare 10s timeout
+  await runRuleEngine(req.user.id);
   res.json({ observation: obs, crop_updated: Object.keys(updates).length > 0, engine_actions: engineActions });
-  setImmediate(() => {
-    runRuleEngine(req.user.id).catch(err => console.error("[Observe] Rule engine error:", err.message));
-  });
 });
 
 app.get("/crops/:id/observations", requireAuth, async (req, res) => {
@@ -7118,74 +6734,64 @@ app.post("/cron/push-morning", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
 
-  // Process synchronously — Promise.all in sendBulkNotifications makes this fast (~2s for 200 users)
-  // setImmediate caused Vercel to kill the process before sends completed
-  let eligible = [], sendCounts = { sent: 0, failed: 0, no_candidate: 0 };
-  try {
-    const result = await buildEligibleUserSet("morning");
-    eligible = result.eligible;
-    const { tokenMap, tasksByUser } = result;
-    console.log(`[PushMorning] Pre-filter: ${JSON.stringify(result.counts)}`);
-    if (!eligible.length) {
-      console.log("[PushMorning] No eligible users — done.");
-    } else {
-      console.log(`[PushMorning] Starting send for ${eligible.length} users`);
-      sendCounts = await sendBulkNotifications(supabaseService, eligible, "morning", tokenMap, tasksByUser);
+  // Respond immediately so cron-job.org does not time out.
+  // Notification sending runs in the background.
+  res.json({ ok: true, status: "processing" });
+
+  setImmediate(async () => {
+    try {
+      const { eligible, counts: preCounts, tokenMap, tasksByUser } = await buildEligibleUserSet("morning");
+      console.log(`[PushMorning] Pre-filter: ${JSON.stringify(preCounts)}`);
+      if (!eligible.length) {
+        console.log("[PushMorning] No eligible users — done.");
+        return;
+      }
+      const sendCounts = await sendBulkNotifications(supabaseService, eligible, "morning", tokenMap, tasksByUser);
       console.log(`[PushMorning] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
+      await supabaseService.from("push_cron_log").insert({
+        push_window:  "morning",
+        eligible:     eligible.length,
+        sent:         sendCounts.sent         || 0,
+        failed:       sendCounts.failed       || 0,
+        no_candidate: sendCounts.no_candidate || 0,
+        ran_at:       new Date().toISOString(),
+      }).catch(e => console.error("[PushMorning] Failed to write cron log:", e.message));
+    } catch(e) {
+      captureError("PushMorning", e);
     }
-  } catch(e) {
-    console.error("[PushMorning] Error:", e.message);
-    captureError("PushMorning", e);
-  }
-  // Always write cron log — even on error
-  try {
-    await supabaseService.from("push_cron_log").insert({
-      push_window:  "morning",
-      eligible:     eligible.length,
-      sent:         sendCounts.sent         || 0,
-      failed:       sendCounts.failed       || 0,
-      no_candidate: sendCounts.no_candidate || 0,
-      ran_at:       new Date().toISOString(),
-    });
-  } catch(logErr) { console.error("[PushMorning] Failed to write cron log:", logErr.message); }
-  res.json({ ok: true, eligible: eligible.length, ...sendCounts });
+  });
 });
 
 app.post("/cron/push-evening", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
 
-  // Process synchronously — Promise.all in sendBulkNotifications makes this fast (~2s for 200 users)
-  // setImmediate caused Vercel to kill the process before sends completed
-  let eligible = [], sendCounts = { sent: 0, failed: 0, no_candidate: 0 };
-  try {
-    const result = await buildEligibleUserSet("evening");
-    eligible = result.eligible;
-    const { tokenMap, tasksByUser } = result;
-    console.log(`[PushEvening] Pre-filter: ${JSON.stringify(result.counts)}`);
-    if (!eligible.length) {
-      console.log("[PushEvening] No eligible users — done.");
-    } else {
-      console.log(`[PushEvening] Starting send for ${eligible.length} users`);
-      sendCounts = await sendBulkNotifications(supabaseService, eligible, "evening", tokenMap, tasksByUser);
+  // Respond immediately so cron-job.org does not time out.
+  // Notification sending runs in the background.
+  res.json({ ok: true, status: "processing" });
+
+  setImmediate(async () => {
+    try {
+      const { eligible, counts: preCounts, tokenMap, tasksByUser } = await buildEligibleUserSet("evening");
+      console.log(`[PushEvening] Pre-filter: ${JSON.stringify(preCounts)}`);
+      if (!eligible.length) {
+        console.log("[PushEvening] No eligible users — done.");
+        return;
+      }
+      const sendCounts = await sendBulkNotifications(supabaseService, eligible, "evening", tokenMap, tasksByUser);
       console.log(`[PushEvening] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
+      await supabaseService.from("push_cron_log").insert({
+        push_window:  "evening",
+        eligible:     eligible.length,
+        sent:         sendCounts.sent         || 0,
+        failed:       sendCounts.failed       || 0,
+        no_candidate: sendCounts.no_candidate || 0,
+        ran_at:       new Date().toISOString(),
+      }).catch(e => console.error("[PushEvening] Failed to write cron log:", e.message));
+    } catch(e) {
+      captureError("PushEvening", e);
     }
-  } catch(e) {
-    console.error("[PushEvening] Error:", e.message);
-    captureError("PushEvening", e);
-  }
-  // Always write cron log — even on error
-  try {
-    await supabaseService.from("push_cron_log").insert({
-      push_window:  "evening",
-      eligible:     eligible.length,
-      sent:         sendCounts.sent         || 0,
-      failed:       sendCounts.failed       || 0,
-      no_candidate: sendCounts.no_candidate || 0,
-      ran_at:       new Date().toISOString(),
-    });
-  } catch(logErr) { console.error("[PushEvening] Failed to write cron log:", logErr.message); }
-  res.json({ ok: true, eligible: eligible.length, ...sendCounts });
+  });
 });
 
 // POST /cron/push-dry-run — verify eligibility without sending anything
@@ -7562,8 +7168,7 @@ app.get("/subscription/status", requireAuth, async (req, res) => {
       .from("profiles")
       .select("plan, pro_expires_at, pro_source")
       .eq("id", req.user.id)
-      .limit(1)
-      .maybeSingle();
+      .single();
 
     if (error) throw error;
 
@@ -7599,39 +7204,11 @@ app.get("/subscription/status", requireAuth, async (req, res) => {
 // STRIPE — WEB SUBSCRIPTION CHECKOUT
 // =============================================================================
 
-// ── Country config — single source of truth for all market settings ───────────
-const COUNTRY_CONFIG = {
-  GB: {
-    postcodeLabel:       "Postcode",
-    postcodePlaceholder: "e.g. TS22",
-    postcodeHint:        "First part only — e.g. TS22, not TS22 5BQ",
-    postcodeRegex:       /^[A-Z]{1,2}[0-9][0-9A-Z]?$/i,
-    currency:            "GBP",
-    currencySymbol:      "£",
-    hemisphere:          "north",
-  },
-  IE: {
-    postcodeLabel:       "Eircode",
-    postcodePlaceholder: "e.g. A65 F4E2",
-    postcodeHint:        "Full Eircode — e.g. A65 F4E2",
-    postcodeRegex:       /^[A-Z][0-9]{2}\s?[A-Z0-9]{4}$/i,
-    currency:            "EUR",
-    currencySymbol:      "€",
-    hemisphere:          "north",
-  },
-};
-
 // ── Stripe price IDs — all tiers and intervals ───────────────────────────────
 const STRIPE_PRICES = {
-  GB: {
-    loyalty:        { monthly: "price_1TL2MGD44o8wCiOZpMYxjCJV", annual: "price_1TL2MeD44o8wCiOZGML8xig4" },
-    early_supporter:{ monthly: "price_1TGz5jD44o8wCiOZIsEcIwBT", annual: "price_1TGz47D44o8wCiOZ9mG7HREJ" },
-    standard:       { monthly: "price_1TL2MyD44o8wCiOZQlbK4l1e", annual: "price_1TL2NGD44o8wCiOZG5yJjCKE" },
-  },
-  IE: {
-    early_supporter:{ monthly: "price_1TOH6bD44o8wCiOZgz2WO2TC", annual: "price_1TOH8AD44o8wCiOZVkASR5DW" },
-    standard:       { monthly: "price_1TOH8rD44o8wCiOZGM9rY0Nb", annual: "price_1TOH9SD44o8wCiOZ4haISlfZ" },
-  },
+  loyalty:        { monthly: "price_1TL2MGD44o8wCiOZpMYxjCJV", annual: "price_1TL2MeD44o8wCiOZGML8xig4" },
+  early_supporter:{ monthly: "price_1TGz5jD44o8wCiOZIsEcIwBT", annual: "price_1TGz47D44o8wCiOZ9mG7HREJ" },
+  standard:       { monthly: "price_1TL2MyD44o8wCiOZQlbK4l1e", annual: "price_1TL2NGD44o8wCiOZG5yJjCKE" },
 };
 
 // ── Launch date ───────────────────────────────────────────────────────────────
@@ -7661,43 +7238,25 @@ function resolveUserPriceTier(profilePriceTier) {
 
 // GET /subscription/pricing
 // Returns the correct prices to show this user in the paywall.
-// Country-aware — IE users get EUR prices and € display.
 app.get("/subscription/pricing", requireAuth, async (req, res) => {
   try {
     const { data: profile } = await supabaseService
-      .from("profiles").select("price_tier, country").eq("id", req.user.id).single();
+      .from("profiles").select("price_tier").eq("id", req.user.id).single();
 
-    const country  = profile?.country || "GB";
-    const config   = COUNTRY_CONFIG[country] || COUNTRY_CONFIG.GB;
-    const sym      = config.currencySymbol;
-    const tier     = resolveUserPriceTier(profile?.price_tier || "standard");
-
-    // IE has no loyalty tier — fall back to early_supporter
-    const countryPrices = STRIPE_PRICES[country] || STRIPE_PRICES.GB;
-    const prices        = countryPrices[tier] || countryPrices.early_supporter || countryPrices.standard;
+    const tier   = resolveUserPriceTier(profile?.price_tier || "standard");
+    const prices = STRIPE_PRICES[tier] || STRIPE_PRICES.standard;
 
     const DISPLAY = {
-      GB: {
-        loyalty:         { monthly: "£2.99", annual: "£29",  label: "Loyalty offer",         badge: "Your special price" },
-        early_supporter: { monthly: "£4.99", annual: "£49",  label: "Early supporter offer", badge: "Best value" },
-        standard:        { monthly: "£5.99", annual: "£59",  label: null,                    badge: "Best value" },
-      },
-      IE: {
-        early_supporter: { monthly: "€4.99", annual: "€49",  label: "Early supporter offer", badge: "Best value" },
-        standard:        { monthly: "€5.99", annual: "€59",  label: null,                    badge: "Best value" },
-      },
+      loyalty:         { monthly: "£2.99", annual: "£29",  label: "Loyalty offer",         badge: "Your special price" },
+      early_supporter: { monthly: "£4.99", annual: "£49",  label: "Early supporter offer", badge: "Best value" },
+      standard:        { monthly: "£5.99", annual: "£59",  label: null,                    badge: "Best value" },
     };
-
-    const displayMap = DISPLAY[country] || DISPLAY.GB;
-    const display    = displayMap[tier] || displayMap.early_supporter || displayMap.standard;
 
     res.json({
       tier,
-      country,
-      currency: config.currency,
       monthly_price_id: prices.monthly,
       annual_price_id:  prices.annual,
-      display,
+      display:          DISPLAY[tier],
     });
   } catch (err) {
     captureError("SubscriptionPricing", err);
@@ -7715,15 +7274,13 @@ app.post("/subscription/create-checkout", requireAuth, async (req, res) => {
     // Resolve correct tier and price for this user
     const { data: profile } = await supabaseService
       .from("profiles")
-      .select("email, stripe_customer_id, price_tier, country")
+      .select("email, stripe_customer_id, price_tier")
       .eq("id", req.user.id)
       .single();
 
-    const country       = profile?.country || "GB";
-    const tier          = resolveUserPriceTier(profile?.price_tier || "standard");
-    const countryPrices = STRIPE_PRICES[country] || STRIPE_PRICES.GB;
-    const prices        = countryPrices[tier] || countryPrices.early_supporter || countryPrices.standard;
-    const priceId       = interval === "monthly" ? prices.monthly : prices.annual;
+    const tier    = resolveUserPriceTier(profile?.price_tier || "standard");
+    const prices  = STRIPE_PRICES[tier] || STRIPE_PRICES.standard;
+    const priceId = interval === "monthly" ? prices.monthly : prices.annual;
 
     let customerId = profile?.stripe_customer_id;
 
