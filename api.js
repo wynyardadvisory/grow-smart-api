@@ -3387,11 +3387,23 @@ app.get("/admin/metrics/funnel", requireAuth, requireMetricsAccess, async (req, 
     let noTasksPostFix = 0;
 
     if (postFixUsers.length > 0) {
-      // Reuse allCrops and allTasks already fetched above — no extra queries needed.
-      // usersWithCropsSet and usersWithTasksSet are built from chunked queries covering all users.
+      // For crops: reuse usersWithCropsSet — already chunked with active=true filter above.
+      // For tasks: build a fresh set scoped to post-fix users, active tasks only (not expired, not completed).
+      // This mirrors the crops logic exactly but for tasks.
+      const postFixActiveTaskSet = new Set();
+      for (let i = 0; i < postFixUsers.length; i += 200) {
+        const chunk = postFixUsers.slice(i, i + 200);
+        const { data: taskChunk } = await db
+          .from("tasks")
+          .select("user_id")
+          .in("user_id", chunk)
+          .not("status", "eq", "expired")
+          .is("completed_at", null);
+        for (const r of taskChunk || []) postFixActiveTaskSet.add(r.user_id);
+      }
       const postFixActivated = postFixUsers.filter(id => activatedIds.has(id));
       noCropsPostFix = postFixActivated.filter(id => !usersWithCropsSet.has(id)).length;
-      noTasksPostFix = postFixActivated.filter(id => !usersWithTasksSet.has(id)).length;
+      noTasksPostFix = postFixActivated.filter(id => !postFixActiveTaskSet.has(id)).length;
     }
 
     res.json({
