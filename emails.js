@@ -85,6 +85,126 @@ function templateNudgeUnactivated(name) {
   };
 }
 
+function templateNudgeUnactivatedD5(name) {
+  const firstName = name ? name.split(" ")[0] : "there";
+  return {
+    subject: "Still time to set up your Vercro garden 🌱",
+    html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f8f2;font-family:Georgia,serif;">
+  <div style="max-width:560px;margin:40px auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 2px 16px rgba(47,93,80,0.08);">
+    <div style="background:#2F5D50;padding:32px 40px;text-align:center;">
+      <div style="font-size:32px;margin-bottom:8px;">🌱</div>
+      <div style="font-family:Georgia,serif;font-size:24px;font-weight:700;color:#ffffff;">Vercro</div>
+    </div>
+    <div style="padding:40px;">
+      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">Hey ${firstName} — your garden plan is one step away</h1>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
+        You signed up a few days ago but haven't set up your garden yet. Takes about 2 minutes — just tell us your postcode and what you're growing, and we'll build your personalised daily plan.
+      </p>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 32px;">
+        Daily task reminders, harvest forecasts, frost alerts — all based on exactly what you're growing.
+      </p>
+      <div style="text-align:center;margin-bottom:32px;">
+        <a href="${APP_URL}" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">
+          Set up my garden →
+        </a>
+      </div>
+      <p style="font-size:13px;color:#888;text-align:center;margin:0;">
+        Takes about 2 minutes. No payment needed.
+      </p>
+    </div>
+    <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
+      <p style="font-size:12px;color:#888;margin:0;">Vercro · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
+    </div>
+  </div>
+</body>
+</html>`,
+  };
+}
+
+function templateNudgeUnactivatedD14(name) {
+  const firstName = name ? name.split(" ")[0] : "there";
+  return {
+    subject: "Your growing season is slipping by 🌿",
+    html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f8f2;font-family:Georgia,serif;">
+  <div style="max-width:560px;margin:40px auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 2px 16px rgba(47,93,80,0.08);">
+    <div style="background:#2F5D50;padding:32px 40px;text-align:center;">
+      <div style="font-size:32px;margin-bottom:8px;">🌱</div>
+      <div style="font-family:Georgia,serif;font-size:24px;font-weight:700;color:#ffffff;">Vercro</div>
+    </div>
+    <div style="padding:40px;">
+      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">Hey ${firstName} — it's not too late</h1>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
+        Two weeks ago you signed up for Vercro but never got your garden set up. The growing season is well underway — there's still plenty to sow and plan.
+      </p>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 32px;">
+        Add your location and crops and we'll tell you exactly what to do this week — no guessing, no forgetting.
+      </p>
+      <div style="text-align:center;margin-bottom:32px;">
+        <a href="${APP_URL}" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">
+          Start my plan →
+        </a>
+      </div>
+      <p style="font-size:13px;color:#888;text-align:center;margin:0;">
+        Takes about 2 minutes. No payment needed.
+      </p>
+    </div>
+    <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
+      <p style="font-size:12px;color:#888;margin:0;">Vercro · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
+    </div>
+  </div>
+</body>
+</html>`,
+  };
+}
+
+function templateNudgeUnactivatedD28(name) {
+  const firstName = name ? name.split(" ")[0] : "there";
+  return {
+    subject: "Last nudge from us 🌱",
+    html: `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f8f2;font-family:Georgia,serif;">
+  <div style="max-width:560px;margin:40px auto;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 2px 16px rgba(47,93,80,0.08);">
+    <div style="background:#2F5D50;padding:32px 40px;text-align:center;">
+      <div style="font-size:32px;margin-bottom:8px;">🌱</div>
+      <div style="font-family:Georgia,serif;font-size:24px;font-weight:700;color:#ffffff;">Vercro</div>
+    </div>
+    <div style="padding:40px;">
+      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">Hey ${firstName} — we'll leave you to it</h1>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
+        You signed up for Vercro a month ago but never got started. We won't keep nudging you — but your account is still there if you change your mind.
+      </p>
+      <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 32px;">
+        If you do want a personalised garden plan this season, it takes about 2 minutes to set up.
+      </p>
+      <div style="text-align:center;margin-bottom:32px;">
+        <a href="${APP_URL}" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">
+          Set up my garden →
+        </a>
+      </div>
+      <p style="font-size:13px;color:#888;text-align:center;margin:0;">
+        You won't hear from us again on this.
+      </p>
+    </div>
+    <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
+      <p style="font-size:12px;color:#888;margin:0;">Vercro · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
+    </div>
+  </div>
+</body>
+</html>`,
+  };
+}
+
 function templateNudgeUnconfirmed(name) {
   const firstName = name ? name.split(" ")[0] : "there";
   return {
@@ -306,7 +426,7 @@ async function sendEmail(to, template, emailType) {
 
 async function runNudgeUnactivated(supabase) {
   // Find users who confirmed email but never completed onboarding (no profile row)
-  // Only nudge once — check email_logs table, or use a simple time window
+  // Sends up to 4 times: D1 (24h), D5, D14, D28 — then stops
   const users = await listAllAuthUsers(supabase);
 
   // Get all profile IDs (users who completed onboarding)
@@ -314,35 +434,53 @@ async function runNudgeUnactivated(supabase) {
   const profileIds = new Set((profiles || []).map(p => p.id));
   const unsubscribedIds = new Set((profiles || []).filter(p => p.email_unsubscribed).map(p => p.id));
 
-  // Get already-nudged users from email_log
+  // Get all nudge emails already sent per user
   const { data: alreadySent } = await supabase
     .from("email_log")
-    .select("user_id")
-    .eq("email_type", "nudge_unactivated");
-  const alreadySentIds = new Set((alreadySent || []).map(e => e.user_id));
+    .select("user_id, email_type")
+    .in("email_type", ["nudge_unactivated", "nudge_unactivated_d5", "nudge_unactivated_d14", "nudge_unactivated_d28"]);
+
+  // Map: user_id → Set of email_types sent
+  const sentMap = {};
+  (alreadySent || []).forEach(e => {
+    if (!sentMap[e.user_id]) sentMap[e.user_id] = new Set();
+    sentMap[e.user_id].add(e.email_type);
+  });
+
+  const DAYS = [
+    { minDays: 1,  maxDays: 4,  type: "nudge_unactivated",      template: templateNudgeUnactivated },
+    { minDays: 5,  maxDays: 13, type: "nudge_unactivated_d5",   template: templateNudgeUnactivatedD5 },
+    { minDays: 14, maxDays: 27, type: "nudge_unactivated_d14",  template: templateNudgeUnactivatedD14 },
+    { minDays: 28, maxDays: 999,type: "nudge_unactivated_d28",  template: templateNudgeUnactivatedD28 },
+  ];
 
   const now = Date.now();
   let sent = 0, skipped = 0;
 
   for (const user of (users || [])) {
-    // Must have confirmed email
     if (!user.email_confirmed_at) { skipped++; continue; }
-    // Must NOT have a profile (never onboarded)
     if (profileIds.has(user.id)) { skipped++; continue; }
-    // Must have been confirmed for at least 24 hours
-    const confirmedAt = new Date(user.email_confirmed_at).getTime();
-    if (now - confirmedAt < 24 * 3600000) { skipped++; continue; }
-    // Must not have been nudged before
-    if (alreadySentIds.has(user.id)) { skipped++; continue; }
-    // Skip unsubscribed users
     if (unsubscribedIds.has(user.id)) { skipped++; continue; }
 
-    const result = await sendEmail(user.email, templateNudgeUnactivated(user.user_metadata?.full_name || null), "nudge_unactivated");
+    const confirmedMs = new Date(user.email_confirmed_at).getTime();
+    const daysSince = (now - confirmedMs) / 86400000;
+
+    // Find which send is due — must be in window and not already sent
+    const userSent = sentMap[user.id] || new Set();
+    const due = DAYS.find(d =>
+      daysSince >= d.minDays &&
+      daysSince < d.maxDays &&
+      !userSent.has(d.type)
+    );
+
+    if (!due) { skipped++; continue; }
+
+    const result = await sendEmail(user.email, due.template(user.user_metadata?.full_name || null), due.type);
     if (result.sent) {
       await supabase.from("email_log").insert({
         user_id:         user.id,
         email:           user.email,
-        email_type:      "nudge_unactivated",
+        email_type:      due.type,
         sent_at:         new Date().toISOString(),
         resend_email_id: result.id || null,
       });
@@ -1228,3 +1366,4 @@ async function runWeeklyEmailDigest(supabase) {
 }
 
 module.exports = { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement, runWeeklyEmailDigest, runOnboardingRecovery };
+// Note: nudge_unactivated_d5, nudge_unactivated_d14, nudge_unactivated_d28 are handled inside runNudgeUnactivated
