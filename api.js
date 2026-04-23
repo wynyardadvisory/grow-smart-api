@@ -5480,6 +5480,12 @@ app.post("/admin/reengagement-email", async (req, res) => {
       return res.json({
         dry_run: true,
         cohort_window: { start: COHORT_START, end: COHORT_END },
+        debug: {
+          total_auth_users: authUsers.length,
+          march_cohort_ids_count: marchCohortIds.length,
+          sample_auth_user: authUsers[0] ? { id: authUsers[0].id, created_at: authUsers[0].created_at, email: authUsers[0].email } : null,
+          profiles_returned: (profiles || []).length,
+        },
         matched_cohort: candidateProfiles.length,
         excluded_below_5_crops: candidateProfiles.length - eligibleProfiles.length,
         eligible: eligibleProfiles.length,
