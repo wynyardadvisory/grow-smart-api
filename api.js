@@ -3387,19 +3387,11 @@ app.get("/admin/metrics/funnel", requireAuth, requireMetricsAccess, async (req, 
     let noTasksPostFix = 0;
 
     if (postFixUsers.length > 0) {
-      // Chunk queries to avoid Supabase 1000-row .in() limit
-      const postFixCropSet = new Set();
-      const postFixTaskSet = new Set();
-      for (let i = 0; i < postFixUsers.length; i += 200) {
-        const chunk = postFixUsers.slice(i, i + 200);
-        const { data: cropChunk } = await db.from("crop_instances").select("user_id").in("user_id", chunk);
-        for (const r of cropChunk || []) postFixCropSet.add(r.user_id);
-        const { data: taskChunk } = await db.from("tasks").select("user_id").in("user_id", chunk).limit(1);
-        for (const r of taskChunk || []) postFixTaskSet.add(r.user_id);
-      }
+      // Reuse allCrops and allTasks already fetched above — no extra queries needed.
+      // usersWithCropsSet and usersWithTasksSet are built from chunked queries covering all users.
       const postFixActivated = postFixUsers.filter(id => activatedIds.has(id));
-      noCropsPostFix = postFixActivated.filter(id => !postFixCropSet.has(id)).length;
-      noTasksPostFix = postFixActivated.filter(id => !postFixTaskSet.has(id)).length;
+      noCropsPostFix = postFixActivated.filter(id => !usersWithCropsSet.has(id)).length;
+      noTasksPostFix = postFixActivated.filter(id => !usersWithTasksSet.has(id)).length;
     }
 
     res.json({
