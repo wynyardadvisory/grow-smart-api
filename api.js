@@ -5588,12 +5588,15 @@ app.post("/admin/reengagement-email", async (req, res) => {
         if (resp.ok) {
           const resendData = await resp.json();
           await supabaseService.from("email_log").insert({
-            user_id:        profile.id,
-            email_type:     "reengagement_march_2026",
-            sent_at:        new Date().toISOString(),
+            user_id:         profile.id,
+            email:           user.email,
+            email_type:      "reengagement_march_2026",
+            sent_at:         new Date().toISOString(),
             resend_email_id: resendData.id || null,
           });
           results.push({ email: user.email, status: "sent" });
+          // Respect Resend rate limit of 5 req/sec
+          await new Promise(r => setTimeout(r, 220));
         } else {
           const err = await resp.json();
           results.push({ email: user.email, status: "failed", error: err });
