@@ -2972,19 +2972,19 @@ app.get("/admin/metrics", requireAuth, requireMetricsAccess, async (req, res) =>
       // Feedback avg rating
       db.from("feedback").select("rating").not("rating", "is", null).not("user_id", "in", demoExclude),
 
-      // Push analytics — last 7 days
-      db.from("notification_events").select("id, notification_type").eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
-      db.from("notification_events").select("id, notification_type").not("opened_at", "is", null).gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
-      db.from("notification_events").select("notification_type, status").eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude),
+      // Push analytics — last 7 days (use count:exact to avoid 1000-row cap)
+      db.from("notification_events").select("id, notification_type", { count: "exact" }).eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude).limit(1000),
+      db.from("notification_events").select("id, notification_type", { count: "exact" }).not("opened_at", "is", null).gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude).limit(1000),
+      db.from("notification_events").select("notification_type, status", { count: "exact" }).eq("status", "sent").gte("sent_at", new Date(Date.now() - 7 * 86400000).toISOString()).not("user_id", "in", demoExclude).limit(1000),
 
       // Push cron log — last 7 days
       db.from("push_cron_log").select("push_window, eligible, sent, failed, no_candidate, ran_at").gte("ran_at", new Date(Date.now() - 7 * 86400000).toISOString()).order("ran_at", { ascending: true }),
 
-      // Email analytics — last 30 days from email_events
-      db.from("email_events").select("email_type").eq("event_type", "email.delivered").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
-      db.from("email_events").select("email_type").eq("event_type", "email.opened").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
-      db.from("email_events").select("email_type").eq("event_type", "email.clicked").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
-      db.from("email_events").select("email_type").eq("event_type", "email.bounced").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()),
+      // Email analytics — last 30 days from email_events (use count:exact to avoid 1000-row cap)
+      db.from("email_events").select("email_type", { count: "exact" }).eq("event_type", "email.delivered").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()).limit(5000),
+      db.from("email_events").select("email_type", { count: "exact" }).eq("event_type", "email.opened").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()).limit(5000),
+      db.from("email_events").select("email_type", { count: "exact" }).eq("event_type", "email.clicked").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()).limit(5000),
+      db.from("email_events").select("email_type", { count: "exact" }).eq("event_type", "email.bounced").gte("occurred_at", new Date(Date.now() - 30 * 86400000).toISOString()).limit(5000),
 
     ]);
 
