@@ -647,39 +647,63 @@ class ScheduledRuleEngine {
       }));
     }
 
-    // Spring feed — schedule for March 15 if in lookahead
+    // Feed scheduling — interval-based when feed_interval_days is set,
+    // otherwise fall back to one-shot seasonal prompts (spring + summer)
     if (ctx.feedType) {
-      const springFeedDate = `${new Date().getFullYear()}-03-15`;
-      if (withinLookahead(springFeedDate, LOOKAHEAD_DAYS.seasonal) || (m >= 3 && m <= 4)) {
-        const due = m >= 3 && m <= 4 ? today : springFeedDate;
-        results.push(candidate(ctx, {
-          ruleId:       "perennial_spring_feed",
-        dedupeByName: true,
-          taskType:     "feed",
-          title:        formatFeedAction(ctx.cropName, ctx.matchedFeed, ctx.feedType, "Feed"),
-          description:  `Spring feeding supports new growth on ${ctx.cropName}.`,
-          scheduledFor: due,
-          urgency:      "low",
-          expiryDays:   21,
-          leadTimeDays: 7,
-        }));
-      }
+      if (ctx.feedInterval && ctx.feedNextDue) {
+        // Interval-based: behaves like _evalGrowing feed scheduling
+        const feedDue = ctx.feedNextDue;
+        if (withinLookahead(feedDue, LOOKAHEAD_DAYS.feed) || isOverdue(feedDue)) {
+          const scheduledFor = isOverdue(feedDue) ? today : feedDue;
+          const feedUrgency = isOverdue(feedDue) ? "high"
+            : ctx.stage === "fruiting" ? "high"
+            : "medium";
+          results.push(candidate(ctx, {
+            ruleId:       "perennial_feed_scheduled",
+            dedupeByName: true,
+            taskType:     "feed",
+            title:        formatFeedAction(ctx.cropName, ctx.matchedFeed, ctx.feedType, "Time to feed"),
+            description:  `Regular feeding is due for ${ctx.cropName}.`,
+            scheduledFor,
+            urgency:      feedUrgency,
+            expiryDays:   7,
+            leadTimeDays: LEAD_TIME_DAYS.feed,
+          }));
+        }
+      } else {
+        // Fallback: no feed_interval_days set — use one-shot seasonal prompts
+        const springFeedDate = `${new Date().getFullYear()}-03-15`;
+        if (withinLookahead(springFeedDate, LOOKAHEAD_DAYS.seasonal) || (m >= 3 && m <= 4)) {
+          const due = m >= 3 && m <= 4 ? today : springFeedDate;
+          results.push(candidate(ctx, {
+            ruleId:       "perennial_spring_feed",
+            dedupeByName: true,
+            taskType:     "feed",
+            title:        formatFeedAction(ctx.cropName, ctx.matchedFeed, ctx.feedType, "Feed"),
+            description:  `Spring feeding supports new growth on ${ctx.cropName}.`,
+            scheduledFor: due,
+            urgency:      "low",
+            expiryDays:   21,
+            leadTimeDays: 7,
+          }));
+        }
 
-      // Summer feed — June/July
-      const summerFeedDate = `${new Date().getFullYear()}-06-15`;
-      if (withinLookahead(summerFeedDate, LOOKAHEAD_DAYS.seasonal) || (m >= 6 && m <= 7)) {
-        const due = m >= 6 && m <= 7 ? today : summerFeedDate;
-        results.push(candidate(ctx, {
-          ruleId:       "perennial_summer_feed",
-        dedupeByName: true,
-          taskType:     "feed",
-          title:        formatFeedAction(ctx.cropName, ctx.matchedFeed, ctx.feedType, "Feed"),
-          description:  `Summer feeding supports fruiting on ${ctx.cropName}.`,
-          scheduledFor: due,
-          urgency:      "low",
-          expiryDays:   21,
-          leadTimeDays: 7,
-        }));
+        // Summer feed — June/July
+        const summerFeedDate = `${new Date().getFullYear()}-06-15`;
+        if (withinLookahead(summerFeedDate, LOOKAHEAD_DAYS.seasonal) || (m >= 6 && m <= 7)) {
+          const due = m >= 6 && m <= 7 ? today : summerFeedDate;
+          results.push(candidate(ctx, {
+            ruleId:       "perennial_summer_feed",
+            dedupeByName: true,
+            taskType:     "feed",
+            title:        formatFeedAction(ctx.cropName, ctx.matchedFeed, ctx.feedType, "Feed"),
+            description:  `Summer feeding supports fruiting on ${ctx.cropName}.`,
+            scheduledFor: due,
+            urgency:      "low",
+            expiryDays:   21,
+            leadTimeDays: 7,
+          }));
+        }
       }
     }
 
