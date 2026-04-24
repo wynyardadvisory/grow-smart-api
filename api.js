@@ -6838,14 +6838,14 @@ app.post("/cron/push-morning", async (req, res) => {
       }
       const sendCounts = await sendBulkNotifications(supabaseService, eligible, "morning", tokenMap, tasksByUser);
       console.log(`[PushMorning] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
-      await supabaseService.from("push_cron_log").insert({
+      supabaseService.from("push_cron_log").insert({
         push_window:  "morning",
         eligible:     eligible.length,
         sent:         sendCounts.sent         || 0,
         failed:       sendCounts.failed       || 0,
         no_candidate: sendCounts.no_candidate || 0,
         ran_at:       new Date().toISOString(),
-      }).catch(e => console.error("[PushMorning] Failed to write cron log:", e.message));
+      }).then(null, e => console.error("[PushMorning] Failed to write cron log:", e.message));
     } catch(e) {
       captureError("PushMorning", e);
     }
@@ -6870,14 +6870,14 @@ app.post("/cron/push-evening", async (req, res) => {
       }
       const sendCounts = await sendBulkNotifications(supabaseService, eligible, "evening", tokenMap, tasksByUser);
       console.log(`[PushEvening] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
-      await supabaseService.from("push_cron_log").insert({
+      supabaseService.from("push_cron_log").insert({
         push_window:  "evening",
         eligible:     eligible.length,
         sent:         sendCounts.sent         || 0,
         failed:       sendCounts.failed       || 0,
         no_candidate: sendCounts.no_candidate || 0,
         ran_at:       new Date().toISOString(),
-      }).catch(e => console.error("[PushEvening] Failed to write cron log:", e.message));
+      }).then(null, e => console.error("[PushEvening] Failed to write cron log:", e.message));
     } catch(e) {
       captureError("PushEvening", e);
     }
