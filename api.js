@@ -143,7 +143,8 @@ const allowedOrigins = [
   "https://grow-smart-frontend.vercel.app",
   "https://grow-smart-frontend-staging.vercel.app",
   "capacitor://localhost",   // iOS Capacitor WebView
-  "http://localhost",        // Android Capacitor WebView
+  "http://localhost",        // Android Capacitor WebView (older)
+  "https://localhost",       // Android Capacitor WebView
   process.env.FRONTEND_URL,
 ].filter(Boolean);
 app.use(cors({ origin: (origin, cb) => {
