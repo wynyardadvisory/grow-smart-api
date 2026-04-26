@@ -360,7 +360,7 @@ function templateFeedbackDay7Active(name, tasksCompleted) {
 function templateFeedbackDay7Quiet(name) {
   const firstName = name ? name.split(" ")[0] : "there";
   return {
-    subject: "A week in — is Vercro working for you?",
+    subject: "7 days of tasks you haven't seen yet 🌱",
     html: `
 <!DOCTYPE html>
 <html>
@@ -372,18 +372,22 @@ function templateFeedbackDay7Quiet(name) {
       <div style="font-family:Georgia,serif;font-size:24px;font-weight:700;color:#ffffff;">Vercro</div>
     </div>
     <div style="padding:40px;">
-      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">Hey ${firstName} — honest question</h1>
+      <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">Hey ${firstName} — your plan has been building without you</h1>
       <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
-        It's been a week since you joined Vercro. I noticed you haven't used it much yet — and I'd genuinely like to know why, because it helps me make it better.
+        It's been a week since you set up your garden in Vercro. Every day since, your personalised task plan has been updating — based on your crops, your location, and what's happening in the garden right now.
       </p>
       <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 24px;">
-        Was it confusing to get started? Not relevant to what you're growing? Or just bad timing? No wrong answers — hit reply and tell me.
+        You haven't seen any of it yet.
       </p>
+      <div style="background:#f4f8f2;border-radius:12px;padding:20px 24px;margin:0 0 28px;border-left:4px solid #2F5D50;">
+        <p style="font-size:15px;color:#2F5D50;font-weight:700;margin:0 0 8px;">This week your plan may include:</p>
+        <p style="font-size:14px;color:#4a4a4a;line-height:1.7;margin:0;">Sowing reminders · Frost alerts · Watering guidance · Thinning and feeding tasks · What to do next with each crop</p>
+      </div>
       <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 32px;">
-        If you'd like another go, your garden is still there. Add a couple of crops and see your personalised plan — it usually clicks at that point.
+        It takes 30 seconds to open. Your tasks are waiting.
       </p>
       <div style="text-align:center;margin-bottom:16px;">
-        <a href="${APP_URL}" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">Give it another go →</a>
+        <a href="${APP_URL}" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">See this week's tasks →</a>
       </div>
     </div>
     <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
