@@ -1050,6 +1050,11 @@ class ScheduledRuleEngine {
     const windowOpen = m >= txStart && m <= txEnd;
     if (!windowOpen) return results;
 
+    // Suppress transplant prompt if sown fewer than 21 days ago — seedlings
+    // cannot be ready to transplant within 3 weeks of sowing from seed.
+    const daysSinceSown = ctx.sowDate ? daysBetween(ctx.sowDate, today) : 999;
+    if (daysSinceSown < 21) return results;
+
     const scheduledFor = today;
     const frostRisk    = ctx.frostRisk;
 
