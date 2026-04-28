@@ -72,6 +72,165 @@ async function getAllAuthUsers() {
   return allUsers;
 }
 
+// ── Geocoding ─────────────────────────────────────────────────────────────────
+// Country determines which geocoder to use.
+// GB   → postcodes.io (free, UK-specific, reliable)
+// all others → Nominatim (OpenStreetMap, free, global, no key required)
+// Returns { latitude, longitude } or null on failure.
+
+async function geocodePostcode(postcode, countryCode = "GB") {
+  const clean = (postcode || "").trim().toUpperCase();
+  if (!clean) return null;
+
+  try {
+    if (countryCode === "GB") {
+      // postcodes.io — reliable for UK outcodes and full postcodes
+      const encoded = encodeURIComponent(clean.replace(/\s+/g, ""));
+      const r = await fetch("https://api.postcodes.io/postcodes/" + encoded);
+      const json = await r.json();
+      if (json.status === 200 && json.result?.latitude) {
+        return { latitude: json.result.latitude, longitude: json.result.longitude };
+      }
+      // Fallback to outcode (first segment only e.g. "TS22")
+      const outcode = clean.replace(/\s.*$/, "").replace(/[0-9][A-Z]{2}$/, "");
+      if (outcode && outcode !== clean) {
+        const r2 = await fetch("https://api.postcodes.io/outcodes/" + encodeURIComponent(outcode));
+        const json2 = await r2.json();
+        if (json2.status === 200 && json2.result?.latitude) {
+          return { latitude: json2.result.latitude, longitude: json2.result.longitude };
+        }
+      }
+      return null;
+    }
+
+    // All other countries — Nominatim (OpenStreetMap)
+    // countrycodes param narrows results to the right country
+    const isoCode = countryCode.toLowerCase();
+    const query   = encodeURIComponent(clean);
+    const url     = "https://nominatim.openstreetmap.org/search?q=" + query + "&countrycodes=" + isoCode + "&format=json&limit=1&addressdetails=0";
+    const r = await fetch(url, {
+      headers: { "User-Agent": "Vercro/1.0 (hello@vercro.com)" }, // required by Nominatim ToS
+    });
+    const json = await r.json();
+    if (Array.isArray(json) && json.length > 0 && json[0].lat) {
+      return { latitude: parseFloat(json[0].lat), longitude: parseFloat(json[0].lon) };
+    }
+    return null;
+  } catch (e) {
+    console.error("[Geocode]", countryCode, postcode, e.message);
+    return null;
+  }
+}
+
+// ── Frost dates ────────────────────────────────────────────────────────────────
+// Open-Meteo archive API — free, global, no API key required.
+// Fetches 10 years of daily minimum temperatures for a lat/lon.
+// Calculates the average last spring frost and first autumn frost dates.
+// These are stored on the location record and used by the rule engine to
+// gate sowing windows correctly for each user's local climate.
+// Note: 0°C threshold gives a directionally correct estimate. We apply a
+// 1-week safety buffer when using these dates in the rule engine.
+
+async function fetchFrostDates(latitude, longitude) {
+  try {
+    const endYear   = new Date().getFullYear() - 1;
+    const startYear = endYear - 9; // 10 years
+    const url = "https://archive-api.open-meteo.com/v1/archive"
+      + "?latitude="   + latitude
+      + "&longitude="  + longitude
+      + "&start_date=" + startYear + "-01-01"
+      + "&end_date="   + endYear   + "-12-31"
+      + "&daily=temperature_2m_min"
+      + "&timezone=auto";
+
+    const r    = await fetch(url);
+    const json = await r.json();
+    if (!json.daily?.time || !json.daily?.temperature_2m_min) return null;
+
+    const times = json.daily.time;                   // ["2015-01-01", ...]
+    const temps = json.daily.temperature_2m_min;     // [-3.2, ...]
+
+    // Per year: last frost in spring (Jan–Jun) and first frost in autumn (Jul–Dec)
+    const yearlyLastSpring  = {}; // { 2015: "04-12", ... }
+    const yearlyFirstAutumn = {}; // { 2015: "10-03", ... }
+
+    for (let i = 0; i < times.length; i++) {
+      if (temps[i] === null || temps[i] > 0) continue; // not a frost day
+      const month = parseInt(times[i].slice(5, 7), 10);
+      const year  = parseInt(times[i].slice(0, 4), 10);
+      const mmdd  = times[i].slice(5); // "MM-DD"
+
+      if (month >= 1 && month <= 6) {
+        if (!yearlyLastSpring[year] || mmdd > yearlyLastSpring[year]) {
+          yearlyLastSpring[year] = mmdd;
+        }
+      } else if (month >= 7 && month <= 12) {
+        if (!yearlyFirstAutumn[year] || mmdd < yearlyFirstAutumn[year]) {
+          yearlyFirstAutumn[year] = mmdd;
+        }
+      }
+    }
+
+    const springValues = Object.values(yearlyLastSpring);
+    const autumnValues = Object.values(yearlyFirstAutumn);
+
+    // Frost-free location — tropical/subtropical
+    if (springValues.length === 0 && autumnValues.length === 0) {
+      return {
+        last_frost_spring:      null,
+        first_frost_autumn:     null,
+        growing_season_days:    365,
+        climate_zone:           "frost_free",
+        frost_dates_fetched_at: new Date().toISOString(),
+      };
+    }
+
+    // Average MM-DD values across years
+    const avgMmdd = (days) => {
+      if (!days.length) return null;
+      const ms = days.map(mmdd => {
+        const [m, d] = mmdd.split("-").map(Number);
+        return new Date(2000, m - 1, d).getTime();
+      });
+      return new Date(ms.reduce((a, b) => a + b, 0) / ms.length).toISOString().slice(5, 10);
+    };
+
+    const lastSpringMmdd  = avgMmdd(springValues);
+    const firstAutumnMmdd = avgMmdd(autumnValues);
+
+    // Store as month-day strings (year-agnostic) — rule engine applies to current year
+    const last_frost_spring  = lastSpringMmdd  ? "2000-" + lastSpringMmdd  : null;
+    const first_frost_autumn = firstAutumnMmdd ? "2000-" + firstAutumnMmdd : null;
+
+    let growing_season_days = null;
+    if (last_frost_spring && first_frost_autumn) {
+      growing_season_days = Math.round(
+        (new Date(first_frost_autumn) - new Date(last_frost_spring)) / 86400000
+      );
+    }
+
+    // Climate zone classification
+    let climate_zone = "temperate";
+    if (growing_season_days !== null) {
+      if (growing_season_days >= 240)      climate_zone = "mild";
+      else if (growing_season_days >= 180) climate_zone = "temperate";
+      else if (growing_season_days >= 120) climate_zone = "cool";
+      else                                 climate_zone = "cold";
+    }
+
+    return {
+      last_frost_spring,
+      first_frost_autumn,
+      growing_season_days,
+      climate_zone,
+      frost_dates_fetched_at: new Date().toISOString(),
+    };
+  } catch (e) {
+    console.error("[FrostDates]", latitude, longitude, e.message);
+    return null;
+  }
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 // ── AI Helper — Claude with GPT-4o fallback on overload ──────────────────────
@@ -666,21 +825,42 @@ app.post("/locations", requireAuth,
   [body("name").trim().notEmpty()],
   async (req, res) => {
     if (!validate(req, res)) return;
-    const { name, postcode, latitude, longitude, orientation, notes } = req.body;
+    const { name, postcode, orientation, notes } = req.body;
+    // country_code comes from request body (set by frontend from user profile)
+    // latitude/longitude may be provided directly by frontend (future) or geocoded below
+    let { country_code, latitude, longitude } = req.body;
+    country_code = country_code || "GB";
+
     const width_m  = req.body.width_m  !== "" && req.body.width_m  != null ? Number(req.body.width_m)  : null;
     const length_m = req.body.length_m !== "" && req.body.length_m != null ? Number(req.body.length_m) : null;
     if (width_m  !== null && (isNaN(width_m)  || width_m  <= 0)) return res.status(400).json({ error: "width_m must be a positive number" });
     if (length_m !== null && (isNaN(length_m) || length_m <= 0)) return res.status(400).json({ error: "length_m must be a positive number" });
+
+    // Geocode synchronously if lat/lon not already provided
+    if (postcode && !latitude) {
+      const coords = await geocodePostcode(postcode, country_code);
+      if (coords) { latitude = coords.latitude; longitude = coords.longitude; }
+    }
+
     const { data, error } = await req.db.from("locations")
-      .insert({ user_id: req.user.id, name, postcode, latitude, longitude, orientation, notes, width_m, length_m })
+      .insert({ user_id: req.user.id, name, postcode, country_code, latitude, longitude, orientation, notes, width_m, length_m })
       .select().single();
     if (error) return res.status(500).json({ error: error.message });
-    res.status(201).json(data);
+
+    // Fetch frost dates in background — non-blocking, doesn't delay response
+    if (data?.id && latitude && longitude) {
+      fetchFrostDates(latitude, longitude).then(frost => {
+        if (!frost) return;
+        supabaseService.from("locations").update(frost).eq("id", data.id).catch(() => {});
+      }).catch(() => {});
+    }
+
+    res.status(201).json({ ...data, latitude, longitude });
   }
 );
 
 app.put("/locations/:id", requireAuth, async (req, res) => {
-  const allowed = ["name","postcode","latitude","longitude","orientation","notes","width_m","length_m"];
+  const allowed = ["name","postcode","country_code","latitude","longitude","orientation","notes","width_m","length_m"];
   const updates = Object.fromEntries(Object.entries(req.body).filter(([k]) => allowed.includes(k)));
   // Normalise numeric fields — empty string → null, validate positive
   for (const field of ["width_m","length_m"]) {
@@ -694,9 +874,35 @@ app.put("/locations/:id", requireAuth, async (req, res) => {
       }
     }
   }
+
+  // Re-geocode if postcode is changing and lat/lon not explicitly provided
+  const postcodeChanging = updates.postcode && !updates.latitude;
+  if (postcodeChanging) {
+    // Fetch current country_code if not in the update payload
+    const countryCode = updates.country_code || (await (async () => {
+      const { data: existing } = await req.db.from("locations")
+        .select("country_code").eq("id", req.params.id).single();
+      return existing?.country_code || "GB";
+    })());
+    const coords = await geocodePostcode(updates.postcode, countryCode);
+    if (coords) {
+      updates.latitude  = coords.latitude;
+      updates.longitude = coords.longitude;
+    }
+  }
+
   const { data, error } = await req.db.from("locations")
     .update(updates).eq("id", req.params.id).eq("user_id", req.user.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
+
+  // Re-fetch frost dates in background if location moved
+  if (data?.id && postcodeChanging && updates.latitude) {
+    fetchFrostDates(updates.latitude, updates.longitude).then(frost => {
+      if (!frost) return;
+      supabaseService.from("locations").update(frost).eq("id", data.id).catch(() => {});
+    }).catch(() => {});
+  }
+
   res.json(data);
 });
 
@@ -4963,6 +5169,57 @@ app.post("/run-rules", requireAuth, async (req, res) => {
 });
 
 // =============================================================================
+// POST /admin/backfill-climate?limit=20
+// Geocodes and enriches locations with lat/lon + frost dates.
+// Run manually in batches — always fetches the NEXT unprocessed batch from the top.
+// No offset param needed — rows disappear from the unprocessed set after each run.
+// Safe to re-run — skips locations that already have frost_dates_fetched_at set.
+// Keep calling until remaining === 0.
+app.post("/admin/backfill-climate", requireAuth, requireAdmin, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit || "20", 10), 50); // max 50 per call
+
+  // Always fetch from top of unprocessed set — no offset needed
+  const { data: locations, error, count } = await supabaseService
+    .from("locations")
+    .select("id, postcode, country_code", { count: "exact" })
+    .is("frost_dates_fetched_at", null)
+    .not("postcode", "is", null)
+    .limit(limit);
+
+  if (error) return res.status(500).json({ error: error.message });
+  if (!locations?.length) return res.json({ ok: true, message: "All locations processed", processed: 0, remaining: 0 });
+
+  const results = [];
+  for (const loc of locations) {
+    const countryCode = loc.country_code || "GB";
+    const coords = await geocodePostcode(loc.postcode, countryCode);
+    if (!coords) {
+      // Mark as attempted so it doesn't block future runs — set fetched_at with nulls
+      await supabaseService.from("locations")
+        .update({ frost_dates_fetched_at: new Date().toISOString() })
+        .eq("id", loc.id);
+      results.push({ id: loc.id, postcode: loc.postcode, status: "geocode_failed" });
+      continue;
+    }
+    const frost = await fetchFrostDates(coords.latitude, coords.longitude);
+    const updates = {
+      latitude:     coords.latitude,
+      longitude:    coords.longitude,
+      country_code: countryCode,
+      frost_dates_fetched_at: new Date().toISOString(),
+    };
+    if (frost) Object.assign(updates, frost);
+    const { error: uErr } = await supabaseService.from("locations").update(updates).eq("id", loc.id);
+    results.push({ id: loc.id, postcode: loc.postcode, status: uErr ? "db_error" : "ok", zone: frost?.climate_zone });
+    // Respect Nominatim 1 req/sec rate limit for non-GB locations
+    if (countryCode !== "GB") await new Promise(r => setTimeout(r, 1000));
+  }
+
+  // Remaining = total unprocessed minus what we just processed
+  const remaining = Math.max(0, (count || 0) - results.length);
+  res.json({ ok: true, processed: results.length, remaining, results });
+});
+
 // ADMIN — migrate existing web push tokens to OneSignal
 // One-time migration. Fetches all active web tokens without an onesignal_subscription_id
 // and registers each with OneSignal, storing the returned subscription ID.
