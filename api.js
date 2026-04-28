@@ -318,7 +318,19 @@ function buildTimeline(crop) {
   const dtm        = variety.days_to_maturity_max || variety.days_to_maturity_min
                    || def.days_to_maturity_max    || def.days_to_maturity_min || null;
 
-  if (!rawSowDate) return null;
+  // If no sow date but crop is transplanted/growing (e.g. bought from nursery),
+  // estimate sow date assuming plant is at ~25% of DTM (early vegetative stage).
+  // Gives a working timeline that PlantCheck can refine via timeline_offset_days.
+  let sowDateEstimated = false;
+  if (!rawSowDate) {
+    const isEstimatable = ["transplanted", "growing", "sown_outdoors"].includes(crop.status) && dtm;
+    if (!isEstimatable) return null;
+    const todayEst = new Date().toISOString().split("T")[0];
+    const addDaysEst = (d, n) => { const dt = new Date(d); dt.setDate(dt.getDate() + n); return dt.toISOString().split("T")[0]; };
+    const estimatedDaysGrown = Math.round(dtm * 0.25);
+    crop = { ...crop, sown_date: addDaysEst(todayEst, -estimatedDaysGrown) };
+    sowDateEstimated = true;
+  }
 
   const addDays = (d, n) => {
     const dt = new Date(d);
@@ -330,7 +342,8 @@ function buildTimeline(crop) {
 
   // Apply timeline_offset_days (positive = behind schedule = harvest later)
   const offsetDays = crop.timeline_offset_days || 0;
-  const sowDate    = offsetDays !== 0 ? addDays(rawSowDate, offsetDays) : rawSowDate;
+  const effectiveSowDate = crop.sown_date || crop.transplanted_date || rawSowDate;
+  const sowDate    = offsetDays !== 0 ? addDays(effectiveSowDate, offsetDays) : effectiveSowDate;
 
   const daysSown = Math.floor((Date.now() - new Date(sowDate).getTime()) / 86400000);
 
@@ -459,6 +472,7 @@ function buildTimeline(crop) {
     progress_pct:        progressPct,
     confidence:          dtm ? "medium" : "low",
     observation_offset_days: 0,
+    sow_date_estimated:  sowDateEstimated,
   };
 }
 
