@@ -131,6 +131,17 @@ function windowAnchor(dateStr, expiryDays) {
   return dateStr; // exact date for urgent tasks
 }
 
+// ── Frost offset helper ──────────────────────────────────────────────────────
+// Shifts a sowing/transplant month by a frost offset (in weeks).
+// Only applied to frost-sensitive crops. Clamped to valid month range 1–12.
+// offsetWeeks < 0 = location has earlier last frost than UK baseline (milder)
+// offsetWeeks > 0 = location has later last frost than UK baseline (cooler/northern)
+function shiftMonth(month, offsetWeeks) {
+  if (!month || !offsetWeeks) return month;
+  const offsetMonths = Math.round(offsetWeeks / 4);
+  return Math.max(1, Math.min(12, month + offsetMonths));
+}
+
 // ── Crop Context Builder ──────────────────────────────────────────────────────
 
 function buildCropContext(crop, weather, envMods, userFeeds, observations = [], rainMm7dayActual = null) {
@@ -154,6 +165,38 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = [], 
   const isPerennial    = def.is_perennial ?? false;
   const sowMethod      = def.sow_method ?? "either";
   const cropGroup      = def.category ?? null;
+
+  // ── Frost offset — international climate calibration ──────────────────────
+  // Compare user location's last spring frost date to UK baseline (April 15).
+  // Only applied to frost-sensitive crops. Falls back to 0 (no shift) if no data.
+  const locationLastFrost = crop.area?.location?.last_frost_spring || null;
+  let frostOffsetWeeks = 0;
+  if (locationLastFrost && frostSensitive && /^\d{4}-\d{2}-\d{2}$/.test(locationLastFrost)) {
+    const baseline = new Date("2000-04-15");
+    const actual   = new Date("2000-" + locationLastFrost.slice(5)); // extract MM-DD from "2000-MM-DD"
+    frostOffsetWeeks = Math.round((actual - baseline) / (7 * 86400000));
+    frostOffsetWeeks = Math.max(-4, Math.min(8, frostOffsetWeeks)); // cap: -4 to +8 weeks
+  }
+  // Adjust sowing/transplant windows for frost-sensitive crops only
+  // Potatoes are left unshifted — their windows are overridden by variety type in _evalPlanned
+  const adjSowStart = frostSensitive ? shiftMonth(sowStart, frostOffsetWeeks) : sowStart;
+  const adjSowEnd   = frostSensitive ? shiftMonth(sowEnd,   frostOffsetWeeks) : sowEnd;
+  const adjTxStart  = frostSensitive ? shiftMonth(txStart,  frostOffsetWeeks) : txStart;
+  const adjTxEnd    = frostSensitive ? shiftMonth(txEnd,    frostOffsetWeeks) : txEnd;
+
+  // Autumn frost gating — suppress tasks if the growing season is too short
+  // Extracts month from stored "2000-MM-DD" format
+  const locationFirstAutumnFrost = crop.area?.location?.first_frost_autumn || null;
+  const autumnFrostMonth = (locationFirstAutumnFrost && /^\d{4}-\d{2}-\d{2}$/.test(locationFirstAutumnFrost))
+    ? parseInt(locationFirstAutumnFrost.slice(5, 7), 10)
+    : null; // null = unknown, no gating applied
+
+  // Climate adjustment metadata — exposed for debugging and future user-facing explainability
+  const climateAdjustment = frostOffsetWeeks !== 0 ? {
+    baseline_last_frost: "04-15",
+    local_last_frost:    locationLastFrost ? locationLastFrost.slice(5) : null,
+    offset_weeks:        frostOffsetWeeks,
+  } : null;
 
   // Date anchors
   // If the user has manually confirmed a stage, we use stage_adjusted_sow_date
@@ -278,9 +321,13 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = [], 
     sowMethod, feedType, feedInterval,
     frostSensitive, isPerennial, isProtected,
 
-    // Windows
-    sowStart, sowEnd, txStart, txEnd,
+    // Windows — adjusted for local frost date on frost-sensitive crops
+    sowStart: adjSowStart, sowEnd: adjSowEnd,
+    txStart:  adjTxStart,  txEnd:  adjTxEnd,
     harvestStart, harvestEnd,
+    frostOffsetWeeks, // exposed for debugging
+    autumnFrostMonth, // month of first autumn frost — used to suppress late-season tasks
+    climateAdjustment, // null for UK users, populated for international users
 
     // Date anchors
     sowDate, transplantDate, plantedOutDate, lastFedAt,
@@ -965,6 +1012,13 @@ class ScheduledRuleEngine {
     const today          = todayISO();
     const m              = currentMonth();
 
+    // Autumn frost gating — suppress sow task once we are within ~1 month of first autumn frost.
+    // Uses current month (m), not window end, so early-window tasks are not wrongly suppressed.
+    // Example: first frost Sept → suppress from August onwards for frost-sensitive crops.
+    if (ctx.autumnFrostMonth && frostSensitive && m >= ctx.autumnFrostMonth - 1) {
+      return results; // too close to first autumn frost — suppress task
+    }
+
     // Only fire sow prompt when the window is actually open — upcoming low-urgency
     // prompts generated too much noise (2% completion rate) so removed.
     const windowOpenNow = m >= sowStart && m <= sowEnd;
@@ -1006,6 +1060,9 @@ class ScheduledRuleEngine {
       urgency = softFrost ? "low" : "medium";
       meta    = { status_transition: "sown", sow_method: "outdoors" };
     }
+
+    // Append climate adjustment to meta if applicable
+    if (ctx.climateAdjustment) meta = { ...meta, climate_adjustment: ctx.climateAdjustment };
 
     results.push(candidate(ctx, {
       ruleId:       "sow_prompt",
@@ -1066,6 +1123,10 @@ class ScheduledRuleEngine {
       ? `${cropName} is ready to transplant but frost is forecast — harden off and wait for a clear spell`
       : `Time to transplant ${cropName} outdoors — harden off for a few days first if not already done`;
 
+    const txMeta = ctx.climateAdjustment
+      ? { status_transition: "transplanted", climate_adjustment: ctx.climateAdjustment }
+      : { status_transition: "transplanted" };
+
     results.push(candidate(ctx, {
       ruleId:       "transplant_prompt",
       taskType:     "transplant",
@@ -1074,7 +1135,7 @@ class ScheduledRuleEngine {
       urgency:      frostRisk ? "low" : "medium",
       expiryDays:   daysBetween(scheduledFor, txEndDate) + 3,
       leadTimeDays: LEAD_TIME_DAYS.transplant,
-      meta:         { status_transition: "transplanted" },
+      meta:         txMeta,
     }));
 
     // Harden off — only show when transplant is imminent (within 5 days)
@@ -2390,7 +2451,7 @@ class RuleEngine {
         area:area_id ( type, location_id, name, last_watered_at, last_pruned_or_mulched_at,
           soil_moisture, soil_moisture_logged_at,
           soil_ph, soil_ph_logged_at, soil_temperature_c, soil_temperature_logged_at,
-          location:location_id ( last_watered_at )
+          location:location_id ( last_watered_at, last_frost_spring, first_frost_autumn )
         ),
         crop_def:crop_def_id (
           id, is_perennial, frost_sensitive, sow_method, category,
