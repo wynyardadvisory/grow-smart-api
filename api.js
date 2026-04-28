@@ -5181,16 +5181,18 @@ app.post("/run-rules", requireAuth, async (req, res) => {
 // Geocodes and enriches locations with lat/lon + frost dates.
 // Run manually in batches — always fetches the NEXT unprocessed batch from the top.
 // No offset param needed — rows disappear from the unprocessed set after each run.
-// Safe to re-run — skips locations that already have frost_dates_fetched_at set.
+// Safe to re-run — skips locations that already have BOTH frost_dates_fetched_at AND last_frost_spring.
+// If lat/lon already exists, skips geocoding and goes straight to frost dates.
 // Keep calling until remaining === 0.
 app.post("/admin/backfill-climate", requireAuth, requireAdmin, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "20", 10), 50); // max 50 per call
 
-  // Always fetch from top of unprocessed set — no offset needed
+  // Fetch locations that still need processing:
+  // either no frost_dates_fetched_at, OR has lat/lon but no frost dates yet
   const { data: locations, error, count } = await supabaseService
     .from("locations")
-    .select("id, postcode, country_code", { count: "exact" })
-    .is("frost_dates_fetched_at", null)
+    .select("id, postcode, country_code, latitude, longitude", { count: "exact" })
+    .or("frost_dates_fetched_at.is.null,and(latitude.not.is.null,last_frost_spring.is.null)")
     .not("postcode", "is", null)
     .limit(limit);
 
@@ -5200,20 +5202,28 @@ app.post("/admin/backfill-climate", requireAuth, requireAdmin, async (req, res) 
   const results = [];
   for (const loc of locations) {
     const countryCode = loc.country_code || "GB";
-    const coords = await geocodePostcode(loc.postcode, countryCode);
-    if (!coords) {
-      // Mark as attempted so it doesn't block future runs — set fetched_at with nulls
-      await supabaseService.from("locations")
-        .update({ frost_dates_fetched_at: new Date().toISOString() })
-        .eq("id", loc.id);
-      results.push({ id: loc.id, postcode: loc.postcode, status: "geocode_failed" });
-      continue;
+    let coords = null;
+
+    // Skip geocoding if lat/lon already exists
+    if (loc.latitude && loc.longitude) {
+      coords = { latitude: loc.latitude, longitude: loc.longitude };
+    } else {
+      coords = await geocodePostcode(loc.postcode, countryCode);
+      if (!coords) {
+        // Mark as attempted so it doesn't block future runs
+        await supabaseService.from("locations")
+          .update({ frost_dates_fetched_at: new Date().toISOString() })
+          .eq("id", loc.id);
+        results.push({ id: loc.id, postcode: loc.postcode, status: "geocode_failed" });
+        continue;
+      }
     }
+
     const frost = await fetchFrostDates(coords.latitude, coords.longitude);
     const updates = {
-      latitude:     coords.latitude,
-      longitude:    coords.longitude,
-      country_code: countryCode,
+      latitude:               coords.latitude,
+      longitude:              coords.longitude,
+      country_code:           countryCode,
       frost_dates_fetched_at: new Date().toISOString(),
     };
     if (frost) Object.assign(updates, frost);
