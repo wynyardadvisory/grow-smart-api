@@ -91,13 +91,22 @@ async function geocodePostcode(postcode, countryCode = "GB") {
       if (json.status === 200 && json.result?.latitude) {
         return { latitude: json.result.latitude, longitude: json.result.longitude };
       }
-      // Fallback to outcode (first segment only e.g. "TS22")
+      // Fallback 1: try as outcode directly (e.g. "TS22", "PO12")
       const outcode = clean.replace(/\s.*$/, "").replace(/[0-9][A-Z]{2}$/, "");
       if (outcode && outcode !== clean) {
         const r2 = await fetch("https://api.postcodes.io/outcodes/" + encodeURIComponent(outcode));
         const json2 = await r2.json();
         if (json2.status === 200 && json2.result?.latitude) {
           return { latitude: json2.result.latitude, longitude: json2.result.longitude };
+        }
+      }
+      // Fallback 2: strip trailing digits to get district (e.g. "LE2" -> "LE", "GU34" -> "GU")
+      const district = clean.replace(/[0-9]+$/, "");
+      if (district && district !== outcode && district !== clean) {
+        const r3 = await fetch("https://api.postcodes.io/outcodes/" + encodeURIComponent(district));
+        const json3 = await r3.json();
+        if (json3.status === 200 && json3.result?.latitude) {
+          return { latitude: json3.result.latitude, longitude: json3.result.longitude };
         }
       }
       return null;
