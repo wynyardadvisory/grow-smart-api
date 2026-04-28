@@ -837,7 +837,12 @@ app.post("/locations", requireAuth,
     // country_code comes from request body (set by frontend from user profile)
     // latitude/longitude may be provided directly by frontend (future) or geocoded below
     let { country_code, latitude, longitude } = req.body;
-    country_code = country_code || "GB";
+    // If country_code not in request, look up from user profile — don't assume GB
+    if (!country_code) {
+      const { data: profile } = await supabaseService.from("profiles")
+        .select("country_code").eq("id", req.user.id).single();
+      country_code = profile?.country_code || "GB";
+    }
 
     const width_m  = req.body.width_m  !== "" && req.body.width_m  != null ? Number(req.body.width_m)  : null;
     const length_m = req.body.length_m !== "" && req.body.length_m != null ? Number(req.body.length_m) : null;
@@ -1166,12 +1171,43 @@ app.delete("/areas/:id", requireAuth, async (req, res) => {
 // CROP DEFINITIONS + VARIETIES (public)
 // =============================================================================
 
-app.get("/crop-definitions", async (_req, res) => {
+app.get("/crop-definitions", async (req, res) => {
   const { data, error } = await supabaseService.from("crop_definitions")
     .select("id, name, category, default_establishment, is_perennial, sow_indoors_start, sow_indoors_end, sow_direct_start, sow_direct_end, plant_out_start, plant_out_end, harvest_month_start, harvest_month_end, days_to_maturity_min, days_to_maturity_max, frost_sensitive, preferred_position, feed_type, feed_interval_days, companions, avoid, pest_notes, grower_notes")
     .eq("hidden", false)
     .order("name");
   if (error) return res.status(500).json({ error: error.message });
+
+  // Apply localised crop names if user has a non-GB locale
+  // Falls back to canonical name if no localised name exists
+  let locale = "en-GB";
+  if (req.headers.authorization) {
+    try {
+      const token = req.headers.authorization.replace("Bearer ", "");
+      const { data: { user } } = await supabaseService.auth.getUser(token);
+      if (user?.id) {
+        const { data: profile } = await supabaseService.from("profiles")
+          .select("locale").eq("id", user.id).single();
+        if (profile?.locale) locale = profile.locale;
+      }
+    } catch (_) {}
+  }
+
+  if (locale && locale !== "en-GB") {
+    const defIds = data.map(d => d.id);
+    const { data: names } = await supabaseService.from("crop_names")
+      .select("crop_def_id, name")
+      .eq("locale", locale)
+      .in("crop_def_id", defIds);
+    if (names?.length) {
+      const nameMap = {};
+      for (const n of names) nameMap[n.crop_def_id] = n.name;
+      for (const crop of data) {
+        if (nameMap[crop.id]) crop.name = nameMap[crop.id];
+      }
+    }
+  }
+
   res.json(data);
 });
 
@@ -5422,6 +5458,7 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
   const userId = req.user.id;
   const {
     name, postcode,
+    country,     // "GB", "IE", "DE", "US" etc — from country selector on onboarding
     crops,       // [{ name, crop_def_id, stage }]
     area_type,
     area_name,
@@ -5435,10 +5472,19 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "name, postcode, crops and area_type required" });
   }
 
+  // Derive locale from country_code using country_settings table
+  const countryCode = country || "GB";
+  let locale = "en-GB";
+  try {
+    const { data: cs } = await supabaseService.from("country_settings")
+      .select("locale").eq("country_code", countryCode).single();
+    if (cs?.locale) locale = cs.locale;
+  } catch (_) {}
+
   try {
     // 1. Save profile — use supabaseService so it bypasses RLS and definitely commits
     // locations.user_id FK references profiles.id so profile MUST exist before location insert
-    const profileData = { id: userId, name, postcode };
+    const profileData = { id: userId, name, postcode, country_code: countryCode, locale };
     if (signup_source)               profileData.signup_source               = signup_source;
     if (signup_medium)               profileData.signup_medium               = signup_medium;
     if (signup_campaign)             profileData.signup_campaign             = signup_campaign;
@@ -5454,11 +5500,24 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
     if (existingLocs?.length) {
       locationId = existingLocs[0].id;
     } else {
+      // Geocode synchronously so lat/lon is available immediately
+      let latitude = null, longitude = null;
+      const coords = await geocodePostcode(postcode, countryCode);
+      if (coords) { latitude = coords.latitude; longitude = coords.longitude; }
+
       const { data: loc, error: locErr } = await supabaseService.from("locations").insert({
-        user_id: userId, name: "My garden", postcode,
+        user_id: userId, name: "My garden", postcode, country_code: countryCode, latitude, longitude,
       }).select("id").single();
       if (locErr) throw new Error("Location: " + locErr.message);
       locationId = loc.id;
+
+      // Fetch frost dates in background — non-blocking
+      if (latitude && longitude) {
+        fetchFrostDates(latitude, longitude).then(frost => {
+          if (!frost) return;
+          supabaseService.from("locations").update(frost).eq("id", locationId).catch(() => {});
+        }).catch(() => {});
+      }
     }
 
     // 3. Create first area (or reuse existing)
