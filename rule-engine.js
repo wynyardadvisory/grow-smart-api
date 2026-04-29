@@ -193,11 +193,20 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = [], 
   }
   // hardy, overwintering, perennial → frostOffsetWeeks stays 0
 
+  // Indoor sowing gets a smaller offset than outdoor — plants are protected from frost indoors.
+  // Starting tomatoes indoors in Helsinki in Feb is fine; it's the outdoor transplant that's frost-critical.
+  // Apply half the offset to sow windows for indoor crops, full offset to transplant windows.
+  // Semi-hardy already gets half offset — don't halve again for indoor.
+  const isIndoorSow = sowMethod === "indoors";
+  const sowOffsetWeeks = (isIndoorSow && sensitivityBand === "tender")
+    ? Math.round(frostOffsetWeeks / 2)   // tender indoor: half offset
+    : frostOffsetWeeks;                  // all others: full band offset
+
   // Adjust sowing/transplant windows — potatoes left unshifted (overridden by variety type)
-  const adjSowStart = frostOffsetWeeks !== 0 ? shiftMonth(sowStart, frostOffsetWeeks) : sowStart;
-  const adjSowEnd   = frostOffsetWeeks !== 0 ? shiftMonth(sowEnd,   frostOffsetWeeks) : sowEnd;
-  const adjTxStart  = frostOffsetWeeks !== 0 ? shiftMonth(txStart,  frostOffsetWeeks) : txStart;
-  const adjTxEnd    = frostOffsetWeeks !== 0 ? shiftMonth(txEnd,    frostOffsetWeeks) : txEnd;
+  const adjSowStart = sowOffsetWeeks !== 0 ? shiftMonth(sowStart, sowOffsetWeeks) : sowStart;
+  const adjSowEnd   = sowOffsetWeeks !== 0 ? shiftMonth(sowEnd,   sowOffsetWeeks) : sowEnd;
+  const adjTxStart  = frostOffsetWeeks !== 0 ? shiftMonth(txStart, frostOffsetWeeks) : txStart;
+  const adjTxEnd    = frostOffsetWeeks !== 0 ? shiftMonth(txEnd,   frostOffsetWeeks) : txEnd;
 
   // Autumn frost gating — suppress tasks if the growing season is too short
   // Extracts month from stored "2000-MM-DD" format
