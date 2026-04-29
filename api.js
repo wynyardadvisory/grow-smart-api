@@ -2963,11 +2963,20 @@ app.post("/barcode/scan-image", requireAuth, async (req, res) => {
     try { parsed = parseAIJson(scanText, scanProvider); } catch { return res.json({ found: false }); }
     if (!parsed.found) return res.json({ found: false });
 
-    // Store barcode against DB entry if identified
+    // Store barcode against DB entry if identified — use alias-aware resolution
     if (parsed.barcode) {
       if (mode === "crop" && parsed.name) {
-        const { data: cropDef } = await supabaseService.from("crop_definitions").select("id").ilike("name", parsed.name).maybeSingle();
-        if (cropDef?.id) { await supabaseService.from("crop_definitions").update({ barcode: parsed.barcode }).eq("id", cropDef.id); parsed.crop_def_id = cropDef.id; }
+        // Look up user locale for alias resolution
+        let userLocale = "en-GB";
+        try {
+          const { data: prof } = await supabaseService.from("profiles").select("locale, country_code").eq("id", req.user.id).single();
+          if (prof?.locale) userLocale = prof.locale;
+        } catch (_) {}
+        const { crop_def_id } = await resolveCropDefId(parsed.name, userLocale);
+        if (crop_def_id) {
+          await supabaseService.from("crop_definitions").update({ barcode: parsed.barcode }).eq("id", crop_def_id).catch(() => {});
+          parsed.crop_def_id = crop_def_id;
+        }
       } else if (mode === "feed" && parsed.product_name) {
         const { data: feedEntry } = await supabaseService.from("feed_catalog").select("id").ilike("product_name", parsed.product_name).maybeSingle();
         if (feedEntry?.id) await supabaseService.from("feed_catalog").update({ barcode: parsed.barcode }).eq("id", feedEntry.id);
@@ -3023,7 +3032,8 @@ app.get("/barcode/:code", requireAuth, async (req, res) => {
       const name = p.product_name_en || p.product_name || p.generic_name || null;
       if (name) {
         // Use Claude to interpret whether it's a seed packet or feed
-        const profile = await enrichBarcodeWithClaude(name, p.brands || null, mode, code);
+        const { data: barcodeProf } = await supabaseService.from("profiles").select("locale, country_code").eq("id", req.user.id).single().catch(() => ({ data: null }));
+        const profile = await enrichBarcodeWithClaude(name, p.brands || null, mode, code, barcodeProf?.locale || "en-GB", barcodeProf?.country_code || "GB");
         return res.json({ found: true, source: "openfoodfacts", ...profile });
       }
     }
@@ -3035,7 +3045,8 @@ app.get("/barcode/:code", requireAuth, async (req, res) => {
       const item = upcData.items[0];
       const name = item.title || item.brand || null;
       if (name) {
-        const profile = await enrichBarcodeWithClaude(name, item.brand || null, mode, code);
+        const { data: barcodeProf2 } = await supabaseService.from("profiles").select("locale, country_code").eq("id", req.user.id).single().catch(() => ({ data: null }));
+        const profile = await enrichBarcodeWithClaude(name, item.brand || null, mode, code, barcodeProf2?.locale || "en-GB", barcodeProf2?.country_code || "GB");
         return res.json({ found: true, source: "upcitemdb", ...profile });
       }
     }
@@ -3049,12 +3060,48 @@ app.get("/barcode/:code", requireAuth, async (req, res) => {
   }
 });
 
-async function enrichBarcodeWithClaude(productName, brand, mode, barcode) {
+// ── Scanner crop resolution — alias-aware ─────────────────────────────────────
+// 1. Try canonical name match in crop_definitions
+// 2. Try alias match in crop_names (e.g. Zucchini → Courgette, Cilantro → Coriander)
+// 3. If a new alias is found via scanner, save it with source='scanner_ai' for review
+async function resolveCropDefId(scannedName, userLocale) {
+  // Step 1: canonical name match
+  const { data: canonical } = await supabaseService
+    .from("crop_definitions").select("id").ilike("name", scannedName).eq("hidden", false).maybeSingle();
+  if (canonical?.id) return { crop_def_id: canonical.id, alias: false };
+
+  // Step 2: crop_names alias match (catches localised names like Zucchini, Cilantro, Eggplant)
+  const { data: alias } = await supabaseService
+    .from("crop_names").select("crop_def_id").ilike("name", scannedName).maybeSingle();
+  if (alias?.crop_def_id) {
+    // Save this scanned name as an alias for this locale if not already present
+    if (userLocale) {
+      const { data: existing } = await supabaseService.from("crop_names")
+        .select("id").eq("crop_def_id", alias.crop_def_id).eq("locale", userLocale).ilike("name", scannedName).maybeSingle();
+      if (!existing) {
+        await supabaseService.from("crop_names").insert({
+          crop_def_id: alias.crop_def_id,
+          locale:      userLocale,
+          name:        scannedName,
+          source:      "scanner_ai",
+        }).catch(() => {}); // non-blocking, fails silently if duplicate
+      }
+    }
+    return { crop_def_id: alias.crop_def_id, alias: true };
+  }
+
+  return { crop_def_id: null, alias: false };
+}
+
+async function enrichBarcodeWithClaude(productName, brand, mode, barcode, userLocale, userCountry) {
+  const gardenerDesc = userCountry && userCountry !== "GB"
+    ? `A gardener in ${userCountry} scanned a barcode`
+    : "A UK gardener scanned a barcode";
   const prompt = mode === "crop"
-    ? `A UK gardener scanned a barcode. Product: "${productName}"${brand ? ` by ${brand}` : ""}. 
-Is this a seed packet? If yes, identify the crop and variety. If it is NOT a seed packet, say so.
+    ? `${gardenerDesc}. Product: "${productName}"${brand ? ` by ${brand}` : ""}. 
+Is this a seed packet? If yes, identify the crop and variety. Use the canonical English name (e.g. Courgette not Zucchini). If it is NOT a seed packet, say so.
 Respond ONLY with JSON: {"is_seed":true,"name":"Carrot","variety":"Nantes 2","description":"Brief growing note","sow_window":"Mar - Jun","brand":"${brand||""}"}`
-    : `A UK gardener scanned a barcode. Product: "${productName}"${brand ? ` by ${brand}` : ""}.
+    : `${gardenerDesc}. Product: "${productName}"${brand ? ` by ${brand}` : ""}.
 Is this a garden feed or fertiliser? If yes, identify it. If NOT, say so.
 Respond ONLY with JSON: {"is_feed":true,"name":"Product name","brand":"${brand||""}","product_name":"${productName}","form":"liquid","feed_type":"tomato","npk":"4-3-8","description":"Brief description"}`;
 
@@ -3063,17 +3110,16 @@ Respond ONLY with JSON: {"is_feed":true,"name":"Product name","brand":"${brand||
   try { parsed = parseAIJson(barcodeText, barcodeProvider); } catch { return { name: productName, brand }; }
   // Store barcode against crop_def / feed_catalog for instant future lookups
   if (mode === "crop" && parsed.is_seed && parsed.name) {
-    const { data: cropDef } = await supabaseService
-      .from("crop_definitions").select("id").ilike("name", parsed.name).maybeSingle();
-    if (cropDef?.id) {
-      await supabaseService.from("crop_definitions").update({ barcode: code }).eq("id", cropDef.id);
-      parsed.crop_def_id = cropDef.id;
+    const { crop_def_id } = await resolveCropDefId(parsed.name, userLocale);
+    if (crop_def_id) {
+      await supabaseService.from("crop_definitions").update({ barcode }).eq("id", crop_def_id).catch(() => {});
+      parsed.crop_def_id = crop_def_id;
     }
   } else if (mode === "feed" && parsed.is_feed && parsed.product_name) {
     const { data: feedEntry } = await supabaseService
       .from("feed_catalog").select("id").ilike("product_name", parsed.product_name).maybeSingle();
     if (feedEntry?.id) {
-      await supabaseService.from("feed_catalog").update({ barcode: code }).eq("id", feedEntry.id);
+      await supabaseService.from("feed_catalog").update({ barcode }).eq("id", feedEntry.id);
     }
   }
   return { ...parsed, barcode };
