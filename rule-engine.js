@@ -167,22 +167,37 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = [], 
   const cropGroup      = def.category ?? null;
 
   // ── Frost offset — international climate calibration ──────────────────────
-  // Compare user location's last spring frost date to UK baseline (April 15).
-  // Only applied to frost-sensitive crops. Falls back to 0 (no shift) if no data.
-  const locationLastFrost = crop.area?.location?.last_frost_spring || null;
-  let frostOffsetWeeks = 0;
-  if (locationLastFrost && frostSensitive && /^\d{4}-\d{2}-\d{2}$/.test(locationLastFrost)) {
+  // Uses sensitivity_band from crop_definitions to apply differential offsets:
+  //   tender       → full offset (tomatoes, peppers, courgettes, beans etc)
+  //   semi_hardy   → half offset capped at 2 weeks (lettuce, beetroot, peas etc)
+  //   hardy        → no offset (kale, brassicas, root veg, herbs)
+  //   overwintering→ no offset (garlic, overwintering onions etc)
+  //   perennial    → no offset (fruit trees, berries etc)
+  // Falls back to frostSensitive boolean if sensitivity_band not set.
+  const sensitivityBand    = def.sensitivity_band || (frostSensitive ? "tender" : "hardy");
+  const locationLastFrost  = crop.area?.location?.last_frost_spring || null;
+  let rawOffsetWeeks = 0;
+  if (locationLastFrost && /^\d{4}-\d{2}-\d{2}$/.test(locationLastFrost)) {
     const baseline = new Date("2000-04-15");
-    const actual   = new Date("2000-" + locationLastFrost.slice(5)); // extract MM-DD from "2000-MM-DD"
-    frostOffsetWeeks = Math.round((actual - baseline) / (7 * 86400000));
-    frostOffsetWeeks = Math.max(-4, Math.min(8, frostOffsetWeeks)); // cap: -4 to +8 weeks
+    const actual   = new Date("2000-" + locationLastFrost.slice(5));
+    rawOffsetWeeks = Math.round((actual - baseline) / (7 * 86400000));
+    rawOffsetWeeks = Math.max(-4, Math.min(8, rawOffsetWeeks)); // cap: -4 to +8 weeks
   }
-  // Adjust sowing/transplant windows for frost-sensitive crops only
-  // Potatoes are left unshifted — their windows are overridden by variety type in _evalPlanned
-  const adjSowStart = frostSensitive ? shiftMonth(sowStart, frostOffsetWeeks) : sowStart;
-  const adjSowEnd   = frostSensitive ? shiftMonth(sowEnd,   frostOffsetWeeks) : sowEnd;
-  const adjTxStart  = frostSensitive ? shiftMonth(txStart,  frostOffsetWeeks) : txStart;
-  const adjTxEnd    = frostSensitive ? shiftMonth(txEnd,    frostOffsetWeeks) : txEnd;
+
+  // Apply offset based on sensitivity band
+  let frostOffsetWeeks = 0;
+  if (sensitivityBand === "tender") {
+    frostOffsetWeeks = rawOffsetWeeks;                            // full offset
+  } else if (sensitivityBand === "semi_hardy") {
+    frostOffsetWeeks = Math.max(-2, Math.min(2, Math.round(rawOffsetWeeks / 2))); // half, capped ±2 weeks
+  }
+  // hardy, overwintering, perennial → frostOffsetWeeks stays 0
+
+  // Adjust sowing/transplant windows — potatoes left unshifted (overridden by variety type)
+  const adjSowStart = frostOffsetWeeks !== 0 ? shiftMonth(sowStart, frostOffsetWeeks) : sowStart;
+  const adjSowEnd   = frostOffsetWeeks !== 0 ? shiftMonth(sowEnd,   frostOffsetWeeks) : sowEnd;
+  const adjTxStart  = frostOffsetWeeks !== 0 ? shiftMonth(txStart,  frostOffsetWeeks) : txStart;
+  const adjTxEnd    = frostOffsetWeeks !== 0 ? shiftMonth(txEnd,    frostOffsetWeeks) : txEnd;
 
   // Autumn frost gating — suppress tasks if the growing season is too short
   // Extracts month from stored "2000-MM-DD" format
@@ -196,6 +211,7 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = [], 
     baseline_last_frost: "04-15",
     local_last_frost:    locationLastFrost ? locationLastFrost.slice(5) : null,
     offset_weeks:        frostOffsetWeeks,
+    sensitivity_band:    sensitivityBand,
   } : null;
 
   // Date anchors
@@ -325,7 +341,7 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = [], 
     sowStart: adjSowStart, sowEnd: adjSowEnd,
     txStart:  adjTxStart,  txEnd:  adjTxEnd,
     harvestStart, harvestEnd,
-    frostOffsetWeeks, // exposed for debugging
+    frostOffsetWeeks, sensitivityBand, // exposed for debugging
     autumnFrostMonth, // month of first autumn frost — used to suppress late-season tasks
     climateAdjustment, // null for UK users, populated for international users
 
@@ -2460,7 +2476,7 @@ class RuleEngine {
           sow_window_start, sow_window_end,
           transplant_window_start, transplant_window_end,
           harvest_month_start, harvest_month_end, feed_type,
-          default_establishment,
+          default_establishment, sensitivity_band,
           soil_ph_min, soil_ph_max, soil_temp_min_c
         ),
         variety:variety_id (
