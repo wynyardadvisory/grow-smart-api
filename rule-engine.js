@@ -161,10 +161,13 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = [], 
   const harvestEnd     = def.harvest_month_end   ?? null;
   const feedInterval   = variety.feed_interval_days_override ?? def.feed_interval_days ?? null;
   const feedType       = def.feed_type ?? null;
-  const frostSensitive = variety.frost_sensitive_override ?? def.frost_sensitive ?? true;
-  const isPerennial    = def.is_perennial ?? false;
-  const sowMethod      = def.sow_method ?? "either";
-  const cropGroup      = def.category ?? null;
+  const frostSensitive        = variety.frost_sensitive_override ?? def.frost_sensitive ?? true;
+  const isPerennial           = def.is_perennial ?? false;
+  const sowMethod             = def.sow_method ?? "either";
+  const cropGroup             = def.category ?? null;
+  const sowWeeksBeforeFrost   = def.sow_weeks_before_frost  ?? null; // weeks before last spring frost to sow
+  const sowWeeksAfterFrost    = def.sow_weeks_after_frost   ?? null; // weeks after last spring frost to sow (direct)
+  const txWeeksAfterFrost     = def.tx_weeks_after_frost    ?? null; // weeks after last spring frost to transplant
 
   // ── Frost offset — international climate calibration ──────────────────────
   // Uses sensitivity_band from crop_definitions to apply differential offsets:
@@ -202,11 +205,70 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = [], 
     ? Math.round(frostOffsetWeeks / 2)   // tender indoor: half offset
     : frostOffsetWeeks;                  // all others: full band offset
 
-  // Adjust sowing/transplant windows — potatoes left unshifted (overridden by variety type)
-  const adjSowStart = sowOffsetWeeks !== 0 ? shiftMonth(sowStart, sowOffsetWeeks) : sowStart;
-  const adjSowEnd   = sowOffsetWeeks !== 0 ? shiftMonth(sowEnd,   sowOffsetWeeks) : sowEnd;
-  const adjTxStart  = frostOffsetWeeks !== 0 ? shiftMonth(txStart, frostOffsetWeeks) : txStart;
-  const adjTxEnd    = frostOffsetWeeks !== 0 ? shiftMonth(txEnd,   frostOffsetWeeks) : txEnd;
+  // ── Frost-relative date windows (opt-in, per crop) ────────────────────────
+  // If the crop has sow_weeks_before_frost / sow_weeks_after_frost / tx_weeks_after_frost
+  // AND the location has a last_frost_spring date — compute actual calendar windows.
+  // Otherwise fall back to the existing month-offset logic above.
+  // This is opt-in: only crops with these columns populated get the new logic.
+  let adjSowStart, adjSowEnd, adjTxStart, adjTxEnd;
+
+  const hasFrostRelativeData = locationLastFrost &&
+    /^\d{4}-\d{2}-\d{2}$/.test(locationLastFrost) &&
+    (sowWeeksBeforeFrost !== null || sowWeeksAfterFrost !== null || txWeeksAfterFrost !== null) &&
+    (sensitivityBand === "tender" || sensitivityBand === "semi_hardy");
+
+  if (hasFrostRelativeData) {
+    // Convert last_frost_spring (stored as "2000-MM-DD") to a date in the current year
+    const currentYear   = new Date().getFullYear();
+    const frostMmDd     = locationLastFrost.slice(5); // "MM-DD"
+    const frostDate     = new Date(`${currentYear}-${frostMmDd}`);
+
+    // Helper: convert Date → month integer (1-12)
+    const dateToMonth = (d) => d.getMonth() + 1;
+
+    // Sow window — start and end derived from frost date
+    if (sowWeeksBeforeFrost !== null) {
+      // Indoor crops: sow window starts sowWeeksBeforeFrost before frost, ends 1 week before frost
+      const sowStartDate = new Date(frostDate); sowStartDate.setDate(sowStartDate.getDate() - sowWeeksBeforeFrost * 7);
+      const sowEndDate   = new Date(frostDate); sowEndDate.setDate(sowEndDate.getDate() - 7); // 1 week before frost
+      adjSowStart = dateToMonth(sowStartDate);
+      adjSowEnd   = dateToMonth(sowEndDate);
+    } else if (sowWeeksAfterFrost !== null) {
+      // Direct sow crops: sow window starts sowWeeksAfterFrost after frost, ends 4 weeks later
+      const sowStartDate = new Date(frostDate); sowStartDate.setDate(sowStartDate.getDate() + sowWeeksAfterFrost * 7);
+      const sowEndDate   = new Date(sowStartDate); sowEndDate.setDate(sowEndDate.getDate() + 28);
+      adjSowStart = dateToMonth(sowStartDate);
+      adjSowEnd   = dateToMonth(sowEndDate);
+    } else {
+      // No sow data — fall back to offset logic
+      adjSowStart = sowOffsetWeeks !== 0 ? shiftMonth(sowStart, sowOffsetWeeks) : sowStart;
+      adjSowEnd   = sowOffsetWeeks !== 0 ? shiftMonth(sowEnd,   sowOffsetWeeks) : sowEnd;
+    }
+
+    // Transplant window — derived from frost date
+    if (txWeeksAfterFrost !== null) {
+      const txStartDate = new Date(frostDate); txStartDate.setDate(txStartDate.getDate() + txWeeksAfterFrost * 7);
+      const txEndDate   = new Date(txStartDate); txEndDate.setDate(txEndDate.getDate() + 28);
+      adjTxStart = dateToMonth(txStartDate);
+      adjTxEnd   = dateToMonth(txEndDate);
+    } else {
+      adjTxStart = frostOffsetWeeks !== 0 ? shiftMonth(txStart, frostOffsetWeeks) : txStart;
+      adjTxEnd   = frostOffsetWeeks !== 0 ? shiftMonth(txEnd,   frostOffsetWeeks) : txEnd;
+    }
+
+    // Clamp all to valid month range
+    if (adjSowStart) adjSowStart = Math.max(1, Math.min(12, adjSowStart));
+    if (adjSowEnd)   adjSowEnd   = Math.max(1, Math.min(12, adjSowEnd));
+    if (adjTxStart)  adjTxStart  = Math.max(1, Math.min(12, adjTxStart));
+    if (adjTxEnd)    adjTxEnd    = Math.max(1, Math.min(12, adjTxEnd));
+
+  } else {
+    // Fall back to existing month-offset logic — potatoes left unshifted (overridden by variety type)
+    adjSowStart = sowOffsetWeeks !== 0 ? shiftMonth(sowStart, sowOffsetWeeks) : sowStart;
+    adjSowEnd   = sowOffsetWeeks !== 0 ? shiftMonth(sowEnd,   sowOffsetWeeks) : sowEnd;
+    adjTxStart  = frostOffsetWeeks !== 0 ? shiftMonth(txStart, frostOffsetWeeks) : txStart;
+    adjTxEnd    = frostOffsetWeeks !== 0 ? shiftMonth(txEnd,   frostOffsetWeeks) : txEnd;
+  }
 
   // Autumn frost gating — suppress tasks if the growing season is too short
   // Extracts month from stored "2000-MM-DD" format
@@ -216,11 +278,12 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = [], 
     : null; // null = unknown, no gating applied
 
   // Climate adjustment metadata — exposed for debugging and future user-facing explainability
-  const climateAdjustment = frostOffsetWeeks !== 0 ? {
-    baseline_last_frost: "04-15",
-    local_last_frost:    locationLastFrost ? locationLastFrost.slice(5) : null,
-    offset_weeks:        frostOffsetWeeks,
-    sensitivity_band:    sensitivityBand,
+  const climateAdjustment = (frostOffsetWeeks !== 0 || hasFrostRelativeData) ? {
+    baseline_last_frost:  "04-15",
+    local_last_frost:     locationLastFrost ? locationLastFrost.slice(5) : null,
+    offset_weeks:         frostOffsetWeeks,
+    sensitivity_band:     sensitivityBand,
+    frost_relative_dates: hasFrostRelativeData, // true = using precise frost-relative windows
   } : null;
 
   // Date anchors
@@ -2486,6 +2549,7 @@ class RuleEngine {
           transplant_window_start, transplant_window_end,
           harvest_month_start, harvest_month_end, feed_type,
           default_establishment, sensitivity_band,
+          sow_weeks_before_frost, sow_weeks_after_frost, tx_weeks_after_frost,
           soil_ph_min, soil_ph_max, soil_temp_min_c
         ),
         variety:variety_id (
