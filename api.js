@@ -651,15 +651,68 @@ app.post("/auth/profile", requireAuth,
   [body("name").trim().notEmpty(), body("postcode").trim().notEmpty()],
   async (req, res) => {
     if (!validate(req, res)) return;
-    const { name, postcode, measurement_unit } = req.body;
+    const { name, postcode, measurement_unit, country_code } = req.body;
     const updates = { id: req.user.id, name, postcode };
     if (measurement_unit === "metric" || measurement_unit === "imperial") {
       updates.measurement_unit = measurement_unit;
     }
+
+    // Save country_code and derive locale if country changed
+    if (country_code) {
+      updates.country_code = country_code;
+      try {
+        const { data: cs } = await supabaseService.from("country_settings")
+          .select("locale").eq("country_code", country_code).single();
+        if (cs?.locale) updates.locale = cs.locale;
+      } catch (_) {}
+    }
+
     const { data, error } = await req.db.from("profiles")
       .upsert(updates).select().single();
     if (error) return res.status(500).json({ error: error.message });
     res.status(201).json(data);
+
+    // Update primary location in background — postcode, country_code, lat/lon, frost dates
+    // This keeps the location in sync when user changes country or postcode in profile
+    try {
+      const effectiveCountry = country_code || "GB";
+      const { data: locations } = await supabaseService.from("locations")
+        .select("id, postcode, country_code")
+        .eq("user_id", req.user.id)
+        .order("id", { ascending: true })
+        .limit(1);
+      const loc = locations?.[0];
+      if (loc) {
+        const postcodeChanged = postcode && postcode !== loc.postcode;
+        const countryChanged  = country_code && country_code !== loc.country_code;
+        if (postcodeChanged || countryChanged) {
+          // Geocode new postcode/country
+          const coords = await geocodePostcode(postcode || loc.postcode, effectiveCountry);
+          const locUpdates = {
+            postcode:     postcode || loc.postcode,
+            country_code: effectiveCountry,
+            // Clear old frost data so backfill picks it up fresh
+            last_frost_spring:      null,
+            first_frost_autumn:     null,
+            growing_season_days:    null,
+            climate_zone:           null,
+            frost_dates_fetched_at: null,
+          };
+          if (coords) {
+            locUpdates.latitude  = coords.latitude;
+            locUpdates.longitude = coords.longitude;
+            // Fetch frost dates in background
+            fetchFrostDates(coords.latitude, coords.longitude).then(frost => {
+              if (!frost) return;
+              supabaseService.from("locations").update(frost).eq("id", loc.id).catch(() => {});
+            }).catch(() => {});
+          }
+          await supabaseService.from("locations").update(locUpdates).eq("id", loc.id);
+        }
+      }
+    } catch (e) {
+      console.error("[ProfileSave] Location update failed:", e.message);
+    }
   }
 );
 
