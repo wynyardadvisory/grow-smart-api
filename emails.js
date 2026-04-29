@@ -77,7 +77,7 @@ function templateNudgeUnactivated(name) {
       </p>
     </div>
     <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
-      <p style="font-size:12px;color:#888;margin:0;">Vercro · Built for UK growers · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
+      <p style="font-size:12px;color:#888;margin:0;">Vercro · Growing intelligence · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
     </div>
   </div>
 </body>
@@ -102,7 +102,7 @@ function templateNudgeUnactivatedD5(name) {
     <div style="padding:40px;">
       <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">Hey ${firstName} — your garden plan is one step away</h1>
       <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
-        You signed up a few days ago but haven't set up your garden yet. Takes about 2 minutes — just tell us your postcode and what you're growing, and we'll build your personalised daily plan.
+        You signed up a few days ago but haven't set up your garden yet. Takes about 2 minutes — just tell us your location and what you're growing, and we'll build your personalised daily plan.
       </p>
       <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 32px;">
         Daily task reminders, harvest forecasts, frost alerts — all based on exactly what you're growing.
@@ -237,7 +237,7 @@ function templateNudgeUnconfirmed(name) {
       </p>
     </div>
     <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
-      <p style="font-size:12px;color:#888;margin:0;">Vercro · Built for UK growers · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
+      <p style="font-size:12px;color:#888;margin:0;">Vercro · Growing intelligence · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
     </div>
   </div>
 </body>
@@ -635,10 +635,10 @@ function templateWaitlistInvite(name) {
     <div style="padding:40px;">
       <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">You're in, ${firstName}!</h1>
       <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
-        Your place on the Vercro beta is ready. Create your free account and we'll build you a personalised growing plan based on your crops, your postcode and the time of year.
+        Your place on the Vercro beta is ready. Create your free account and we'll build you a personalised growing plan based on your crops, your location and the time of year.
       </p>
       <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 32px;">
-        Daily tasks, harvest forecasts, frost alerts, AI crop identification — all in one place, built for UK growers.
+        Daily tasks, harvest forecasts, frost alerts, AI crop identification — all in one place, wherever you grow.
       </p>
       <div style="text-align:center;margin-bottom:24px;">
         <a href="https://app.vercro.com" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">
@@ -789,14 +789,14 @@ function templateWaitlistNudge2(name) {
     <div style="padding:40px;">
       <h1 style="font-family:Georgia,serif;font-size:22px;color:#1a1a1a;margin:0 0 16px;">The growing season is getting started</h1>
       <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 16px;">
-        Hey ${firstName} — March and April are the busiest months in the UK growing calendar. Sowing windows are opening, frost risk is still real, and getting organised now makes the rest of the season much easier.
+        Hey ${firstName} — the growing season is well underway. Sowing windows are opening, frost risk is still real in many areas, and getting organised now makes the rest of the season much easier.
       </p>
       <p style="font-size:15px;color:#4a4a4a;line-height:1.7;margin:0 0 24px;">
-        Vercro tells you exactly what to do and when — based on your crops, your postcode and the actual weather. Your spot is still there.
+        Vercro tells you exactly what to do and when — based on your crops, your location and the actual weather. Your spot is still there.
       </p>
       <div style="background:#f4f8f2;border-radius:12px;padding:16px 20px;margin-bottom:28px;">
         <p style="font-size:13px;color:#2F5D50;font-weight:700;margin:0 0 8px;">What you'll get on day one:</p>
-        <p style="font-size:13px;color:#4a4a4a;line-height:1.7;margin:0;">✓ A personalised daily task list<br>✓ Sowing and harvest windows for your crops<br>✓ Frost alerts based on your postcode<br>✓ AI crop identification if you're not sure what you have</p>
+        <p style="font-size:13px;color:#4a4a4a;line-height:1.7;margin:0;">✓ A personalised daily task list<br>✓ Sowing and harvest windows for your crops<br>✓ Frost alerts based on your location<br>✓ AI crop identification if you're not sure what you have</p>
       </div>
       <div style="text-align:center;margin-bottom:16px;">
         <a href="https://app.vercro.com" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">
@@ -911,7 +911,7 @@ function templateReengageDay30(name) {
   const firstName = name ? name.split(" ")[0] : "there";
   const month = new Date().toLocaleString("en-GB", { month: "long" });
   return {
-    subject: `What's happening in UK gardens this ${month}`,
+    subject: `What's growing this ${month}`,
     html: `
 <!DOCTYPE html>
 <html>
@@ -1108,12 +1108,13 @@ function templateGardenToday(name, tasks, cropNames) {
         </div>`).join("")}
         ${taskCount > 3 ? `<div style="font-size:13px;color:#6E6E6E;margin-top:14px;padding-top:14px;border-top:1px solid #D4E8CE;">+ ${taskCount - 3} more task${taskCount - 3 !== 1 ? "s" : ""} in the app</div>` : ""}
       </div>
+      <p style="font-size:13px;color:#6E6E6E;line-height:1.6;margin:0 0 24px;">These tasks are timed around your local weather, growing season and frost dates.</p>
       <div style="text-align:center;margin-bottom:16px;">
         <a href="${APP_URL}" style="display:inline-block;background:#2F5D50;color:#ffffff;text-decoration:none;border-radius:12px;padding:16px 36px;font-family:Georgia,serif;font-size:16px;font-weight:700;">Open my garden →</a>
       </div>
     </div>
     <div style="background:#f4f8f2;padding:20px 40px;text-align:center;border-top:1px solid #D4E8CE;">
-      <p style="font-size:12px;color:#888;margin:0;">Vercro · Built for UK growers · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
+      <p style="font-size:12px;color:#888;margin:0;">Vercro · Growing intelligence · <a href="https://vercro.com" style="color:#2F5D50;">vercro.com</a></p>
     </div>
   </div>
 </body>
