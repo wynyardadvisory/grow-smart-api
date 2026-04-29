@@ -1203,7 +1203,10 @@ app.get("/crop-definitions", async (req, res) => {
       const nameMap = {};
       for (const n of names) nameMap[n.crop_def_id] = n.name;
       for (const crop of data) {
-        if (nameMap[crop.id]) crop.name = nameMap[crop.id];
+        if (nameMap[crop.id]) {
+          crop.canonical_name = crop.name; // preserve original for matching
+          crop.name = nameMap[crop.id];    // display localised name
+        }
       }
     }
   }
@@ -2368,8 +2371,8 @@ If the product is not a real plant feed, return: { "valid": false }`;
 app.get("/feed-catalog", requireAuth, async (req, res) => {
   // Get user's country to filter feed catalog to relevant products
   const { data: profile } = await req.db.from("profiles")
-    .select("country").eq("id", req.user.id).single();
-  const country = profile?.country || "GB";
+    .select("country_code").eq("id", req.user.id).single();
+  const country = profile?.country_code || "GB";
 
   const { data, error } = await req.db.from("feed_catalog")
     .select("brand, product_name, form, feed_type, npk, dilution_ml_per_litre, frequency_days, suitable_crop_types, application_method, notes")
@@ -2978,8 +2981,29 @@ app.post("/barcode/scan-image", requireAuth, async (req, res) => {
           parsed.crop_def_id = crop_def_id;
         }
       } else if (mode === "feed" && parsed.product_name) {
-        const { data: feedEntry } = await supabaseService.from("feed_catalog").select("id").ilike("product_name", parsed.product_name).maybeSingle();
-        if (feedEntry?.id) await supabaseService.from("feed_catalog").update({ barcode: parsed.barcode }).eq("id", feedEntry.id);
+        // Look up user country for feed matching
+        let scanUserCountry = "GB";
+        try {
+          const { data: scanProf } = await supabaseService.from("profiles").select("country_code").eq("id", req.user.id).single();
+          if (scanProf?.country_code) scanUserCountry = scanProf.country_code;
+        } catch (_) {}
+        // 1. Prefer country-specific match
+        let feedEntry = null;
+        const { data: localFeed } = await supabaseService.from("feed_catalog").select("id")
+          .ilike("product_name", parsed.product_name).contains("countries", [scanUserCountry]).maybeSingle();
+        if (localFeed?.id) {
+          feedEntry = localFeed;
+        } else {
+          const { data: globalFeed } = await supabaseService.from("feed_catalog").select("id")
+            .ilike("product_name", parsed.product_name).maybeSingle();
+          if (globalFeed?.id) feedEntry = globalFeed;
+        }
+        if (feedEntry?.id) {
+          await supabaseService.from("feed_catalog").update({ barcode: parsed.barcode }).eq("id", feedEntry.id);
+          parsed.feed_catalog_id = feedEntry.id;
+        } else {
+          parsed.countries = [scanUserCountry];
+        }
       }
     }
 
@@ -3116,10 +3140,26 @@ Respond ONLY with JSON: {"is_feed":true,"name":"Product name","brand":"${brand||
       parsed.crop_def_id = crop_def_id;
     }
   } else if (mode === "feed" && parsed.is_feed && parsed.product_name) {
-    const { data: feedEntry } = await supabaseService
-      .from("feed_catalog").select("id").ilike("product_name", parsed.product_name).maybeSingle();
+    // 1. Prefer country-specific match
+    const country = userCountry || "GB";
+    let feedEntry = null;
+    const { data: localFeed } = await supabaseService
+      .from("feed_catalog").select("id").ilike("product_name", parsed.product_name)
+      .contains("countries", [country]).maybeSingle();
+    if (localFeed?.id) {
+      feedEntry = localFeed;
+    } else {
+      // 2. Fallback to any match
+      const { data: globalFeed } = await supabaseService
+        .from("feed_catalog").select("id").ilike("product_name", parsed.product_name).maybeSingle();
+      if (globalFeed?.id) feedEntry = globalFeed;
+    }
     if (feedEntry?.id) {
       await supabaseService.from("feed_catalog").update({ barcode }).eq("id", feedEntry.id);
+      parsed.feed_catalog_id = feedEntry.id;
+    } else {
+      // 3. New feed — tag with user's country
+      parsed.countries = [country];
     }
   }
   return { ...parsed, barcode };
@@ -4415,15 +4455,15 @@ app.get("/weather", requireAuth, async (req, res) => {
   let weatherCountry = "GB";
   if (location_id) {
     const { data } = await req.db.from("locations")
-      .select("postcode, country").eq("id", location_id).single();
+      .select("postcode, country_code").eq("id", location_id).single();
     postcode = data?.postcode;
-    if (data?.country) weatherCountry = data.country;
+    if (data?.country_code) weatherCountry = data.country_code;
   }
   if (!postcode) {
     const { data } = await req.db.from("profiles")
-      .select("postcode, country").eq("id", req.user.id).single();
+      .select("postcode, country_code").eq("id", req.user.id).single();
     postcode = data?.postcode;
-    if (data?.country) weatherCountry = data.country;
+    if (data?.country_code) weatherCountry = data.country_code;
   }
   if (!postcode) return res.status(400).json({ error: "No postcode set" });
 
@@ -4549,7 +4589,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     req.db.from("crop_instances")
       .select("id, name, variety, variety_id, sown_date, stage, timeline_offset_days, area_id, missed_task_note, succession_index, crop_def:crop_def_id(harvest_month_start, harvest_month_end, days_to_maturity_min, days_to_maturity_max, pest_window_start, pest_window_end, pest_notes, is_perennial)")
       .eq("user_id", req.user.id).eq("active", true),
-    req.db.from("profiles").select("name, plan, postcode, country, photo_url").eq("id", req.user.id).single(),
+    req.db.from("profiles").select("name, plan, postcode, country_code, photo_url").eq("id", req.user.id).single(),
     req.db.from("harvest_log")
       .select("id, harvested_at, quantity_g, crop:crop_instance_id(name)")
       .eq("user_id", req.user.id)
@@ -4633,7 +4673,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
   let weather = null;
   try {
     const rawPostcode      = profile?.postcode;
-    const dashboardCountry = profile?.country || "GB";
+    const dashboardCountry = profile?.country_code || "GB";
     if (rawPostcode) {
       // Always use outward code only (e.g. "TS22" not "TS22 5BQ") — OpenWeather requires it
       const postcode = rawPostcode.trim().split(" ")[0].toUpperCase();
