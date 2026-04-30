@@ -499,6 +499,10 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = [], 
     // Potato type
     potatoType: variety.potato_type || null,
 
+    // Tomato/variety classification — used for sideshoot rule gating
+    // e.g. "Bush/Trailing" suppresses sideshoot removal task
+    varietyClassification: variety.classification || null,
+
     // Lifecycle mode — seasonal | established | overwintered
     // Defaults to seasonal for all existing crops (DB column defaults to 'seasonal')
     lifecycleMode: crop.lifecycle_mode || "seasonal",
@@ -1407,6 +1411,55 @@ class ScheduledRuleEngine {
               meta:         { planting_date: plantDate, earthing_number: earthingNum },
             }));
           }
+        }
+      }
+    }
+
+    // ── Tomato sideshoot removal ─────────────────────────────────────────────
+    // Fires for tomato crops from vegetative stage through fruiting.
+    // Three-way logic based on variety classification:
+    //   Bush/Trailing  → suppress entirely (these types should not be de-sideshot)
+    //   Known cordon   → fire targeted advice
+    //   No variety     → fire advisory with prompt to add variety for better advice
+    // Cadence: every 14 days (sideshoots need regular attention during growing season)
+    // Only fires May–September — outside this window tomatoes aren't actively growing outdoors
+    const TOMATO_DEF_ID = '5a349653-c09d-43b2-920f-f1b53d97ffb2';
+    if (ctx.def?.id === TOMATO_DEF_ID) {
+      const m = currentMonth();
+      const inTomatoSeason = m >= 5 && m <= 9;
+      const activeStages = ['vegetative', 'flowering', 'fruiting', 'harvesting'];
+
+      if (inTomatoSeason && activeStages.includes(ctx.stage)) {
+        const classification = ctx.varietyClassification || null;
+        const isBushOrTrailing = classification?.toLowerCase().includes('bush')
+          || classification?.toLowerCase().includes('trailing');
+
+        if (!isBushOrTrailing) {
+          const hasVariety = !!classification;
+          const sowAnchor  = ctx.sowDate || ctx.transplantDate;
+
+          // Cadence — anchor to 14-day windows from planting so it fires consistently
+          // rather than regenerating daily. Uses windowAnchor to snap to stable key.
+          const cadenceDays = 14;
+          const keyDate = windowAnchor(today, cadenceDays);
+
+          const title = hasVariety
+            ? `Check ${ctx.cropName} for sideshoots and remove any growing between the main stem and a leaf joint — do this every 1–2 weeks to keep energy focused on fruit`
+            : `If you're growing a cordon tomato variety (like Moneymaker or Gardener's Delight), check for sideshoots now and pinch out any growing between the main stem and a leaf joint. Bush and tumbler types don't need this — add your variety for tailored advice`;
+
+          results.push(candidate(ctx, {
+            ruleId:       'tomato_sideshoot',
+            taskType:     'care',
+            title,
+            description:  hasVariety
+              ? `Regular sideshoot removal on cordon tomatoes directs energy into fruit rather than leafy growth. Pinch out when small — they snap off cleanly.`
+              : `Not sure if you need to do this? Add your tomato variety and Vercro will tell you exactly what applies to your plants.`,
+            scheduledFor: today,
+            urgency:      'medium',
+            expiryDays:   cadenceDays,
+            leadTimeDays: 0,
+            meta:         { classification, has_variety: hasVariety, tomato_season: true },
+          }));
         }
       }
     }
@@ -2667,7 +2720,7 @@ class RuleEngine {
           pest_window_start_override, pest_window_end_override,
           sow_window_start, sow_window_end,
           transplant_window_start, transplant_window_end,
-          potato_type
+          potato_type, classification
         )
       `)
       .eq("user_id", userId)
