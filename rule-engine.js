@@ -499,10 +499,6 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = [], 
     // Potato type
     potatoType: variety.potato_type || null,
 
-    // Tomato/variety classification — used for sideshoot rule gating
-    // e.g. "Bush/Trailing" suppresses sideshoot removal task
-    varietyClassification: variety.classification || null,
-
     // Lifecycle mode — seasonal | established | overwintered
     // Defaults to seasonal for all existing crops (DB column defaults to 'seasonal')
     lifecycleMode: crop.lifecycle_mode || "seasonal",
@@ -1415,52 +1411,47 @@ class ScheduledRuleEngine {
       }
     }
 
-    // ── Tomato sideshoot removal ─────────────────────────────────────────────
-    // Fires for tomato crops from vegetative stage through fruiting.
-    // Three-way logic based on variety classification:
-    //   Bush/Trailing  → suppress entirely (these types should not be de-sideshot)
-    //   Known cordon   → fire targeted advice
-    //   No variety     → fire advisory with prompt to add variety for better advice
-    // Cadence: every 14 days (sideshoots need regular attention during growing season)
-    // Only fires May–September — outside this window tomatoes aren't actively growing outdoors
-    const TOMATO_DEF_ID = '5a349653-c09d-43b2-920f-f1b53d97ffb2';
-    if (ctx.def?.id === TOMATO_DEF_ID) {
+    // ── Cucumber / courgette hand pollination nudge ──────────────────────────
+    // Fires when crop reaches flowering stage for cucumber and courgette.
+    // Particularly important for:
+    //   - Greenhouse/polytunnel crops (no natural pollinators)
+    //   - Early season outdoor crops (pollinators not yet active)
+    // Three-way logic:
+    //   Protected area (greenhouse/polytunnel) → strong advice to hand pollinate
+    //   Outdoor, early season (May–June)       → nudge to check pollinators visiting
+    //   Outdoor, mid season (July+)            → suppress (pollinators active)
+    // Cadence: 10 days — flowers are short-lived and need regular attention
+    const COURGETTE_DEF_ID = '42f770f0-daf7-46c5-9427-a008b13413d4';
+    const CUCUMBER_DEF_ID  = '15aa9699-a37d-45f6-a6bb-9f79350e7a2a';
+    const isSquashFamily = ctx.def?.id === COURGETTE_DEF_ID || ctx.def?.id === CUCUMBER_DEF_ID;
+
+    if (isSquashFamily && ctx.stage === 'flowering') {
       const m = currentMonth();
-      const inTomatoSeason = m >= 5 && m <= 9;
-      const activeStages = ['vegetative', 'flowering', 'fruiting', 'harvesting'];
+      const isProtectedGrow = ctx.areaType === 'greenhouse' || ctx.areaType === 'polytunnel';
+      const isEarlyOutdoor  = !isProtectedGrow && m <= 6;
+      const isMidOutdoor    = !isProtectedGrow && m >= 7;
 
-      if (inTomatoSeason && activeStages.includes(ctx.stage)) {
-        const classification = ctx.varietyClassification || null;
-        const isBushOrTrailing = classification?.toLowerCase().includes('bush')
-          || classification?.toLowerCase().includes('trailing');
+      // Suppress for outdoor mid-season — pollinators are active, no intervention needed
+      if (!isMidOutdoor) {
+        const title = isProtectedGrow
+          ? `Hand pollinate your ${ctx.cropName} — with no natural pollinators inside, use a small brush or cotton bud to transfer pollen from male to female flowers. Female flowers have a tiny fruit behind the petals`
+          : `Check your ${ctx.cropName} flowers are getting pollinated — early in the season pollinators can be scarce. If you see flowers but no fruit forming, try hand pollinating with a small brush`;
 
-        if (!isBushOrTrailing) {
-          const hasVariety = !!classification;
-          const sowAnchor  = ctx.sowDate || ctx.transplantDate;
+        const description = isProtectedGrow
+          ? `Pollinators may not reliably reach plants in a greenhouse or polytunnel. Hand pollination can make fruit set much more reliable — do this when flowers are open, ideally late morning.`
+          : `Poor fruit set early in the season is usually a pollination issue. If flowers drop without setting fruit, hand pollination takes 30 seconds and makes a big difference.`;
 
-          // Cadence — anchor to 14-day windows from planting so it fires consistently
-          // rather than regenerating daily. Uses windowAnchor to snap to stable key.
-          const cadenceDays = 14;
-          const keyDate = windowAnchor(today, cadenceDays);
-
-          const title = hasVariety
-            ? `Check ${ctx.cropName} for sideshoots and remove any growing between the main stem and a leaf joint — do this every 1–2 weeks to keep energy focused on fruit`
-            : `If you're growing a cordon tomato variety (like Moneymaker or Gardener's Delight), check for sideshoots now and pinch out any growing between the main stem and a leaf joint. Bush and tumbler types don't need this — add your variety for tailored advice`;
-
-          results.push(candidate(ctx, {
-            ruleId:       'tomato_sideshoot',
-            taskType:     'care',
-            title,
-            description:  hasVariety
-              ? `Regular sideshoot removal on cordon tomatoes directs energy into fruit rather than leafy growth. Pinch out when small — they snap off cleanly.`
-              : `Not sure if you need to do this? Add your tomato variety and Vercro will tell you exactly what applies to your plants.`,
-            scheduledFor: today,
-            urgency:      'medium',
-            expiryDays:   cadenceDays,
-            leadTimeDays: 0,
-            meta:         { classification, has_variety: hasVariety, tomato_season: true },
-          }));
-        }
+        results.push(candidate(ctx, {
+          ruleId:       'squash_hand_pollination',
+          taskType:     'care',
+          title,
+          description,
+          scheduledFor: today,
+          urgency:      isProtectedGrow ? 'high' : 'medium',
+          expiryDays:   10,
+          leadTimeDays: 0,
+          meta:         { area_type: ctx.areaType, is_protected: isProtectedGrow, month: m },
+        }));
       }
     }
 
@@ -2720,7 +2711,7 @@ class RuleEngine {
           pest_window_start_override, pest_window_end_override,
           sow_window_start, sow_window_end,
           transplant_window_start, transplant_window_end,
-          potato_type, classification
+          potato_type
         )
       `)
       .eq("user_id", userId)
