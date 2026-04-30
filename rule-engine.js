@@ -332,10 +332,65 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = [], 
     }
   }
 
-  // Estimated harvest date
-  const estimatedHarvestDate = sowDate && dtm_min
-    ? addDays(sowDate, dtm_min)
-    : (harvestStart ? monthToDate(harvestStart) : null);
+  // ── Estimated harvest date ────────────────────────────────────────────────
+  // Area type — needed here for location multiplier in harvest calculation
+  const areaType = crop.area?.type || null;
+  // Anchor depends on dtm_anchor field on crop definition:
+  //   "sow"       → sowDate + dtm_min (default, direct-sown crops)
+  //   "transplant" → planted_out_date || transplanted_date || frost-derived estimate || sowDate fallback
+  //   "planting"  → same as transplant
+  //
+  // For transplant-anchored crops, a location multiplier is applied based on
+  // growing area type (greenhouse = 0.90, polytunnel = 0.93, else 1.0).
+  // A minimum_days_to_harvest_after_transplant floor prevents over-optimistic
+  // dates for crops that were started indoors very early.
+
+  const dtmAnchorType = def.dtm_anchor || "sow";
+  const minDaysAfterTransplant = def.minimum_days_to_harvest_after_transplant ?? null;
+
+  // Location multiplier — only applies to transplant-anchored crops
+  let locationMultiplier = 1.0;
+  if (areaType === "greenhouse") locationMultiplier = def.dtm_multiplier_greenhouse ?? 0.90;
+  else if (areaType === "polytunnel") locationMultiplier = def.dtm_multiplier_polytunnel ?? 0.93;
+
+  let estimatedHarvestDate = null;
+
+  if (dtmAnchorType === "transplant" || dtmAnchorType === "planting") {
+    // Anchor priority: planted_out_date → transplanted_date → planned_transplant_date
+    // → lastFrostDate + outdoor_after_frost_days → sowDate (last resort)
+    let harvestAnchor = plantedOutDate || transplantDate || crop.planned_transplant_date || null;
+
+    if (!harvestAnchor) {
+      // Derive from last frost date + crop-specific buffer
+      const outdoorAfterFrostDays = def.outdoor_after_frost_days ?? (txWeeksAfterFrost !== null ? txWeeksAfterFrost * 7 : 14);
+      if (locationLastFrost && /^\d{4}-\d{2}-\d{2}$/.test(locationLastFrost)) {
+        const currentYear = new Date().getFullYear();
+        const frostMmDd   = locationLastFrost.slice(5);
+        const frostDate   = `${currentYear}-${frostMmDd}`;
+        harvestAnchor     = addDays(frostDate, outdoorAfterFrostDays);
+      }
+    }
+
+    // Final fallback — use sowDate only if nothing else available
+    if (!harvestAnchor) harvestAnchor = sowDate;
+
+    if (harvestAnchor && dtm_min) {
+      const rawDtmDays = Math.round(dtm_min * locationMultiplier);
+      // Apply minimum floor to prevent over-optimistic dates from early indoor sowing
+      const effectiveDtmDays = minDaysAfterTransplant
+        ? Math.max(rawDtmDays, minDaysAfterTransplant)
+        : rawDtmDays;
+      estimatedHarvestDate = addDays(harvestAnchor, effectiveDtmDays);
+    } else if (harvestStart) {
+      estimatedHarvestDate = monthToDate(harvestStart);
+    }
+
+  } else {
+    // dtm_anchor === "sow" (default) — original logic
+    estimatedHarvestDate = sowDate && dtm_min
+      ? addDays(sowDate, dtm_min)
+      : (harvestStart ? monthToDate(harvestStart) : null);
+  }
 
   // Feed next due
   // If the calculated due date is in the past and the task was never completed
@@ -354,7 +409,6 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = [], 
   }
 
   // Environment
-  const areaType = crop.area?.type || null;
   const isProtected = envMods?.frost_protection?.protected || false;
 
   // Weather summary
@@ -420,6 +474,7 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = [], 
     // Date anchors
     sowDate, transplantDate, plantedOutDate, lastFedAt,
     feedNextDue, estimatedHarvestDate,
+    dtmAnchorType, locationMultiplier, minDaysAfterTransplant,
 
     // Stage
     stage: inferredStage, stageBoundaries,
