@@ -179,6 +179,7 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = [], 
   // Falls back to frostSensitive boolean if sensitivity_band not set.
   const sensitivityBand    = def.sensitivity_band || (frostSensitive ? "tender" : "hardy");
   const locationLastFrost  = crop.area?.location?.last_frost_spring || null;
+  const userCountry        = crop.area?.location?.country_code || null;
   let rawOffsetWeeks = 0;
   if (locationLastFrost && /^\d{4}-\d{2}-\d{2}$/.test(locationLastFrost)) {
     const baseline = new Date("2000-04-15");
@@ -468,6 +469,7 @@ function buildCropContext(crop, weather, envMods, userFeeds, observations = [], 
     txStart:  adjTxStart,  txEnd:  adjTxEnd,
     harvestStart, harvestEnd,
     frostOffsetWeeks, sensitivityBand, // exposed for debugging
+    userCountry, // ISO country code from location — used for country-gated pest rules
     autumnFrostMonth, // month of first autumn frost — used to suppress late-season tasks
     climateAdjustment, // null for UK users, populated for international users
 
@@ -1645,6 +1647,14 @@ class DynamicRiskEngine {
     if (rule.requires_outdoor && ctx.cropStatus === "sown_indoors") return false;
     if (rule.requires_unprotected && ctx.isProtected) return false;
 
+    // Country filter — null countries = applies globally
+    // Populated array = only fire if user's country_code is in the list
+    // If user country is unknown, only show global rules (null countries)
+    if (rule.countries?.length) {
+      if (!ctx.userCountry) return false;
+      if (!rule.countries.includes(ctx.userCountry)) return false;
+    }
+
     return true;
   }
 
@@ -2692,7 +2702,7 @@ class RuleEngine {
         area:area_id ( type, location_id, name, last_watered_at, last_pruned_or_mulched_at,
           soil_moisture, soil_moisture_logged_at,
           soil_ph, soil_ph_logged_at, soil_temperature_c, soil_temperature_logged_at,
-          location:location_id ( last_watered_at, last_frost_spring, first_frost_autumn )
+          location:location_id ( last_watered_at, last_frost_spring, first_frost_autumn, country_code )
         ),
         crop_def:crop_def_id (
           id, is_perennial, frost_sensitive, sow_method, category,
