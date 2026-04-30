@@ -1375,6 +1375,42 @@ class ScheduledRuleEngine {
       }
     }
 
+    // ── Potato earthing up ───────────────────────────────────────────────────
+    // Fires twice per season for potato crops:
+    //   1st earthing: ~21 days after planting (shoots ~15cm)
+    //   2nd earthing: ~42 days after planting (3 weeks after first)
+    // Only fires when crop is actively growing (not finished, not planned).
+    // Uses sowDate as planting anchor (potatoes use tuber establishment).
+    // Suppressed if no sowDate — can't calculate timing without planting date.
+    if (ctx.sowMethod === "tuber" || ctx.cropName?.toLowerCase().includes("potato")) {
+      const plantDate = ctx.sowDate;
+      if (plantDate && ctx.stage !== "finished" && ctx.stage !== "harvesting") {
+        const firstEarthing  = addDays(plantDate, 21);
+        const secondEarthing = addDays(plantDate, 42);
+        const windowDays     = 14; // fire within 14-day window around each date
+
+        for (const [earthingDate, earthingNum] of [[firstEarthing, 1], [secondEarthing, 2]]) {
+          const windowStart = addDays(earthingDate, -3);
+          const windowEnd   = addDays(earthingDate, windowDays);
+          if (today >= windowStart && today <= windowEnd) {
+            results.push(candidate(ctx, {
+              ruleId:       `potato_earth_up_${earthingNum}`,
+              taskType:     "care",
+              title:        earthingNum === 1
+                ? `Your ${ctx.cropName} shoots may be ready for their first earthing up — if they're around 15–20cm tall, draw soil up around the stems to encourage more tubers and protect from light`
+                : `Time for a second earthing up of ${ctx.cropName} — mound soil up around the stems again to maximise tuber development and prevent greening`,
+              description:  `Earthing up potatoes increases yield and prevents tubers turning green. Repeat ${earthingNum === 1 ? "in 3 weeks" : "if stems continue to grow"}.`,
+              scheduledFor: today,
+              urgency:      "medium",
+              expiryDays:   windowDays,
+              leadTimeDays: 0,
+              meta:         { planting_date: plantDate, earthing_number: earthingNum },
+            }));
+          }
+        }
+      }
+    }
+
     // ── Stage-based tasks from crop_rules table ──────────────────────────────
     for (const rule of rules) {
       // Crop match
@@ -1829,11 +1865,25 @@ class RuleEngine {
         areaId,
       };
 
+      // ── Confidence-ranked watering wording ───────────────────────────────
+      // High confidence = protected area (greenhouse/indoors/container) OR
+      // outdoor with dry soil reading + high-risk crop + no rain coming.
+      // Everything else = "check whether" wording — less assertive, more accurate.
+      const isProtectedArea = areaType === "greenhouse" || areaType === "indoors";
+      const isContainer     = areaType === "container" || areaType === "pot";
+      const highConfidence  = isProtectedArea
+        || isContainer
+        || (moistureActive && soilMoisture === "dry" && hasHighRiskCrop && !rainComingSoon);
+
+      const wateringAction = highConfidence
+        ? `Water ${areaName}${daysText}${atRiskText}`
+        : `Check whether ${areaName} needs watering${daysText}${atRiskText} — conditions suggest it may be drying out`;
+
       allCandidates.push({
         user_id:          userId,
         crop_instance_id: null,
         area_id:          areaId,
-        action:           `Water ${areaName}${daysText}${atRiskText}`,
+        action:           wateringAction,
         task_type:        "water",
         urgency,
         due_date:         today,
@@ -2174,11 +2224,12 @@ class RuleEngine {
   // ── Weeding maintenance rhythm ───────────────────────────────────────────
   // One area-level weeding check task per area on a rolling cadence.
   // Cadence:
-  //   greenhouse / container / pot / indoors : 10 days year-round
-  //   raised bed / open ground               : 14 days in season (Mar–Oct)
-  //                                            21 days off season (Nov–Feb)
+  //   greenhouse / container / pot / indoors : suppressed — weeding not meaningful here
+  //   raised bed / open ground               : 21 days in season (Mar–Oct)
+  //                                            28 days off season (Nov–Feb)
+  // Promoted to 14 days if wet week (actual >15mm) — weeds grow faster after rain.
   // Suppressed if last_weeded_at is within the cadence window.
-  // Urgency: medium if wet week (actual >15mm or forecast >20mm); low otherwise.
+  // Urgency: medium if wet week; low otherwise.
 
   _weedingAdvisories(userId, crops, rainHistoryByLocation, weatherByLocation) {
     const today    = todayISO();
@@ -2196,10 +2247,21 @@ class RuleEngine {
       const areaType = area.type || null;
       const areaName = area.name || 'your area';
 
-      const intensiveTypes = ['greenhouse', 'container', 'pot', 'indoors'];
-      const cadenceDays = intensiveTypes.includes(areaType)
-        ? 10
-        : inSeason ? 14 : 21;
+      // Suppress entirely for protected/container areas — weeding not meaningful
+      const suppressedTypes = ['greenhouse', 'container', 'pot', 'indoors'];
+      if (suppressedTypes.includes(areaType)) continue;
+
+      // Weather signals — check before cadence to allow wet-weather promotion
+      const locId            = crop.location_id || area.location_id;
+      const rainActual7day   = rainHistoryByLocation?.[locId]?.total7day ?? null;
+      const weather          = weatherByLocation?.[locId]    ?? null;
+      const rainForecast5day = weather?.rain_mm_forecast_5day ?? null;
+      const wetRecent        = rainActual7day   !== null && rainActual7day   > 15;
+      const wetForecast      = rainForecast5day !== null && rainForecast5day > 20 && inSeason;
+
+      // Cadence — promote to 14 days after wet week, otherwise 21/28
+      const baseCadence = inSeason ? 21 : 28;
+      const cadenceDays = wetRecent ? 14 : baseCadence;
 
       // Suppress if weeded recently enough
       const lastWeeded    = area.last_weeded_at || null;
@@ -2208,15 +2270,7 @@ class RuleEngine {
 
       seen.add(areaId);
 
-      // Weather signals for urgency
-      const locId            = crop.location_id || area.location_id;
-      const rainActual7day   = rainHistoryByLocation?.[locId]?.total7day ?? null;
-      const weather          = weatherByLocation?.[locId]    ?? null;
-      const rainForecast5day = weather?.rain_mm_forecast_5day ?? null;
-      const wetRecent        = rainActual7day   !== null && rainActual7day   > 15;
-      const wetForecast      = rainForecast5day !== null && rainForecast5day > 20 && inSeason;
-      const urgency          = (wetRecent || wetForecast) ? 'medium' : 'low';
-
+      const urgency        = (wetRecent || wetForecast) ? 'medium' : 'low';
       const lastWeededNote = daysSinceWeed !== null ? ` — last weeded ${daysSinceWeed} days ago` : '';
       const wetNote        = wetRecent ? ' — recent rain will have encouraged weed growth' : '';
       const keyDate        = windowAnchor(today, cadenceDays);
