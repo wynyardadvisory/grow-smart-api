@@ -1604,7 +1604,7 @@ class DynamicRiskEngine {
         urgency:      riskLevel,
         engineType:   "risk",
         recordType:   riskLevel === "high" ? "task" : "alert",
-        expiryDays:   rule.alert_cooldown_days || 2,
+        expiryDays:   rule.alert_cooldown_days || 7,
         leadTimeDays: 0,
         riskPayload:  {
           pest_code:         rule.pest_code,
@@ -1852,8 +1852,9 @@ class RuleEngine {
         return ["flowering", "fruiting", "harvesting"].includes(stage);
       });
       // Apply soil moisture modifier — dry reading reduces threshold (water sooner)
-      const baseDryThreshold = hasHighRiskCrop && BASE_THRESHOLD > 1 ? BASE_THRESHOLD - 1 : BASE_THRESHOLD;
-      const DRY_DAY_THRESHOLD = (moistureActive && soilMoisture === "dry" && baseDryThreshold > 1)
+      // Floor of 2 prevents containers/pots firing every single day after watering
+      const baseDryThreshold = hasHighRiskCrop && BASE_THRESHOLD > 2 ? BASE_THRESHOLD - 1 : BASE_THRESHOLD;
+      const DRY_DAY_THRESHOLD = (moistureActive && soilMoisture === "dry" && baseDryThreshold > 2)
         ? baseDryThreshold - 1
         : baseDryThreshold;
 

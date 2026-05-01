@@ -4694,7 +4694,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
           return null;
         }
       }
-      return { crop: c.succession_index ? `${c.name} (Sow ${c.succession_index})` : c.name, variety: c.variety || null, crop_instance_id: c.id, window_start: windowStart, window_end: windowEnd };
+      return { crop_name: c.succession_index ? `${c.name} (Sow ${c.succession_index})` : c.name, variety: c.variety || null, crop_instance_id: c.id, window_start: windowStart, window_end: windowEnd };
     })
     .filter(Boolean);
 
