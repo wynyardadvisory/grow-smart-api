@@ -687,8 +687,8 @@ function scoreCandidate(ctx, candidate) {
   // Hard frost — strong negative signal
   if (ctx.frostRisk7day !== null && ctx.frostRisk7day <= 0) score -= 30;
 
-  // Heavy rain — mild negative signal
-  if (ctx.rainMm !== null && ctx.rainMm >= 5) score -= 10;
+  // Rain — suppress score if any rain present
+  if (ctx.rainMm !== null && ctx.rainMm >= 2) score -= 10;
 
   // ── Stage confidence (common but optional) ─────────────────────────────────
   if (ctx.stage_confidence === "confirmed") score += 20;
@@ -1825,13 +1825,17 @@ class RuleEngine {
       const rainForecast5day   = weather?.rain_mm_forecast_5day ?? null;
       const isOutdoor          = areaType !== "indoors" && areaType !== "greenhouse";
 
-      // Suppress if it rained more than 5mm today (next 24h forecast gate)
-      if (areaType !== "indoors" && rainMm !== null && rainMm >= 5) continue;
+      // Suppress if it rained more than 2mm today (next 24h forecast gate)
+      // Also suppress on rain condition strings regardless of mm value
+      const rainCondition = weather?.condition?.toLowerCase() ?? "";
+      const isRainyCondition = rainCondition.includes("rain") || rainCondition.includes("drizzle") || rainCondition.includes("shower");
+      if (areaType !== "indoors" && isRainyCondition) continue;
+      if (areaType !== "indoors" && rainMm !== null && rainMm >= 2) continue;
 
-      // Suppress if any forecast write in the last 24h predicted >= 5mm.
+      // Suppress if any forecast write in the last 24h predicted >= 2mm.
       // This catches overnight rain that was forecast but has now passed —
       // the next 24h forward forecast would show 0mm even though it just rained.
-      if (isOutdoor && rainMm24hMax !== null && rainMm24hMax >= 5) continue;
+      if (isOutdoor && rainMm24hMax !== null && rainMm24hMax >= 2) continue;
 
       // Suppress if it's been a genuinely wet week for outdoor areas — ground is already moist.
       // Greenhouse and indoors unaffected — rain doesn't reach them.
