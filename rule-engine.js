@@ -2780,23 +2780,40 @@ class RuleEngine {
     if (!this.supabase) return {};
     const { data: locations } = await this.supabase
       .from("locations").select("id, postcode").eq("user_id", userId);
-    const result = {};
+    if (!locations?.length) return {};
+
+    const postcodes = [...new Set((locations).filter(l => l.postcode).map(l => l.postcode))];
+    if (!postcodes.length) return {};
+
+    // Single batched query across all postcodes — replaces N per-location queries
     const cutoff7day = new Date(Date.now() - 7 * 86400000).toISOString();
     const cutoff24h  = new Date(Date.now() - 24 * 3600000).toISOString();
-    for (const loc of locations || []) {
+    const { data: rows } = await this.supabase
+      .from("weather_history")
+      .select("postcode, rain_mm, recorded_at")
+      .in("postcode", postcodes)
+      .gte("recorded_at", cutoff7day);
+
+    if (!rows?.length) return {};
+
+    // Group rows by postcode
+    const byPostcode = {};
+    for (const row of rows) {
+      if (!byPostcode[row.postcode]) byPostcode[row.postcode] = [];
+      byPostcode[row.postcode].push(row);
+    }
+
+    // Build result keyed by location id
+    const result = {};
+    for (const loc of locations) {
       if (!loc.postcode) continue;
-      const { data: rows } = await this.supabase
-        .from("weather_history")
-        .select("rain_mm, recorded_at")
-        .eq("postcode", loc.postcode)
-        .gte("recorded_at", cutoff7day);
-      if (rows?.length) {
-        const total7day = rows.reduce((sum, r) => sum + (r.rain_mm || 0), 0);
-        const max24h    = rows
-          .filter(r => r.recorded_at >= cutoff24h)
-          .reduce((max, r) => Math.max(max, r.rain_mm || 0), 0);
-        result[loc.id] = { total7day, max24h };
-      }
+      const locRows = byPostcode[loc.postcode];
+      if (!locRows?.length) continue;
+      const total7day = locRows.reduce((sum, r) => sum + (r.rain_mm || 0), 0);
+      const max24h    = locRows
+        .filter(r => r.recorded_at >= cutoff24h)
+        .reduce((max, r) => Math.max(max, r.rain_mm || 0), 0);
+      result[loc.id] = { total7day, max24h };
     }
     return result;
   }
