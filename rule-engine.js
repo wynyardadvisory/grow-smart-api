@@ -586,7 +586,8 @@ function candidate(ctx, opts) {
     engineType = "scheduled", recordType = "task",
     expiryDays = 14, leadTimeDays = null,
     meta = {}, riskPayload = null,
-    dedupeByName = false, // if true, all instances of same crop share one task
+    dedupeByName = false,  // if true, all instances of same crop share one task globally
+    dedupeByArea = false,  // if true, one task per crop type per area (e.g. feed tasks)
   } = opts;
 
   const lead    = leadTimeDays ?? LEAD_TIME_DAYS[taskType] ?? LEAD_TIME_DAYS.default;
@@ -597,10 +598,15 @@ function candidate(ctx, opts) {
   const today   = todayISO();
   const status  = scheduledFor && scheduledFor > today ? "upcoming" : "due";
 
-  // For perennial care tasks, dedupe by crop name so multiple instances share one task
-  const cropKey = dedupeByName
-    ? ctx.cropName.toLowerCase().replace(/\s+/g, "_")
-    : ctx.cropId;
+  // Dedupe key:
+  //   dedupeByArea → one task per crop type per area (feed tasks — Jules bug fix)
+  //   dedupeByName → one task per crop type globally (perennial care)
+  //   default      → one task per crop instance
+  const cropKey = dedupeByArea
+    ? `${ctx.cropName.toLowerCase().replace(/\s+/g, "_")}_a${ctx.areaId}`
+    : dedupeByName
+      ? ctx.cropName.toLowerCase().replace(/\s+/g, "_")
+      : ctx.cropId;
 
   // Use a window-stable date anchor in the key so tasks that fire
   // within a broad window (mulch, prune, monitor) don't regenerate
@@ -1329,6 +1335,7 @@ class ScheduledRuleEngine {
           urgency:      feedUrgency,
           expiryDays:   7,
           leadTimeDays: LEAD_TIME_DAYS.feed,
+          dedupeByArea: true, // one feed task per crop type per area — prevents duplicates for multi-instance crops
         }));
       }
     }
