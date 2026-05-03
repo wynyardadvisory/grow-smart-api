@@ -4308,7 +4308,7 @@ app.get("/harvest-log", requireAuth, async (req, res) => {
 
 // POST /harvest-log — create a harvest entry + optionally mark crop as harvested
 app.post("/harvest-log", requireAuth,
-  [body("crop_name").trim().notEmpty()],
+  [body("crop_instance_id").isUUID().withMessage("Valid crop_instance_id is required")],
   async (req, res) => {
     if (!validate(req, res)) return;
     const {
