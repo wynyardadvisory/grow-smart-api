@@ -2228,6 +2228,16 @@ app.post("/tasks/:id/complete", requireAuth, async (req, res) => {
   const completedAt = new Date().toISOString();
   const today       = completedAt.split("T")[0];
 
+  // Idempotency guard — fetch first, short-circuit if already completed.
+  // Prevents duplicate badge events, crop state updates, rule engine runs,
+  // and activity log writes when the PCQ retries a completion on next open.
+  const { data: existing, error: fetchError } = await req.db.from("tasks")
+    .select()
+    .eq("id", req.params.id).eq("user_id", req.user.id)
+    .single();
+  if (fetchError) return res.status(500).json({ error: fetchError.message });
+  if (existing?.completed_at) return res.json(existing); // already done — no side effects
+
   const { data, error } = await req.db.from("tasks")
     .update({ completed_at: completedAt, status: "completed" })
     .eq("id", req.params.id).eq("user_id", req.user.id).select().single();
@@ -2308,6 +2318,15 @@ app.post("/tasks/:id/complete", requireAuth, async (req, res) => {
 });
 
 app.post("/tasks/:id/uncomplete", requireAuth, async (req, res) => {
+  // Idempotency guard — fetch first, short-circuit if already uncompleted.
+  // Prevents duplicate crop-state reversals when PCQ replay fires /uncomplete twice.
+  const { data: existing, error: fetchError } = await req.db.from("tasks")
+    .select()
+    .eq("id", req.params.id).eq("user_id", req.user.id)
+    .single();
+  if (fetchError) return res.status(500).json({ error: fetchError.message });
+  if (!existing?.completed_at) return res.json(existing); // already uncompleted — no side effects
+
   const { data, error } = await req.db.from("tasks")
     .update({ completed_at: null, status: "due" })
     .eq("id", req.params.id).eq("user_id", req.user.id).select().single();
