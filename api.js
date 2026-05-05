@@ -651,10 +651,13 @@ app.post("/auth/profile", requireAuth,
   [body("name").trim().notEmpty(), body("postcode").trim().notEmpty()],
   async (req, res) => {
     if (!validate(req, res)) return;
-    const { name, postcode, measurement_unit, country_code } = req.body;
+    const { name, postcode, measurement_unit, temperature_unit, country_code } = req.body;
     const updates = { id: req.user.id, name, postcode };
     if (measurement_unit === "metric" || measurement_unit === "imperial") {
       updates.measurement_unit = measurement_unit;
+    }
+    if (temperature_unit === "celsius" || temperature_unit === "fahrenheit") {
+      updates.temperature_unit = temperature_unit;
     }
 
     // Save country_code and derive locale if country changed
