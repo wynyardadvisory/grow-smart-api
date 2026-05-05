@@ -1257,7 +1257,7 @@ app.delete("/areas/:id", requireAuth, async (req, res) => {
     await req.db.from("crop_instances").update({ active: false }).in("id", cropIds).eq("user_id", userId);
   }
 
-  const { error } = await req.db.from("growing_areas").delete().eq("id", areaId).eq("user_id", userId);
+  const { error } = await req.db.from("growing_areas").delete().eq("id", areaId);
   if (error) return res.status(500).json({ error: error.message });
   res.status(204).send();
 });
