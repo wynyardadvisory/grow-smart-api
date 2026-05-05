@@ -5689,6 +5689,9 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
     if (signup_medium)               profileData.signup_medium               = signup_medium;
     if (signup_campaign)             profileData.signup_campaign             = signup_campaign;
     if (signup_source_self_reported) profileData.signup_source_self_reported = signup_source_self_reported;
+    if (area_type)                   profileData.onboarding_area_type        = area_type;
+    const onboardingStage = crops?.[0]?.stage;
+    if (onboardingStage)             profileData.onboarding_stage            = onboardingStage;
     const { error: profileErr } = await supabaseService.from("profiles")
       .upsert(profileData, { onConflict: "id" });
     if (profileErr) throw new Error("Profile: " + profileErr.message);
