@@ -1218,7 +1218,46 @@ app.post("/areas/:id/duplicate", requireAuth, async (req, res) => {
 });
 
 app.delete("/areas/:id", requireAuth, async (req, res) => {
-  const { error } = await req.db.from("growing_areas").delete().eq("id", req.params.id);
+  const areaId = req.params.id;
+  const userId = req.user.id;
+  const confirm = req.query.confirm === "true";
+
+  // Count crops and tasks linked to this area
+  const { data: crops } = await req.db.from("crop_instances")
+    .select("id")
+    .eq("area_id", areaId)
+    .eq("user_id", userId)
+    .eq("active", true);
+
+  const cropIds = (crops || []).map(c => c.id);
+
+  let taskCount = 0;
+  if (cropIds.length > 0) {
+    const { count } = await req.db.from("tasks")
+      .select("id", { count: "exact", head: true })
+      .in("crop_instance_id", cropIds)
+      .eq("user_id", userId);
+    taskCount = count || 0;
+  }
+
+  const cropCount = cropIds.length;
+
+  // If there are crops or tasks and the user hasn't confirmed, return counts for warning
+  if ((cropCount > 0 || taskCount > 0) && !confirm) {
+    return res.status(409).json({
+      requiresConfirmation: true,
+      cropCount,
+      taskCount,
+    });
+  }
+
+  // Cascade delete: tasks → soft-delete crops → delete area
+  if (cropIds.length > 0) {
+    await req.db.from("tasks").delete().in("crop_instance_id", cropIds).eq("user_id", userId);
+    await req.db.from("crop_instances").update({ active: false }).in("id", cropIds).eq("user_id", userId);
+  }
+
+  const { error } = await req.db.from("growing_areas").delete().eq("id", areaId).eq("user_id", userId);
   if (error) return res.status(500).json({ error: error.message });
   res.status(204).send();
 });
