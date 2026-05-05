@@ -1251,11 +1251,13 @@ app.delete("/areas/:id", requireAuth, async (req, res) => {
     });
   }
 
-  // Cascade delete: tasks → soft-delete crops → delete area
+  // Cascade delete: tasks (by crop) → tasks (by area) → soft-delete crops → delete area
   if (cropIds.length > 0) {
     await req.db.from("tasks").delete().in("crop_instance_id", cropIds).eq("user_id", userId);
     await req.db.from("crop_instances").update({ active: false }).in("id", cropIds).eq("user_id", userId);
   }
+  // Also delete any tasks linked directly to this area (area_id FK)
+  await req.db.from("tasks").delete().eq("area_id", areaId).eq("user_id", userId);
 
   const { error } = await req.db.from("growing_areas").delete().eq("id", areaId);
   if (error) return res.status(500).json({ error: error.message });
