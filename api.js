@@ -5711,7 +5711,7 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
       if (coords) { latitude = coords.latitude; longitude = coords.longitude; }
 
       const { data: loc, error: locErr } = await supabaseService.from("locations").insert({
-        user_id: userId, name: "My garden", postcode, country_code: countryCode, latitude, longitude,
+        user_id: userId, name: "My garden", postcode, country_code: countryCode, latitude, longitude, width_m: 10, length_m: 10,
       }).select("id").single();
       if (locErr) throw new Error("Location: " + locErr.message);
       locationId = loc.id;
@@ -5732,8 +5732,16 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
       areaId = existingAreas[0].id;
     } else {
       const finalAreaName = area_name?.trim() || "My first area";
+      const AREA_DEFAULTS = {
+        raised_bed:  { width_m: 1.2, length_m: 2.4 },
+        open_ground: { width_m: 2,   length_m: 8   },
+        greenhouse:  { width_m: 2.4, length_m: 3   },
+        polytunnel:  { width_m: 3,   length_m: 6   },
+        container:   { width_m: 0.4, length_m: 0.4 },
+      };
+      const areaDims = AREA_DEFAULTS[area_type] || { width_m: 1.2, length_m: 2.4 };
       const { data: area, error: areaErr } = await supabaseService.from("growing_areas").insert({
-        location_id: locationId, name: finalAreaName, type: area_type,
+        location_id: locationId, name: finalAreaName, type: area_type, ...areaDims,
       }).select("id").single();
       if (areaErr) throw new Error("Area: " + areaErr.message);
       areaId = area.id;
