@@ -7385,65 +7385,55 @@ async function buildEligibleUserSet(window) {
 app.post("/cron/push-morning", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-
-  // Respond immediately so cron-job.org does not time out.
-  // Notification sending runs in the background.
-  res.json({ ok: true, status: "processing" });
-
-  setImmediate(async () => {
-    try {
-      const { eligible, counts: preCounts, tokenMap, tasksByUser } = await buildEligibleUserSet("morning");
-      console.log(`[PushMorning] Pre-filter: ${JSON.stringify(preCounts)}`);
-      if (!eligible.length) {
-        console.log("[PushMorning] No eligible users — done.");
-        return;
-      }
-      const sendCounts = await sendBulkNotifications(supabaseService, eligible, "morning", tokenMap, tasksByUser);
-      console.log(`[PushMorning] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
-      supabaseService.from("push_cron_log").insert({
-        push_window:  "morning",
-        eligible:     eligible.length,
-        sent:         sendCounts.sent         || 0,
-        failed:       sendCounts.failed       || 0,
-        no_candidate: sendCounts.no_candidate || 0,
-        ran_at:       new Date().toISOString(),
-      }).then(null, e => console.error("[PushMorning] Failed to write cron log:", e.message));
-    } catch(e) {
-      captureError("PushMorning", e);
+  try {
+    const { eligible, counts: preCounts, tokenMap, tasksByUser } = await buildEligibleUserSet("morning");
+    console.log(`[PushMorning] Pre-filter: ${JSON.stringify(preCounts)}`);
+    if (!eligible.length) {
+      console.log("[PushMorning] No eligible users — done.");
+      return res.json({ ok: true, sent: 0, status: "no_eligible_users" });
     }
-  });
+    const sendCounts = await sendBulkNotifications(supabaseService, eligible, "morning", tokenMap, tasksByUser);
+    console.log(`[PushMorning] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
+    supabaseService.from("push_cron_log").insert({
+      push_window:  "morning",
+      eligible:     eligible.length,
+      sent:         sendCounts.sent         || 0,
+      failed:       sendCounts.failed       || 0,
+      no_candidate: sendCounts.no_candidate || 0,
+      ran_at:       new Date().toISOString(),
+    }).then(null, e => console.error("[PushMorning] Failed to write cron log:", e.message));
+    return res.json({ ok: true, eligible: eligible.length, sent: sendCounts.sent, failed: sendCounts.failed });
+  } catch(e) {
+    captureError("PushMorning", e);
+    return res.status(500).json({ error: e.message });
+  }
 });
 
 app.post("/cron/push-evening", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-
-  // Respond immediately so cron-job.org does not time out.
-  // Notification sending runs in the background.
-  res.json({ ok: true, status: "processing" });
-
-  setImmediate(async () => {
-    try {
-      const { eligible, counts: preCounts, tokenMap, tasksByUser } = await buildEligibleUserSet("evening");
-      console.log(`[PushEvening] Pre-filter: ${JSON.stringify(preCounts)}`);
-      if (!eligible.length) {
-        console.log("[PushEvening] No eligible users — done.");
-        return;
-      }
-      const sendCounts = await sendBulkNotifications(supabaseService, eligible, "evening", tokenMap, tasksByUser);
-      console.log(`[PushEvening] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
-      supabaseService.from("push_cron_log").insert({
-        push_window:  "evening",
-        eligible:     eligible.length,
-        sent:         sendCounts.sent         || 0,
-        failed:       sendCounts.failed       || 0,
-        no_candidate: sendCounts.no_candidate || 0,
-        ran_at:       new Date().toISOString(),
-      }).then(null, e => console.error("[PushEvening] Failed to write cron log:", e.message));
-    } catch(e) {
-      captureError("PushEvening", e);
+  try {
+    const { eligible, counts: preCounts, tokenMap, tasksByUser } = await buildEligibleUserSet("evening");
+    console.log(`[PushEvening] Pre-filter: ${JSON.stringify(preCounts)}`);
+    if (!eligible.length) {
+      console.log("[PushEvening] No eligible users — done.");
+      return res.json({ ok: true, sent: 0, status: "no_eligible_users" });
     }
-  });
+    const sendCounts = await sendBulkNotifications(supabaseService, eligible, "evening", tokenMap, tasksByUser);
+    console.log(`[PushEvening] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
+    supabaseService.from("push_cron_log").insert({
+      push_window:  "evening",
+      eligible:     eligible.length,
+      sent:         sendCounts.sent         || 0,
+      failed:       sendCounts.failed       || 0,
+      no_candidate: sendCounts.no_candidate || 0,
+      ran_at:       new Date().toISOString(),
+    }).then(null, e => console.error("[PushEvening] Failed to write cron log:", e.message));
+    return res.json({ ok: true, eligible: eligible.length, sent: sendCounts.sent, failed: sendCounts.failed });
+  } catch(e) {
+    captureError("PushEvening", e);
+    return res.status(500).json({ error: e.message });
+  }
 });
 
 // POST /cron/push-dry-run — verify eligibility without sending anything
@@ -7474,97 +7464,105 @@ app.post("/notifications/test", requireAuth, requireAdmin, async (req, res) => {
 app.post("/cron/nudge-unactivated", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-  res.json({ ok: true, status: "processing" });
-  setImmediate(async () => {
-    try {
-      const result = await runNudgeUnactivated(supabaseService);
-      console.log("[NudgeUnactivated]", result);
-    } catch(e) { captureError("NudgeUnactivated", e); }
-  });
+  try {
+    const result = await runNudgeUnactivated(supabaseService);
+    console.log("[NudgeUnactivated]", result);
+    return res.json({ ok: true, result });
+  } catch(e) {
+    captureError("NudgeUnactivated", e);
+    return res.status(500).json({ error: e.message });
+  }
 });
 
 app.post("/cron/nudge-unconfirmed", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-  res.json({ ok: true, status: "processing" });
-  setImmediate(async () => {
-    try {
-      const result = await runNudgeUnconfirmed(supabaseService);
-      console.log("[NudgeUnconfirmed]", result);
-    } catch(e) { captureError("NudgeUnconfirmed", e); }
-  });
+  try {
+    const result = await runNudgeUnconfirmed(supabaseService);
+    console.log("[NudgeUnconfirmed]", result);
+    return res.json({ ok: true, result });
+  } catch(e) {
+    captureError("NudgeUnconfirmed", e);
+    return res.status(500).json({ error: e.message });
+  }
 });
 
 app.post("/cron/feedback-sequence", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-  res.json({ ok: true, status: "processing" });
-  setImmediate(async () => {
-    try {
-      const result = await runFeedbackSequence(supabaseService);
-      console.log("[FeedbackSequence]", result);
-    } catch(e) { captureError("FeedbackSequence", e); }
-  });
+  try {
+    const result = await runFeedbackSequence(supabaseService);
+    console.log("[FeedbackSequence]", result);
+    return res.json({ ok: true, result });
+  } catch(e) {
+    captureError("FeedbackSequence", e);
+    return res.status(500).json({ error: e.message });
+  }
 });
 
 app.post("/cron/waitlist-invites", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-  res.json({ ok: true, status: "processing" });
-  setImmediate(async () => {
-    try {
-      const result = await runWaitlistInvites(supabaseService);
-      console.log("[WaitlistInvites]", result);
-    } catch(e) { captureError("WaitlistInvites", e); }
-  });
+  try {
+    const result = await runWaitlistInvites(supabaseService);
+    console.log("[WaitlistInvites]", result);
+    return res.json({ ok: true, result });
+  } catch(e) {
+    captureError("WaitlistInvites", e);
+    return res.status(500).json({ error: e.message });
+  }
 });
 
 app.post("/cron/waitlist-nudges", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-  res.json({ ok: true, status: "processing" });
-  setImmediate(async () => {
-    try {
-      const result = await runWaitlistNudges(supabaseService);
-      console.log("[WaitlistNudges]", result);
-    } catch(e) { captureError("WaitlistNudges", e); }
-  });
+  try {
+    const result = await runWaitlistNudges(supabaseService);
+    console.log("[WaitlistNudges]", result);
+    return res.json({ ok: true, result });
+  } catch(e) {
+    captureError("WaitlistNudges", e);
+    return res.status(500).json({ error: e.message });
+  }
 });
 
 app.post("/cron/waitlist-nudges-2", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-  res.json({ ok: true, status: "processing" });
-  setImmediate(async () => {
-    try {
-      const result = await runWaitlistNudges2(supabaseService);
-      console.log("[WaitlistNudges2]", result);
-    } catch(e) { captureError("WaitlistNudges2", e); }
-  });
+  try {
+    const result = await runWaitlistNudges2(supabaseService);
+    console.log("[WaitlistNudges2]", result);
+    return res.json({ ok: true, result });
+  } catch(e) {
+    captureError("WaitlistNudges2", e);
+    return res.status(500).json({ error: e.message });
+  }
 });
 
 app.post("/cron/waitlist-nudges-3", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-  res.json({ ok: true, status: "processing" });
-  setImmediate(async () => {
-    try {
-      const result = await runWaitlistNudges3(supabaseService);
-      console.log("[WaitlistNudges3]", result);
-    } catch(e) { captureError("WaitlistNudges3", e); }
-  });
+  try {
+    const result = await runWaitlistNudges3(supabaseService);
+    console.log("[WaitlistNudges3]", result);
+    return res.json({ ok: true, result });
+  } catch(e) {
+    captureError("WaitlistNudges3", e);
+    return res.status(500).json({ error: e.message });
+  }
 });
 
 app.post("/cron/reengagement", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-  res.json({ ok: true, status: "processing" });
-  setImmediate(async () => {
-    try {
-      const result = await runReengagement(supabaseService);
-      console.log("[Reengagement]", result);
-    } catch(e) { captureError("Reengagement", e); }
-  });
+  try {
+    const result = await runReengagement(supabaseService);
+    console.log("[Reengagement]", result);
+    return res.json({ ok: true, result });
+  } catch(e) {
+    captureError("Reengagement", e);
+    return res.status(500).json({ error: e.message });
+  }
 });
 
 // POST /cron/weekly-digest — Sunday weekly email digest for no-push users with due tasks
@@ -7572,13 +7570,14 @@ app.post("/cron/reengagement", async (req, res) => {
 app.post("/cron/weekly-digest", async (req, res) => {
   const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
   if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
-  res.json({ ok: true, status: "processing" });
-  setImmediate(async () => {
-    try {
-      const result = await runWeeklyEmailDigest(supabaseService);
-      console.log("[WeeklyDigest]", result);
-    } catch(e) { captureError("WeeklyDigest", e); }
-  });
+  try {
+    const result = await runWeeklyEmailDigest(supabaseService);
+    console.log("[WeeklyDigest]", result);
+    return res.json({ ok: true, result });
+  } catch(e) {
+    captureError("WeeklyDigest", e);
+    return res.status(500).json({ error: e.message });
+  }
 });
 
 // =============================================================================
