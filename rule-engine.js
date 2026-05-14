@@ -829,8 +829,18 @@ class ScheduledRuleEngine {
     const year = new Date().getFullYear();
 
     // Harvest window — recurring every 14 days
+    // Some perennials need several years to establish before first harvest
+    const YEARS_TO_FIRST_HARVEST = {
+      asparagus: 3,
+      rhubarb:   2,
+    };
+    const cropKey = Object.keys(YEARS_TO_FIRST_HARVEST).find(k => ctx.cropName.toLowerCase().includes(k));
+    const yearsRequired = cropKey ? YEARS_TO_FIRST_HARVEST[cropKey] : 0;
+    const yearsSinceSown = ctx.sowDate ? (Date.now() - new Date(ctx.sowDate).getTime()) / (365.25 * 24 * 60 * 60 * 1000) : 99;
+    const isEstablished = yearsSinceSown >= yearsRequired;
+
     const hs = ctx.harvestStart, he = ctx.harvestEnd;
-    if (hs && he && m >= hs && m <= he) {
+    if (hs && he && m >= hs && m <= he && isEstablished) {
       // Next harvest check = today (it's within window)
       results.push(candidate(ctx, {
         ruleId:       "perennial_harvest",
