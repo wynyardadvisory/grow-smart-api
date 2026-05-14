@@ -5483,63 +5483,61 @@ app.post("/admin/backfill-climate", requireAuth, requireAdmin, async (req, res) 
 // =============================================================================
 
 app.post("/admin/migrate-android-push", requireAuth, requireAdmin, async (req, res) => {
-  res.json({ ok: true, status: "processing" });
+  try {
+    const { data: tokens } = await supabaseService
+      .from("device_push_tokens")
+      .select("id, user_id, push_token")
+      .eq("platform", "android")
+      .eq("is_active", true)
+      .is("onesignal_subscription_id", null);
 
-  setImmediate(async () => {
-    try {
-      const { data: tokens } = await supabaseService
-        .from("device_push_tokens")
-        .select("id, user_id, push_token")
-        .eq("platform", "android")
-        .eq("is_active", true)
-        .is("onesignal_subscription_id", null);
-
-      if (!tokens?.length) {
-        console.log("[MigrateAndroidPush] No tokens to migrate");
-        return;
-      }
-
-      console.log(`[MigrateAndroidPush] Migrating ${tokens.length} Android tokens to OneSignal`);
-      let success = 0, failed = 0;
-
-      await Promise.all(tokens.map(async (token) => {
-        try {
-          const osRes = await fetch(`https://api.onesignal.com/apps/${process.env.ONESIGNAL_APP_ID}/users`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Key ${process.env.ONESIGNAL_API_KEY}`,
-            },
-            body: JSON.stringify({
-              properties: { external_id: token.user_id },
-              subscriptions: [{ type: "FCMToken", token: token.push_token, enabled: true }],
-            }),
-          });
-
-          const osData = await osRes.json();
-          const osSubId = osData?.subscriptions?.[0]?.id || null;
-
-          if (osSubId) {
-            await supabaseService.from("device_push_tokens")
-              .update({ onesignal_subscription_id: osSubId, updated_at: new Date().toISOString() })
-              .eq("id", token.id);
-            success++;
-            console.log(`[MigrateAndroidPush] Migrated token ${token.id} -> ${osSubId}`);
-          } else {
-            failed++;
-            console.warn(`[MigrateAndroidPush] No sub ID for token ${token.id}:`, JSON.stringify(osData));
-          }
-        } catch (err) {
-          failed++;
-          console.error(`[MigrateAndroidPush] Error for token ${token.id}:`, err.message);
-        }
-      }));
-
-      console.log(`[MigrateAndroidPush] Done. Success: ${success}, Failed: ${failed}`);
-    } catch (err) {
-      console.error("[MigrateAndroidPush] Fatal error:", err.message);
+    if (!tokens?.length) {
+      console.log("[MigrateAndroidPush] No tokens to migrate");
+      return res.json({ ok: true, success: 0, failed: 0, message: "No tokens to migrate" });
     }
-  });
+
+    console.log(`[MigrateAndroidPush] Migrating ${tokens.length} Android tokens to OneSignal`);
+    let success = 0, failed = 0;
+
+    await Promise.all(tokens.map(async (token) => {
+      try {
+        const osRes = await fetch(`https://api.onesignal.com/apps/${process.env.ONESIGNAL_APP_ID}/users`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Key ${process.env.ONESIGNAL_API_KEY}`,
+          },
+          body: JSON.stringify({
+            properties: { external_id: token.user_id },
+            subscriptions: [{ type: "FCMToken", token: token.push_token, enabled: true }],
+          }),
+        });
+
+        const osData = await osRes.json();
+        const osSubId = osData?.subscriptions?.[0]?.id || null;
+
+        if (osSubId) {
+          await supabaseService.from("device_push_tokens")
+            .update({ onesignal_subscription_id: osSubId, updated_at: new Date().toISOString() })
+            .eq("id", token.id);
+          success++;
+          console.log(`[MigrateAndroidPush] Migrated token ${token.id} -> ${osSubId}`);
+        } else {
+          failed++;
+          console.warn(`[MigrateAndroidPush] No sub ID for token ${token.id}:`, JSON.stringify(osData));
+        }
+      } catch (err) {
+        failed++;
+        console.error(`[MigrateAndroidPush] Error for token ${token.id}:`, err.message);
+      }
+    }));
+
+    console.log(`[MigrateAndroidPush] Done. Success: ${success}, Failed: ${failed}`);
+    res.json({ ok: true, success, failed });
+  } catch (err) {
+    console.error("[MigrateAndroidPush] Fatal error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ADMIN — migrate existing web push tokens to OneSignal
