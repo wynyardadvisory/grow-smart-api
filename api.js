@@ -5476,6 +5476,72 @@ app.post("/admin/backfill-climate", requireAuth, requireAdmin, async (req, res) 
   res.json({ ok: true, processed: results.length, remaining, results });
 });
 
+// ADMIN — migrate existing Android push tokens to OneSignal
+// Run once after FCM is connected to OneSignal. Finds all Android tokens with no
+// OneSignal subscription ID and registers them. Safe to run multiple times.
+// POST /admin/migrate-android-push
+// =============================================================================
+
+app.post("/admin/migrate-android-push", requireAuth, requireAdmin, async (req, res) => {
+  res.json({ ok: true, status: "processing" });
+
+  setImmediate(async () => {
+    try {
+      const { data: tokens } = await supabaseService
+        .from("device_push_tokens")
+        .select("id, user_id, push_token")
+        .eq("platform", "android")
+        .eq("is_active", true)
+        .is("onesignal_subscription_id", null);
+
+      if (!tokens?.length) {
+        console.log("[MigrateAndroidPush] No tokens to migrate");
+        return;
+      }
+
+      console.log(`[MigrateAndroidPush] Migrating ${tokens.length} Android tokens to OneSignal`);
+      let success = 0, failed = 0;
+
+      await Promise.all(tokens.map(async (token) => {
+        try {
+          const osRes = await fetch(`https://api.onesignal.com/apps/${process.env.ONESIGNAL_APP_ID}/users`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Key ${process.env.ONESIGNAL_API_KEY}`,
+            },
+            body: JSON.stringify({
+              properties: { external_id: token.user_id },
+              subscriptions: [{ type: "FCMToken", token: token.push_token, enabled: true }],
+            }),
+          });
+
+          const osData = await osRes.json();
+          const osSubId = osData?.subscriptions?.[0]?.id || null;
+
+          if (osSubId) {
+            await supabaseService.from("device_push_tokens")
+              .update({ onesignal_subscription_id: osSubId, updated_at: new Date().toISOString() })
+              .eq("id", token.id);
+            success++;
+            console.log(`[MigrateAndroidPush] Migrated token ${token.id} -> ${osSubId}`);
+          } else {
+            failed++;
+            console.warn(`[MigrateAndroidPush] No sub ID for token ${token.id}:`, JSON.stringify(osData));
+          }
+        } catch (err) {
+          failed++;
+          console.error(`[MigrateAndroidPush] Error for token ${token.id}:`, err.message);
+        }
+      }));
+
+      console.log(`[MigrateAndroidPush] Done. Success: ${success}, Failed: ${failed}`);
+    } catch (err) {
+      console.error("[MigrateAndroidPush] Fatal error:", err.message);
+    }
+  });
+});
+
 // ADMIN — migrate existing web push tokens to OneSignal
 // One-time migration. Fetches all active web tokens without an onesignal_subscription_id
 // and registers each with OneSignal, storing the returned subscription ID.
