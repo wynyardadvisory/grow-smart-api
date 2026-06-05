@@ -477,7 +477,9 @@ async function sendNotification(supabase, userId, candidate, preloadedTokens) {
 
 // ── BULK send — used by cron handlers in api.js ───────────────────────────────
 // Accepts pre-fetched data — no DB calls except the actual send + event insert.
-async function sendBulkNotifications(supabase, eligible, window, tokenMap, tasksByUser) {
+// tipGenerator: optional async fn(userId) => { title, body } | null
+//   Called when only a static habit_nudge candidate exists. Falls back silently.
+async function sendBulkNotifications(supabase, eligible, window, tokenMap, tasksByUser, tipGenerator) {
   if (!setupVapid()) return { sent: 0, reason: "vapid_not_configured" };
   const counts = { sent: 0, failed: 0, no_candidate: 0 };
 
@@ -485,7 +487,25 @@ async function sendBulkNotifications(supabase, eligible, window, tokenMap, tasks
   await Promise.all(eligible.map(async (userId) => {
     try {
       const candidates = buildCandidatesFromCache(userId, window, tasksByUser);
-      const candidate  = selectCandidate(candidates);
+      let candidate  = selectCandidate(candidates);
+
+      // If only a static fallback was selected, try AI tip first
+      if (candidate?.notification_type === "habit_nudge" && typeof tipGenerator === "function") {
+        try {
+          const tip = await tipGenerator(userId);
+          if (tip?.title && tip?.body) {
+            candidate = {
+              notification_type: "ai_tip",
+              priority:          "low",
+              title:             tip.title,
+              body:              tip.body,
+              task_id:           null,
+              payload:           { url: "/", section: "dashboard" },
+            };
+          }
+        } catch (_) {} // silent — fall through to static fallback
+      }
+
       if (!candidate) { counts.no_candidate++; return; }
       const tokens = tokenMap[userId] || [];
       const result = await sendNotification(supabase, userId, candidate, tokens);

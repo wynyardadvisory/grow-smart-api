@@ -4875,7 +4875,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     .then(() => {}).catch(() => {});
 
 
-  const [tasksRes, cropsRes, profileRes, harvestRes, completedThisWeekRes] = await Promise.all([
+  const [tasksRes, cropsRes, profileRes, harvestRes, completedThisWeekRes, streakRes] = await Promise.all([
     req.db.from("tasks")
       .select("*, crop:crop_instance_id(name, variety, succession_group_id, succession_index), area:area_id(name)")
       .eq("user_id", req.user.id).is("completed_at", null)
@@ -4896,6 +4896,10 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       .eq("user_id", req.user.id)
       .not("completed_at", "is", null)
       .gte("completed_at", weekStartISO),
+    req.db.from("user_activity_counters")
+      .select("current_streak_days, longest_streak_days")
+      .eq("user_id", req.user.id)
+      .maybeSingle(),
   ]);
 
   const tasks   = tasksRes.data  || [];
@@ -5086,6 +5090,8 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     pest_risk:   pestRisk,
     pest_crops:  pestCrops,
     tasks_completed_this_week: tasksCompletedThisWeek,
+    current_streak_days: streakRes.data?.current_streak_days || 0,
+    longest_streak_days: streakRes.data?.longest_streak_days || 0,
   });
 });
 
@@ -7542,6 +7548,95 @@ app.post("/notifications/:id/opened", async (req, res) => {
 // ── Shared bulk pre-fetch — used by both push cron handlers ──────────────────
 // 3 bulk queries upfront replace thousands of per-user queries.
 // Returns eligible user IDs, their tokens, and all their relevant tasks.
+// =============================================================================
+// AI TIP GENERATION FOR NOTIFICATIONS
+// Called when a user has no task candidate for their push notification.
+// Generates a personalised crop tip using Claude, cached per user per day
+// in notification_tip_cache so morning + evening share one AI call.
+// =============================================================================
+
+async function getOrGenerateNotificationTip(userId) {
+  const today = new Date().toISOString().split("T")[0];
+
+  // Check cache first
+  try {
+    const { data: cached } = await supabaseService
+      .from("notification_tip_cache")
+      .select("title, body")
+      .eq("user_id", userId)
+      .eq("date", today)
+      .maybeSingle();
+    if (cached) return { title: cached.title, body: cached.body };
+  } catch (_) {}
+
+  // Fetch crop context
+  let cropNames = [];
+  try {
+    const { data: crops } = await supabaseService
+      .from("crop_instances")
+      .select("name, variety, stage, sown_date")
+      .eq("user_id", userId)
+      .eq("active", true)
+      .limit(8);
+    cropNames = (crops || []).map(c => c.variety ? `${c.name} (${c.variety})` : c.name);
+  } catch (_) {}
+
+  if (!cropNames.length) return null; // no crops — use static fallback
+
+  // Fetch weather if available
+  let weatherStr = "";
+  try {
+    const { data: profile } = await supabaseService
+      .from("profiles")
+      .select("postcode")
+      .eq("id", userId)
+      .single();
+    if (profile?.postcode) {
+      const postcode = profile.postcode.trim().split(" ")[0].toUpperCase();
+      const { data: wx } = await supabaseService
+        .from("weather_cache")
+        .select("temp_c, condition, rain_mm")
+        .eq("postcode", postcode)
+        .gt("expires_at", new Date().toISOString())
+        .maybeSingle();
+      if (wx) weatherStr = `Current weather: ${wx.temp_c}°C, ${wx.condition}, rain last 24h: ${wx.rain_mm || 0}mm.`;
+    }
+  } catch (_) {}
+
+  const month = new Date().toLocaleString("en-GB", { month: "long" });
+  const prompt = `You are a practical UK gardening advisor. Generate a single short, personalised gardening tip for a push notification.
+
+The user grows: ${cropNames.join(", ")}.
+Month: ${month}. ${weatherStr}
+
+Rules:
+- Maximum 8 words for title. Maximum 15 words for body.
+- Must reference one of their actual crops by name.
+- Make it timely, specific, and actionable — not generic.
+- No emojis in title. One optional emoji at start of body.
+- Respond ONLY with valid JSON: {"title":"...","body":"..."}`;
+
+  try {
+    const { text } = await callAI({ prompt, maxTokens: 120 });
+    const clean = text.replace(/```json|```/g, "").trim();
+    const parsed = JSON.parse(clean);
+    if (!parsed.title || !parsed.body) return null;
+
+    // Cache for today
+    await supabaseService.from("notification_tip_cache").upsert({
+      user_id: userId,
+      date:    today,
+      title:   parsed.title,
+      body:    parsed.body,
+    }, { onConflict: "user_id,date" });
+
+    return { title: parsed.title, body: parsed.body };
+  } catch (e) {
+    console.error(`[NotifTip] Failed for ${userId}:`, e.message);
+    return null;
+  }
+}
+
 async function buildEligibleUserSet(window) {
   const db  = supabaseService;
   const today   = new Date().toISOString().split("T")[0];
@@ -7635,7 +7730,7 @@ app.post("/cron/push-morning", async (req, res) => {
       console.log("[PushMorning] No eligible users — done.");
       return res.json({ ok: true, sent: 0, status: "no_eligible_users" });
     }
-    const sendCounts = await sendBulkNotifications(supabaseService, eligible, "morning", tokenMap, tasksByUser);
+    const sendCounts = await sendBulkNotifications(supabaseService, eligible, "morning", tokenMap, tasksByUser, getOrGenerateNotificationTip);
     console.log(`[PushMorning] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
     supabaseService.from("push_cron_log").insert({
       push_window:  "morning",
@@ -7662,7 +7757,7 @@ app.post("/cron/push-evening", async (req, res) => {
       console.log("[PushEvening] No eligible users — done.");
       return res.json({ ok: true, sent: 0, status: "no_eligible_users" });
     }
-    const sendCounts = await sendBulkNotifications(supabaseService, eligible, "evening", tokenMap, tasksByUser);
+    const sendCounts = await sendBulkNotifications(supabaseService, eligible, "evening", tokenMap, tasksByUser, getOrGenerateNotificationTip);
     console.log(`[PushEvening] Eligible=${eligible.length} Sent=${sendCounts.sent} Failed=${sendCounts.failed} Other=${sendCounts.no_candidate}`);
     supabaseService.from("push_cron_log").insert({
       push_window:  "evening",
