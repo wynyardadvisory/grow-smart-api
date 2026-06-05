@@ -2398,6 +2398,185 @@ app.post("/tasks/:id/snooze", requireAuth,
   }
 );
 
+// =============================================================================
+// WHY NOW? — AI explanation for why a task is being suggested today
+// Free users capped at 3 lifetime uses. Pro users unlimited.
+// Logs to why_log table. Responses are not cached server-side — cache is
+// handled client-side per session by task ID.
+// =============================================================================
+
+app.post("/tasks/:id/why-now", requireAuth, async (req, res) => {
+  try {
+    const taskId = req.params.id;
+
+    // ── Fetch the task ────────────────────────────────────────────────────────
+    const { data: task, error: taskErr } = await req.db.from("tasks")
+      .select("id, action, task_type, due_date, urgency, crop_instance_id, area_id, meta, rule_id")
+      .eq("id", taskId)
+      .eq("user_id", req.user.id)
+      .single();
+
+    if (taskErr || !task) return res.status(404).json({ error: "Task not found" });
+
+    // ── Plan check — free users capped at 3 lifetime uses ────────────────────
+    const pro = await userIsPro(req);
+    if (!pro) {
+      const { count } = await req.db.from("why_log")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", req.user.id);
+      if ((count || 0) >= 3) {
+        return res.status(403).json({
+          error: "You've used your 3 free Why now? explanations. Upgrade to Pro for unlimited.",
+          upgrade_required: true,
+          count: count || 0,
+        });
+      }
+    }
+
+    // ── Fetch crop context if task has a crop ─────────────────────────────────
+    let cropCtx = null;
+    if (task.crop_instance_id) {
+      const { data: crop } = await req.db.from("crop_instances")
+        .select("name, variety, stage, sown_date, transplanted_date, last_watered_at, last_fed_at, area:area_id(name, type, location_id)")
+        .eq("id", task.crop_instance_id)
+        .eq("user_id", req.user.id)
+        .single();
+      if (crop) cropCtx = crop;
+    }
+
+    // ── Fetch area context if area-level task ─────────────────────────────────
+    let areaCtx = null;
+    if (task.area_id && !cropCtx) {
+      const { data: area } = await req.db.from("growing_areas")
+        .select("name, type, location_id")
+        .eq("id", task.area_id)
+        .single();
+      if (area) areaCtx = area;
+    }
+
+    // ── Fetch weather ─────────────────────────────────────────────────────────
+    let weatherCtx = null;
+    try {
+      const locationId = cropCtx?.area?.location_id || areaCtx?.location_id;
+      if (locationId) {
+        const { data: loc } = await req.db.from("locations")
+          .select("postcode").eq("id", locationId).single();
+        if (loc?.postcode) {
+          const postcode = loc.postcode.trim().split(" ")[0].toUpperCase();
+          const { data: wx } = await req.db.from("weather_cache")
+            .select("temp_c, condition, frost_risk_7day, rain_mm, rain_mm_forecast_5day")
+            .eq("postcode", postcode)
+            .gt("expires_at", new Date().toISOString())
+            .single();
+          if (wx) weatherCtx = wx;
+        }
+      }
+    } catch (_) {}
+
+    // ── Fetch recent completed tasks for this crop ────────────────────────────
+    let recentTasks = [];
+    if (task.crop_instance_id) {
+      const { data: rt } = await req.db.from("tasks")
+        .select("task_type, action, completed_at")
+        .eq("crop_instance_id", task.crop_instance_id)
+        .not("completed_at", "is", null)
+        .order("completed_at", { ascending: false })
+        .limit(5);
+      if (rt) recentTasks = rt;
+    }
+
+    // ── Build context strings ─────────────────────────────────────────────────
+    const cropName    = cropCtx?.name || "this crop";
+    const variety     = cropCtx?.variety || null;
+    const stage       = cropCtx?.stage || null;
+    const sowDate     = cropCtx?.sown_date || cropCtx?.transplanted_date || null;
+    const areaName    = cropCtx?.area?.name || areaCtx?.name || null;
+    const areaType    = (cropCtx?.area?.type || areaCtx?.type || "growing area").replace(/_/g, " ");
+
+    const sowWeeksAgo = sowDate
+      ? Math.floor((Date.now() - new Date(sowDate).getTime()) / (7 * 86400000))
+      : null;
+
+    const lastWatered = cropCtx?.last_watered_at
+      ? Math.floor((Date.now() - new Date(cropCtx.last_watered_at).getTime()) / 86400000)
+      : null;
+
+    const lastFed = cropCtx?.last_fed_at
+      ? Math.floor((Date.now() - new Date(cropCtx.last_fed_at).getTime()) / 86400000)
+      : null;
+
+    const weatherStr = weatherCtx
+      ? `${weatherCtx.temp_c}°C, ${weatherCtx.condition}. Rain last 24h: ${weatherCtx.rain_mm || 0}mm. 5-day forecast: ${weatherCtx.rain_mm_forecast_5day || 0}mm. Frost risk 7 days: ${weatherCtx.frost_risk_7day ?? "none"}`
+      : "Weather data unavailable";
+
+    const recentStr = recentTasks.length
+      ? recentTasks.map(t => `${t.task_type} (${Math.floor((Date.now() - new Date(t.completed_at).getTime()) / 86400000)}d ago)`).join(", ")
+      : "no recent tasks logged";
+
+    const cropLine = cropCtx
+      ? `Crop: ${cropName}${variety ? ` (${variety})` : ""}. Stage: ${stage || "unknown"}. ${sowWeeksAgo !== null ? `Sown ${sowWeeksAgo} weeks ago.` : ""} ${lastWatered !== null ? `Last watered ${lastWatered} days ago.` : ""} ${lastFed !== null ? `Last fed ${lastFed} days ago.` : ""} Growing in: ${areaName ? `${areaName} (${areaType})` : areaType}.`
+      : areaName
+        ? `Area-level task for: ${areaName} (${areaType}).`
+        : "General garden task.";
+
+    // ── Build prompt ──────────────────────────────────────────────────────────
+    const currentMonth = new Date().toLocaleString("en-GB", { month: "long" });
+    const prompt = `You are a knowledgeable but warm gardening advisor helping a UK home grower understand their personalised task list.
+
+The user has tapped "Why now?" on a task card. Explain why this specific task is being suggested today, what it does for the plant at this growth stage, and what happens if it's skipped. Be specific to their situation — never give generic gardening advice.
+
+TASK:
+- Action: ${task.action}
+- Task type: ${task.task_type}
+- Urgency: ${task.urgency}
+
+CONTEXT:
+- ${cropLine}
+- Weather: ${weatherStr}
+- Month: ${currentMonth}
+- Recent activity: ${recentStr}
+
+RULES:
+- 3-5 sentences maximum. Mobile interface — be concise.
+- Reference their actual crop name, stage, and conditions — never say "your plant" when you know the crop.
+- Explain the consequence of skipping in plain terms (what specifically will suffer).
+- Do not use bullet points. Write in flowing, natural sentences.
+- Do not start with "Great" or any filler phrase.
+- If urgency is "high", convey that timing matters now.
+- Respond with plain text only — no markdown, no formatting.`;
+
+    // ── Call AI ───────────────────────────────────────────────────────────────
+    const { text: explanation } = await callAI({ prompt, maxTokens: 300 });
+
+    if (!explanation?.trim()) throw new Error("Empty response from AI");
+
+    // ── Log to why_log ────────────────────────────────────────────────────────
+    await req.db.from("why_log").insert({
+      user_id:          req.user.id,
+      task_id:          taskId,
+      task_type:        task.task_type,
+      crop_instance_id: task.crop_instance_id || null,
+      created_at:       new Date().toISOString(),
+    });
+
+    // ── Return with usage info ────────────────────────────────────────────────
+    const { count: newCount } = await req.db.from("why_log")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", req.user.id);
+
+    res.json({
+      explanation: explanation.trim(),
+      is_pro: pro,
+      why_used: newCount || 1,
+      why_remaining: pro ? null : Math.max(0, 3 - (newCount || 1)),
+    });
+
+  } catch (e) {
+    console.error("[WhyNow] Error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/tasks", requireAuth,
   [
     body("action").trim().notEmpty(),
