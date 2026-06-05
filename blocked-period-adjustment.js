@@ -15,61 +15,51 @@ const TASK_POLICIES = {
     moveEarlierMaxDays: 3,
     moveLaterMaxDays:   3,
     preferDirection:    "earlier",
-    riskIfUnmovable:    false,
   },
   water: {
     moveEarlierMaxDays: 0,
     moveLaterMaxDays:   1,
     preferDirection:    "earlier",
-    riskIfUnmovable:    true,
   },
   sow: {
     moveEarlierMaxDays: 5,
     moveLaterMaxDays:   7,
     preferDirection:    "later",
-    riskIfUnmovable:    true,
   },
   transplant: {
     moveEarlierMaxDays: 2,
     moveLaterMaxDays:   3,
     preferDirection:    "later",
-    riskIfUnmovable:    true,
   },
   harvest: {
     moveEarlierMaxDays: 2,
     moveLaterMaxDays:   2,
     preferDirection:    "earlier",
-    riskIfUnmovable:    true,
   },
   protect: {
     moveEarlierMaxDays: 0,
     moveLaterMaxDays:   0,
     preferDirection:    "earlier",
-    riskIfUnmovable:    true,
   },
   monitor: {
     moveEarlierMaxDays: 2,
     moveLaterMaxDays:   5,
     preferDirection:    "later",
-    riskIfUnmovable:    false,
   },
   prune: {
     moveEarlierMaxDays: 3,
     moveLaterMaxDays:   5,
     preferDirection:    "later",
-    riskIfUnmovable:    false,
   },
   thin: {
     moveEarlierMaxDays: 3,
     moveLaterMaxDays:   5,
     preferDirection:    "later",
-    riskIfUnmovable:    false,
   },
   other: {
     moveEarlierMaxDays: 2,
     moveLaterMaxDays:   5,
     preferDirection:    "later",
-    riskIfUnmovable:    false,
   },
 };
 
@@ -176,7 +166,9 @@ function evaluateTask(task, blockedPeriod, policy) {
     decision_source: "task_type_config",
   };
 
-  // Preferred direction first, fallback to other direction, then at_risk
+  // Preferred direction first, fallback to other direction.
+  // If neither tolerance allows movement, push to day after holiday ends.
+  // No task is ever left on a date within the blocked period.
   if (policy.preferDirection === "earlier" && earlierValid) {
     return { type: "moved_earlier", adjustedDueDate: earlierCandidate, metadata: { ...meta, explanation: buildExplanation(task.task_type, "moved_earlier") } };
   }
@@ -189,11 +181,9 @@ function evaluateTask(task, blockedPeriod, policy) {
   if (laterValid) {
     return { type: "moved_later", adjustedDueDate: laterCandidate, metadata: { ...meta, explanation: buildExplanation(task.task_type, "moved_later") } };
   }
-  if (policy.riskIfUnmovable) {
-    return { type: "at_risk", adjustedDueDate: null, metadata: { ...meta, reason: "no_safe_date", explanation: buildExplanation(task.task_type, "at_risk") } };
-  }
 
-  return null; // no adjustment needed
+  // Cannot move within tolerance — push to day after return regardless
+  return { type: "moved_later", adjustedDueDate: laterCandidate, metadata: { ...meta, explanation: buildExplanation(task.task_type, "moved_later") } };
 }
 
 // ---------------------------------------------------------------------------
@@ -241,23 +231,23 @@ async function applyBlockedPeriodAdjustments(db, userId, blockedPeriodId) {
     const policy = TASK_POLICIES[task.task_type];
 
     if (!policy) {
-      // Unknown task type — mark at risk conservatively
+      // Unknown task type — push to day after return
       toInsert.push({
         user_id:           userId,
         task_id:           task.id,
         blocked_period_id: blockedPeriodId,
         adjustment_reason: "blocked_dates",
-        adjustment_type:   "at_risk",
+        adjustment_type:   "moved_later",
         original_due_date: task.due_date,
-        adjusted_due_date: null,
-        metadata:          { reason: "no_policy_for_task_type", task_type: task.task_type, explanation: "This task could not be automatically adjusted — it may need attention while you're away." },
+        adjusted_due_date: addDays(bp.end_date, 1),
+        metadata:          { reason: "no_policy_for_task_type", task_type: task.task_type, explanation: "Moved to after your time away." },
       });
-      atRisk++;
+      movedLater++;
       continue;
     }
 
     const decision = evaluateTask(task, bp, policy);
-    if (!decision) continue; // no adjustment needed (riskIfUnmovable: false and no valid moves)
+    if (!decision) continue; // safety guard — should not happen
 
     toInsert.push({
       user_id:           userId,
@@ -279,7 +269,7 @@ async function applyBlockedPeriodAdjustments(db, userId, blockedPeriodId) {
     await db.from("task_adjustments").insert(toInsert);
   }
 
-  console.log(`[TimeAway] ${bp.label || blockedPeriodId}: ${movedEarlier} earlier, ${movedLater} later, ${atRisk} at risk`);
+  console.log(`[TimeAway] ${bp.label || blockedPeriodId}: ${movedEarlier} earlier, ${movedLater} later`);
 
   return {
     movedEarlier,
