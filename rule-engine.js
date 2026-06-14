@@ -1736,11 +1736,29 @@ class RuleEngine {
 
     const allCandidates = [];
 
+    // Task types suppressed for dormant perennials.
+    // Dormant = winter/resting mode. Maintenance tasks allowed; harvest/fruit/summer tasks suppressed.
+    const DORMANT_SUPPRESSED = new Set([
+      "perennial_harvest",
+      "perennial_feed_scheduled",
+      "perennial_summer_feed",
+      "perennial_flowering_check",
+      "perennial_fruit_set_check",
+      "strawberry_runners",
+      "strawberry_renovate",
+      "apple_pear_summer_prune",
+      "asparagus_cutting_check",
+      "squash_hand_pollination",
+    ]);
+
     // Build a canonical context map once — reused by both the candidate loop
     // and the watering section so all stage/lastWateredAt values are consistent.
     const ctxMap = new Map();
 
     for (const crop of crops) {
+      // Skip failed crops entirely — no tasks generated
+      if (crop.status === "failed") continue;
+
       const locId   = crop.location_id || crop.area?.location_id;
       const weather = weatherByLocation[locId] || null;
       const areaType = crop.area?.type;
@@ -1754,10 +1772,16 @@ class RuleEngine {
 
       // Scheduled engine — future tasks
       const scheduled = this.scheduled.evaluate(ctx, rules);
-      allCandidates.push(...scheduled);
+
+      // For dormant perennials: filter out suppressed task types, keep maintenance only
+      if (crop.status === "dormant") {
+        allCandidates.push(...scheduled.filter(c => !DORMANT_SUPPRESSED.has(c.ruleId) && !DORMANT_SUPPRESSED.has(c.task_type)));
+      } else {
+        allCandidates.push(...scheduled);
+      }
 
       // Risk engine — short-horizon alerts
-      // Skip for planned, finished, or indoor crops (pests not relevant until outside)
+      // Skip for planned, finished, indoor, or failed crops (pests not relevant)
       const skipRisk = crop.status === "planned" ||
                        crop.status === "sown_indoors" ||
                        ctx.stage === "finished";
@@ -1793,7 +1817,7 @@ class RuleEngine {
     // Uses ctxMap for inferred stage, tiered lastWateredAt and areaType — not raw crop fields.
     const areaMap = new Map(); // areaId -> { crops, areaType, areaName, locId, weather }
     for (const crop of crops) {
-      if (crop.status === "planned" || crop.status === "sown_indoors" || crop.status === "finished") continue;
+      if (crop.status === "planned" || crop.status === "sown_indoors" || crop.status === "finished" || crop.status === "failed" || crop.status === "dormant") continue;
       const areaId = crop.area_id;
       if (!areaId) continue;
       const locId = crop.location_id || crop.area?.location_id;

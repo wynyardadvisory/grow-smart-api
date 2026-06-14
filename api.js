@@ -1951,9 +1951,115 @@ app.delete("/crops/:id", requireAuth, async (req, res) => {
   res.status(204).send();
 });
 
-// =============================================================================
-// SUCCESSION GROUPS
-// =============================================================================
+// ── Crop lifecycle status endpoints ──────────────────────────────────────────
+
+// PATCH /crops/:id/dormant — mark a perennial crop as dormant for the season
+app.patch("/crops/:id/dormant", requireAuth, async (req, res) => {
+  const { notes } = req.body || {};
+  const cropId = req.params.id;
+
+  // Fetch crop + verify ownership + confirm perennial
+  const { data: crop, error: fetchErr } = await req.db.from("crop_instances")
+    .select("id, name, area_id, crop_def:crop_def_id(is_perennial, name)")
+    .eq("id", cropId).eq("user_id", req.user.id).single();
+
+  if (fetchErr || !crop) return res.status(404).json({ error: "Crop not found" });
+  if (!crop.crop_def?.is_perennial) return res.status(400).json({ error: "Only perennial crops can be marked dormant" });
+
+  const { data: updated, error } = await req.db.from("crop_instances")
+    .update({ status: "dormant", dormant_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+    .eq("id", cropId).eq("user_id", req.user.id)
+    .select().single();
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Clear open tasks for this crop — new season tasks generated on reactivation
+  await supabaseService.from("tasks")
+    .delete()
+    .eq("crop_instance_id", cropId)
+    .eq("user_id", req.user.id)
+    .is("completed_at", null);
+
+  const today = new Date().toISOString().split("T")[0];
+  writeActivityEvent("crop_instances", cropId, req.user.id, "crop_dormant",
+    today, new Date().toISOString(), {
+      cropName: crop.crop_def?.name || crop.name,
+      areaId:   crop.area_id,
+      note:     notes || null,
+    });
+
+  res.json({ success: true, crop: updated });
+});
+
+// PATCH /crops/:id/fail — mark a crop as failed with a reason
+app.patch("/crops/:id/fail", requireAuth, async (req, res) => {
+  const { reason, notes } = req.body || {};
+  const VALID_REASONS = ["frost", "disease", "pest_damage", "drought", "neglect", "other"];
+  if (!reason || !VALID_REASONS.includes(reason)) {
+    return res.status(400).json({ error: `reason must be one of: ${VALID_REASONS.join(", ")}` });
+  }
+
+  const cropId = req.params.id;
+  const { data: crop, error: fetchErr } = await req.db.from("crop_instances")
+    .select("id, name, area_id, crop_def:crop_def_id(name)")
+    .eq("id", cropId).eq("user_id", req.user.id).single();
+  if (fetchErr || !crop) return res.status(404).json({ error: "Crop not found" });
+
+  const { data: updated, error } = await req.db.from("crop_instances")
+    .update({
+      status:         "failed",
+      active:         false,
+      failed_at:      new Date().toISOString(),
+      failure_reason: reason,
+      updated_at:     new Date().toISOString(),
+    })
+    .eq("id", cropId).eq("user_id", req.user.id)
+    .select().single();
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Clear open tasks
+  await supabaseService.from("tasks")
+    .delete()
+    .eq("crop_instance_id", cropId)
+    .eq("user_id", req.user.id)
+    .is("completed_at", null);
+
+  const today = new Date().toISOString().split("T")[0];
+  writeActivityEvent("crop_instances", cropId, req.user.id, "crop_failed",
+    today, new Date().toISOString(), {
+      cropName: crop.crop_def?.name || crop.name,
+      areaId:   crop.area_id,
+      reason,
+      note:     notes || null,
+    });
+
+  res.json({ success: true, crop: updated });
+});
+
+// PATCH /crops/:id/reactivate — reactivate a dormant perennial (manual or cron)
+app.patch("/crops/:id/reactivate", requireAuth, async (req, res) => {
+  const cropId = req.params.id;
+  const { data: crop, error: fetchErr } = await req.db.from("crop_instances")
+    .select("id, name, area_id, status, crop_def:crop_def_id(is_perennial, name)")
+    .eq("id", cropId).eq("user_id", req.user.id).single();
+  if (fetchErr || !crop) return res.status(404).json({ error: "Crop not found" });
+  if (crop.status !== "dormant") return res.status(400).json({ error: "Crop is not dormant" });
+
+  const { data: updated, error } = await req.db.from("crop_instances")
+    .update({ status: "growing", dormant_at: null, updated_at: new Date().toISOString() })
+    .eq("id", cropId).eq("user_id", req.user.id)
+    .select().single();
+  if (error) return res.status(500).json({ error: error.message });
+
+  const today = new Date().toISOString().split("T")[0];
+  writeActivityEvent("crop_instances", cropId, req.user.id, "crop_reactivated",
+    today, new Date().toISOString(), {
+      cropName: crop.crop_def?.name || crop.name,
+      areaId:   crop.area_id,
+      reason:   "manual",
+    });
+
+  res.json({ success: true, crop: updated });
+});
 
 // POST /succession-groups — create group + first sowing
 app.post("/succession-groups", requireAuth,
@@ -7786,6 +7892,91 @@ app.post("/cron/push-dry-run", async (req, res) => {
     res.json({ ok: true, window, would_send_to: eligible.length, breakdown: counts, tasks_fetched: totalTasks, users_with_tasks: usersWithTasks });
   } catch(e) {
     captureError("PushDryRun", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /cron/reactivate-perennials
+// Runs 1 March each year via cron-job.org.
+// Checks all dormant perennial crops and reactivates those that have relevant
+// spring tasks generated by the rule engine — crop-aware, not blanket reactivation.
+app.post("/cron/reactivate-perennials", async (req, res) => {
+  const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
+  if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+
+  try {
+    // Fetch all dormant perennial crop_instances
+    const { data: dormantCrops, error } = await supabaseService
+      .from("crop_instances")
+      .select("id, user_id, name, area_id, crop_def:crop_def_id(name, is_perennial)")
+      .eq("status", "dormant")
+      .eq("active", true)
+      .eq("deleted", false);
+
+    if (error) throw new Error(error.message);
+    if (!dormantCrops?.length) return res.json({ ok: true, reactivated: 0, checked: 0 });
+
+    const engine = new RuleEngine(supabaseService);
+    const today = new Date().toISOString().split("T")[0];
+
+    const SPRING_TASK_TYPES = [
+      "perennial_spring_feed",
+      "apple_pear_winter_prune",
+      "berry_winter_prune",
+      "raspberry_cane_prune",
+      "perennial_mulch",
+      "rhubarb_forcing_check",
+    ];
+
+    let reactivated = 0;
+    const reactivatedIds = [];
+
+    // Group by user to run rule engine per user efficiently
+    const byUser = {};
+    for (const crop of dormantCrops) {
+      if (!byUser[crop.user_id]) byUser[crop.user_id] = [];
+      byUser[crop.user_id].push(crop);
+    }
+
+    for (const [userId, userCrops] of Object.entries(byUser)) {
+      try {
+        // Run rule engine for this user to get candidate tasks
+        const candidates = await engine.runForUser(userId);
+        const candidateCropIds = new Set(
+          (candidates || [])
+            .filter(c => SPRING_TASK_TYPES.includes(c.ruleId) || SPRING_TASK_TYPES.some(t => c.task_type === t))
+            .map(c => c.crop_instance_id)
+            .filter(Boolean)
+        );
+
+        for (const crop of userCrops) {
+          // Only reactivate if rule engine generated relevant spring tasks for this crop
+          if (!candidateCropIds.has(crop.id)) continue;
+
+          await supabaseService.from("crop_instances")
+            .update({ status: "growing", dormant_at: null, updated_at: new Date().toISOString() })
+            .eq("id", crop.id);
+
+          writeActivityEvent("crop_instances", crop.id, userId, "crop_reactivated",
+            today, new Date().toISOString(), {
+              cropName: crop.crop_def?.name || crop.name,
+              areaId:   crop.area_id,
+              reason:   "new_season",
+            });
+
+          reactivatedIds.push(crop.id);
+          reactivated++;
+        }
+      } catch(e) {
+        console.error(`[ReactivatePerennials] Error for user ${userId}:`, e.message);
+      }
+    }
+
+    console.log(`[ReactivatePerennials] Checked ${dormantCrops.length}, reactivated ${reactivated}`);
+    res.json({ ok: true, checked: dormantCrops.length, reactivated, reactivated_ids: reactivatedIds });
+
+  } catch(e) {
+    captureError("ReactivatePerennials", e);
     res.status(500).json({ error: e.message });
   }
 });
