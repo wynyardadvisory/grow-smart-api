@@ -358,7 +358,7 @@ function selectCandidate(candidates) {
 }
 
 // ── OneSignal send helper — native iOS/Android only ───────────────────────────
-async function sendViaOneSignal(subscriptionIds, candidate, badgeCount = 0) {
+async function sendViaOneSignal(subscriptionIds, candidate) {
   const res = await fetch("https://api.onesignal.com/notifications", {
     method: "POST",
     headers: {
@@ -371,8 +371,8 @@ async function sendViaOneSignal(subscriptionIds, candidate, badgeCount = 0) {
       headings:                 { en: candidate.title },
       contents:                 { en: candidate.body },
       ios_badgeType:            "SetTo",
-      ios_badgeCount:           badgeCount,
-      android_badge_count:      badgeCount,
+      ios_badgeCount:           1,
+      android_badge_count:      1,
       data: {
         notification_type: candidate.notification_type,
         priority:          candidate.priority,
@@ -388,7 +388,7 @@ async function sendViaOneSignal(subscriptionIds, candidate, badgeCount = 0) {
 }
 
 // ── Send notification ─────────────────────────────────────────────────────────
-async function sendNotification(supabase, userId, candidate, preloadedTokens, badgeCount = 0) {
+async function sendNotification(supabase, userId, candidate, preloadedTokens) {
   // preloadedTokens: token array passed in from bulk path — avoids a DB query
   let tokens;
   if (preloadedTokens) {
@@ -430,7 +430,7 @@ async function sendNotification(supabase, userId, candidate, preloadedTokens, ba
 
   if (osSubscriptionIds.length) {
     try {
-      const osResult = await sendViaOneSignal(osSubscriptionIds, candidate, badgeCount);
+      const osResult = await sendViaOneSignal(osSubscriptionIds, candidate);
       const osSent = osResult.recipients || 0;
       sentCount += osSent;
       console.log(`[Push] OneSignal sent to ${userId}: ${candidate.notification_type} — "${candidate.title}" — recipients=${osSent}`);
@@ -511,12 +511,7 @@ async function sendBulkNotifications(supabase, eligible, window, tokenMap, tasks
 
       if (!candidate) { counts.no_candidate++; return; }
       const tokens = tokenMap[userId] || [];
-      const today = new Date().toISOString().split("T")[0];
-      const userTasks = tasksByUser.get(userId) || [];
-      const badgeCount = userTasks.filter(t =>
-        !t.completed_at && t.status !== "expired" && t.due_date <= today
-      ).length;
-      const result = await sendNotification(supabase, userId, candidate, tokens, badgeCount);
+      const result = await sendNotification(supabase, userId, candidate, tokens);
       if (result.sent) counts.sent++;
       else counts.failed++;
     } catch(e) {
@@ -559,15 +554,7 @@ async function runNotificationsForUser(supabase, userId, window = "morning") {
   }
 
   const today = new Date().toISOString().split("T")[0];
-  const { count: badgeCount } = await supabase
-    .from("tasks")
-    .select("id", { count: "exact", head: true })
-    .eq("user_id", userId)
-    .is("completed_at", null)
-    .not("status", "eq", "expired")
-    .lte("due_date", today);
-
-  const result = await sendNotification(supabase, userId, candidate, null, badgeCount || 0);
+  const result = await sendNotification(supabase, userId, candidate, null);
   if (isAdmin) {
     console.log(`[Push] Admin send (${window}): ${candidate.notification_type} — "${candidate.title}" — sent=${result.sent}`);
   }
