@@ -2874,7 +2874,7 @@ class RuleEngine {
     const { data } = await this.supabase
       .from("user_feeds")
       .select("id, brand, product_name, form, feed_type, npk, dilution_ml_per_litre, frequency_days, suitable_crop_types, application_method, notes, enriched")
-      .eq("user_id", userId).eq("active", true).eq("enriched", true);
+      .eq("user_id", userId).eq("active", true).eq("enriched", true).eq("out_of_stock", false);
     return data || [];
   }
 

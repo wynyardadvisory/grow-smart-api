@@ -2856,6 +2856,19 @@ app.delete("/feeds/:id", requireAuth, async (req, res) => {
   res.json({ success: true });
 });
 
+// PATCH /feeds/:id/stock — toggle out_of_stock status
+app.patch("/feeds/:id/stock", requireAuth, async (req, res) => {
+  const { out_of_stock } = req.body;
+  if (typeof out_of_stock !== "boolean") return res.status(400).json({ error: "out_of_stock must be a boolean" });
+  const { data, error } = await req.db.from("user_feeds")
+    .update({ out_of_stock, updated_at: new Date().toISOString() })
+    .eq("id", req.params.id)
+    .eq("user_id", req.user.id)
+    .select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true, feed: data });
+});
+
 
 
 
