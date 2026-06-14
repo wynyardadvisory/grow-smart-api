@@ -1972,12 +1972,21 @@ app.patch("/crops/:id/dormant", requireAuth, async (req, res) => {
     .select().single();
   if (error) return res.status(500).json({ error: error.message });
 
-  // Clear open tasks for this crop — new season tasks generated on reactivation
+  // Delete only suppressed task types for dormant crops.
+  // Maintenance tasks (winter prune, mulch, spring feed etc.) are kept so they
+  // remain visible without needing the rule engine to regenerate them immediately.
+  const DORMANT_SUPPRESSED = [
+    "perennial_harvest", "perennial_feed_scheduled", "perennial_summer_feed",
+    "perennial_flowering_check", "perennial_fruit_set_check",
+    "strawberry_runners", "strawberry_renovate",
+    "apple_pear_summer_prune", "asparagus_cutting_check", "squash_hand_pollination",
+  ];
   await supabaseService.from("tasks")
     .delete()
     .eq("crop_instance_id", cropId)
     .eq("user_id", req.user.id)
-    .is("completed_at", null);
+    .is("completed_at", null)
+    .in("rule_id", DORMANT_SUPPRESSED);
 
   const today = new Date().toISOString().split("T")[0];
   writeActivityEvent("crop_instances", cropId, req.user.id, "crop_dormant",
@@ -7944,7 +7953,7 @@ app.post("/cron/reactivate-perennials", async (req, res) => {
         const candidates = await engine.runForUser(userId);
         const candidateCropIds = new Set(
           (candidates || [])
-            .filter(c => SPRING_TASK_TYPES.includes(c.ruleId) || SPRING_TASK_TYPES.some(t => c.task_type === t))
+            .filter(c => SPRING_TASK_TYPES.includes(c.rule_id))
             .map(c => c.crop_instance_id)
             .filter(Boolean)
         );

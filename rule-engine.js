@@ -1775,7 +1775,7 @@ class RuleEngine {
 
       // For dormant perennials: filter out suppressed task types, keep maintenance only
       if (crop.status === "dormant") {
-        allCandidates.push(...scheduled.filter(c => !DORMANT_SUPPRESSED.has(c.ruleId) && !DORMANT_SUPPRESSED.has(c.task_type)));
+        allCandidates.push(...scheduled.filter(c => !DORMANT_SUPPRESSED.has(c.rule_id)));
       } else {
         allCandidates.push(...scheduled);
       }
