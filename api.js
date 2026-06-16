@@ -247,7 +247,7 @@ async function callAI({ prompt, maxTokens = 1000 }) {
   const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: maxTokens, messages: [{ role: "user", content: prompt }] }),
+    body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: maxTokens, messages: [{ role: "user", content: prompt }] }),
   });
   const claudeRaw = await claudeRes.json();
   if (claudeRaw.type === "error" && claudeRaw.error?.type === "overloaded_error") {
@@ -269,7 +269,7 @@ async function callAIVision({ prompt, imageBase64, maxTokens = 1200 }) {
   const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: maxTokens, messages: [{ role: "user", content: [
+    body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: maxTokens, messages: [{ role: "user", content: [
       { type: "image", source: { type: "base64", media_type: "image/jpeg", data: imageBase64 } },
       { type: "text", text: prompt },
     ]}] }),
@@ -5693,7 +5693,7 @@ RULES:
       diagnosis:        result.problem_name || (result.looks_healthy ? "Healthy" : "No issue detected"),
       severity:         result.severity || null,
       confidence:       result.stage_confidence || null,
-      ai_model:         diagProvider === "gpt-4o" ? "gpt-4o" : "claude-sonnet-4-20250514",
+      ai_model:         diagProvider === "gpt-4o" ? "gpt-4o" : "claude-sonnet-4-6",
     }).select().single();
 
     if (logErr) console.error("[DiagnosisAnalyze] Log error:", logErr.message);
