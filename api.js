@@ -241,42 +241,49 @@ async function fetchFrostDates(latitude, longitude) {
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
-// ── AI Helper — Claude with GPT-4o fallback on overload ──────────────────────
+// ── AI Helper — Claude with GPT-4o fallback on any Claude error ───────────────
 // Text-only call (no image)
 async function callAI({ prompt, maxTokens = 1000 }) {
-  const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: maxTokens, messages: [{ role: "user", content: prompt }] }),
-  });
-  const claudeRaw = await claudeRes.json();
-  if (claudeRaw.type === "error" && claudeRaw.error?.type === "overloaded_error") {
-    console.error("[AI] Claude overloaded, falling back to GPT-4o");
+  try {
+    const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: maxTokens, messages: [{ role: "user", content: prompt }] }),
+    });
+    const claudeRaw = await claudeRes.json();
+    if (claudeRaw.type === "error") throw new Error(`Claude API error: ${claudeRaw.error?.message || "unknown"}`);
+    if (!claudeRaw.content?.[0]?.text) throw new Error("Claude returned empty response");
+    return { text: claudeRaw.content[0].text, provider: "claude" };
+  } catch(claudeErr) {
+    console.error("[AI] Claude failed, falling back to GPT-4o:", claudeErr.message);
     const openaiRes = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": `Bearer ${process.env.OPENAI_API_KEY}` },
       body: JSON.stringify({ model: "gpt-4o", max_tokens: maxTokens, messages: [{ role: "user", content: prompt }] }),
     });
     const openaiRaw = await openaiRes.json();
-    return { text: openaiRaw.choices?.[0]?.message?.content || "", provider: "gpt-4o" };
+    if (!openaiRaw.choices?.[0]?.message?.content) throw new Error("Both Claude and GPT-4o failed");
+    return { text: openaiRaw.choices[0].message.content, provider: "gpt-4o" };
   }
-  if (claudeRaw.type === "error") throw new Error(`Claude API error: ${claudeRaw.error?.message || "unknown"}`);
-  return { text: claudeRaw.content?.[0]?.text || "", provider: "claude" };
 }
 
 // Vision call (with image)
 async function callAIVision({ prompt, imageBase64, maxTokens = 1200 }) {
-  const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: maxTokens, messages: [{ role: "user", content: [
-      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: imageBase64 } },
-      { type: "text", text: prompt },
-    ]}] }),
-  });
-  const claudeRaw = await claudeRes.json();
-  if (claudeRaw.type === "error" && claudeRaw.error?.type === "overloaded_error") {
-    console.error("[AI] Claude overloaded, falling back to GPT-4o vision");
+  try {
+    const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: maxTokens, messages: [{ role: "user", content: [
+        { type: "image", source: { type: "base64", media_type: "image/jpeg", data: imageBase64 } },
+        { type: "text", text: prompt },
+      ]}] }),
+    });
+    const claudeRaw = await claudeRes.json();
+    if (claudeRaw.type === "error") throw new Error(`Claude API error: ${claudeRaw.error?.message || "unknown"}`);
+    if (!claudeRaw.content?.[0]?.text) throw new Error("Claude returned empty response");
+    return { text: claudeRaw.content[0].text, provider: "claude" };
+  } catch(claudeErr) {
+    console.error("[AI] Claude vision failed, falling back to GPT-4o:", claudeErr.message);
     const openaiRes = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": `Bearer ${process.env.OPENAI_API_KEY}` },
@@ -286,10 +293,9 @@ async function callAIVision({ prompt, imageBase64, maxTokens = 1200 }) {
       ]}] }),
     });
     const openaiRaw = await openaiRes.json();
-    return { text: openaiRaw.choices?.[0]?.message?.content || "", provider: "gpt-4o" };
+    if (!openaiRaw.choices?.[0]?.message?.content) throw new Error("Both Claude and GPT-4o vision failed");
+    return { text: openaiRaw.choices[0].message.content, provider: "gpt-4o" };
   }
-  if (claudeRaw.type === "error") throw new Error(`Claude API error: ${claudeRaw.error?.message || "unknown"}`);
-  return { text: claudeRaw.content?.[0]?.text || "", provider: "claude" };
 }
 
 // Parse JSON from AI response (strips markdown fences)
