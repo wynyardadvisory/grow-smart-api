@@ -2414,8 +2414,15 @@ app.post("/tasks/:id/complete", requireAuth, async (req, res) => {
     const transition = meta.status_transition;
 
     if (data.task_type === "water") {
-      // Water tasks are area-level — update last_watered_at on all crops in the area
+      // Water tasks are area-level. The rule engine's tiered lastWateredAt
+      // fallback checks crop.area?.last_watered_at — so growing_areas must be
+      // updated, not just crop_instances. Update both: area-level (what the
+      // fallback chain actually reads) and crop-level (for crops with their
+      // own override).
       if (data.area_id) {
+        await supabaseService.from("growing_areas")
+          .update({ last_watered_at: completedAt })
+          .eq("id", data.area_id);
         await supabaseService.from("crop_instances")
           .update({ last_watered_at: completedAt, updated_at: completedAt })
           .eq("area_id", data.area_id).eq("user_id", req.user.id);
