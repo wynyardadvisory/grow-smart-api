@@ -1835,6 +1835,7 @@ class RuleEngine {
     const today = todayISO();
 
     const MOISTURE_WINDOW_DAYS = 7;
+    const SUFFICIENT_RAIN_MM = 2; // same value as the same-day rain suppression check below — a day where the strongest forecast snapshot recorded that day hits this counts as a moisture event
 
     for (const [areaId, area] of areaMap.entries()) {
       const { crops: areaCrops, areaType, areaName, weather } = area;
@@ -1863,6 +1864,7 @@ class RuleEngine {
       const rainHistory        = areaLocId ? (rainHistoryByLocation?.[areaLocId] ?? null) : null;
       const rainMm7dayActual   = rainHistory?.total7day ?? null;
       const rainMm24hMax       = rainHistory?.max24h    ?? null;
+      const dailyRain          = rainHistory?.dailyRain  ?? {};
       const rainForecast5day   = weather?.rain_mm_forecast_5day ?? null;
       const isOutdoor          = areaType !== "indoors" && areaType !== "greenhouse";
 
@@ -1913,13 +1915,36 @@ class RuleEngine {
         if (lw && (!lastWateredDate || lw > lastWateredDate)) lastWateredDate = lw;
       }
 
-      // Calculate days since last watered
+      // Calculate days since last watered (literal fact — kept for meta below)
       const daysSinceWatered = lastWateredDate
         ? Math.floor((Date.now() - new Date(lastWateredDate).getTime()) / 86400000)
         : null;
 
-      // Only fire if overdue
-      if (daysSinceWatered !== null && daysSinceWatered < DRY_DAY_THRESHOLD) continue;
+      // ── Rain-aware moisture date ──────────────────────────────────────────
+      // daysSinceWatered alone ignores rain that fell after the last watering —
+      // a task could say "19 days since watered" even if it rained sufficiently
+      // 6 days ago. Find the most recent day this area's dailyRain map hit the
+      // sufficient-rain bar, then take whichever is more recent: that day, or
+      // the watering date. dailyRain[date] is the max single forecast snapshot
+      // recorded that day (not a sum — see _loadRainHistory).
+      let lastSufficientRainDate = null;
+      for (const [date, mm] of Object.entries(dailyRain)) {
+        if (mm >= SUFFICIENT_RAIN_MM && (!lastSufficientRainDate || date > lastSufficientRainDate)) {
+          lastSufficientRainDate = date;
+        }
+      }
+      const lastMoistureDate = [lastWateredDate, lastSufficientRainDate]
+        .filter(Boolean)
+        .sort()
+        .pop() || null;
+      const daysSinceMoisture = lastMoistureDate
+        ? Math.floor((Date.now() - new Date(lastMoistureDate).getTime()) / 86400000)
+        : null;
+
+      // Only fire if overdue — uses daysSinceMoisture (watering OR sufficient
+      // rain, whichever is more recent), not daysSinceWatered alone, so a
+      // rainy spell after watering correctly delays the task.
+      if (daysSinceMoisture !== null && daysSinceMoisture < DRY_DAY_THRESHOLD) continue;
       if (daysSinceWatered === null) {
         // Never watered — only fire if no rain recently (rain_mm null = unknown, skip)
         if (rainMm === null) continue;
@@ -1936,13 +1961,17 @@ class RuleEngine {
       const atRiskCrops = sortedCrops.slice(0, 3).map(c => c.name);
       const atRiskText = atRiskCrops.length > 0 ? " — pay particular attention to: " + atRiskCrops.join(", ") : "";
 
-      const daysText = daysSinceWatered !== null ? " (" + daysSinceWatered + " days since last watered)" : "";
+      const daysText = daysSinceMoisture !== null
+        ? ` (Last watering or meaningful rain: ${daysSinceMoisture} day${daysSinceMoisture !== 1 ? "s" : ""} ago)`
+        : "";
 
       // Urgency calculation — four signals in priority order:
       // 1. Dry soil reading logged recently → always high
       // 2. Rain forecast in next 5 days (>15mm) → downgrade to low (relief coming)
       // 3. No rain forecast and overdue by threshold+2 → high (no relief coming)
       // 4. Default escalation at threshold+2 → high
+      // Uses daysSinceMoisture (not daysSinceWatered) so severity tracks the
+      // same rain-aware figure that decided whether to fire at all.
       const rainComingSoon = isOutdoor && rainForecast5day !== null && rainForecast5day > 15;
       const noDryRelief    = isOutdoor && (rainForecast5day === null || rainForecast5day < 2);
 
@@ -1950,9 +1979,9 @@ class RuleEngine {
         ? "high"
         : rainComingSoon
           ? "low"
-          : (noDryRelief && daysSinceWatered !== null && daysSinceWatered >= DRY_DAY_THRESHOLD)
+          : (noDryRelief && daysSinceMoisture !== null && daysSinceMoisture >= DRY_DAY_THRESHOLD)
             ? "high"
-            : daysSinceWatered !== null && daysSinceWatered >= DRY_DAY_THRESHOLD + 2
+            : daysSinceMoisture !== null && daysSinceMoisture >= DRY_DAY_THRESHOLD + 2
               ? "high"
               : "medium";
 
@@ -1997,7 +2026,7 @@ class RuleEngine {
         rule_id:          "watering_due",
         source_key:       sourceKey({ u: userId, a: areaId, r: "watering_due", d: today }),
         date_confidence:  "exact",
-        meta:             JSON.stringify({ dry_days: daysSinceWatered, area_type: areaType, soil_moisture: moistureActive ? soilMoisture : null }),
+        meta:             JSON.stringify({ dry_days: daysSinceWatered, dry_days_combined: daysSinceMoisture, area_type: areaType, soil_moisture: moistureActive ? soilMoisture : null }),
         risk_payload:     null,
       });
     }
@@ -2811,11 +2840,17 @@ class RuleEngine {
     return result;
   }
 
-  // Returns total rainfall (mm) over the last 7 days per location_id.
+  // Returns total rainfall (mm) over the last 7 days per location_id, plus a
+  // day-by-day map covering the last 30 days.
   // Queries weather_history which accumulates one row per cache refresh.
-  // Returns { [locId]: { total7day, max24h } } per location.
+  // Returns { [locId]: { total7day, max24h, dailyRain } } per location.
   // max24h = the highest single rain_mm forecast value written in the last 24h.
   // If any write predicted >= 5mm in the last 24h, it likely rained or was about to.
+  // dailyRain[date] = the highest single rain_mm value recorded that calendar
+  // day, over the last 30 days. rain_mm is itself a rolling 24h-forward forecast
+  // snapshot logged at each cache refresh, not an observed measurement — summing
+  // same-day rows would double-count overlapping forecasts, so this takes the
+  // max per day instead (same approach as max24h above).
   // Returns {} if table is empty or not yet populated.
   async _loadRainHistory(userId) {
     if (!this.supabase) return {};
@@ -2826,14 +2861,19 @@ class RuleEngine {
     const postcodes = [...new Set((locations).filter(l => l.postcode).map(l => l.postcode))];
     if (!postcodes.length) return {};
 
-    // Single batched query across all postcodes — replaces N per-location queries
-    const cutoff7day = new Date(Date.now() - 7 * 86400000).toISOString();
-    const cutoff24h  = new Date(Date.now() - 24 * 3600000).toISOString();
+    // Single batched query across all postcodes — replaces N per-location queries.
+    // Widened to 30 days so dailyRain can look back far enough to catch rain that
+    // fell after a stale watering date. total7day/max24h are filtered back down
+    // to their original 7-day / 24h windows from this same wider fetch, so their
+    // values are unchanged from before.
+    const cutoff30day = new Date(Date.now() - 30 * 86400000).toISOString();
+    const cutoff7day  = new Date(Date.now() - 7  * 86400000).toISOString();
+    const cutoff24h   = new Date(Date.now() - 24 * 3600000).toISOString();
     const { data: rows } = await this.supabase
       .from("weather_history")
       .select("postcode, rain_mm, recorded_at")
       .in("postcode", postcodes)
-      .gte("recorded_at", cutoff7day);
+      .gte("recorded_at", cutoff30day);
 
     if (!rows?.length) return {};
 
@@ -2850,11 +2890,20 @@ class RuleEngine {
       if (!loc.postcode) continue;
       const locRows = byPostcode[loc.postcode];
       if (!locRows?.length) continue;
-      const total7day = locRows.reduce((sum, r) => sum + (r.rain_mm || 0), 0);
+
+      const rows7day  = locRows.filter(r => r.recorded_at >= cutoff7day);
+      const total7day = rows7day.reduce((sum, r) => sum + (r.rain_mm || 0), 0);
       const max24h    = locRows
         .filter(r => r.recorded_at >= cutoff24h)
         .reduce((max, r) => Math.max(max, r.rain_mm || 0), 0);
-      result[loc.id] = { total7day, max24h };
+
+      const dailyRain = {};
+      for (const row of locRows) {
+        const date = row.recorded_at.split("T")[0];
+        dailyRain[date] = Math.max(dailyRain[date] || 0, row.rain_mm || 0);
+      }
+
+      result[loc.id] = { total7day, max24h, dailyRain };
     }
     return result;
   }
