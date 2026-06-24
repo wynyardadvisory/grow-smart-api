@@ -50,7 +50,7 @@ const Stripe = require("stripe");
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const { applyBlockedPeriodAdjustments, reapplyAllBlockedPeriods } = require("./blocked-period-adjustment");
 const { runNotificationsForUser, sendBulkNotifications } = require("./notifications");
-const { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement, runWeeklyEmailDigest } = require("./emails");
+const { runNudgeUnactivated, runNudgeUnconfirmed, runFeedbackSequence, runWaitlistInvites, runWaitlistNudges, runWaitlistNudges2, runWaitlistNudges3, runReengagement, runWeeklyEmailDigest, runStreakRecovery, runFirstHarvest, runBadgeUnlockEmails, runUpgradePrompt } = require("./emails");
 
 // ── Supabase (service role — server only) ─────────────────────────────────────
 const supabaseService = createClient(
@@ -8140,6 +8140,66 @@ app.post("/cron/weekly-digest", async (req, res) => {
     return res.json({ ok: true, result });
   } catch(e) {
     captureError("WeeklyDigest", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /cron/streak-recovery — daily, fires email when a 5+ day streak is at risk
+// Managed by cron-job.org (08:00 UTC every day)
+app.post("/cron/streak-recovery", async (req, res) => {
+  const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
+  if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  try {
+    const result = await runStreakRecovery(supabaseService);
+    console.log("[StreakRecovery]", result);
+    return res.json({ ok: true, result });
+  } catch(e) {
+    captureError("StreakRecovery", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /cron/first-harvest — daily, fires once when a user logs their first harvest
+// Managed by cron-job.org (09:00 UTC every day)
+app.post("/cron/first-harvest", async (req, res) => {
+  const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
+  if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  try {
+    const result = await runFirstHarvest(supabaseService);
+    console.log("[FirstHarvest]", result);
+    return res.json({ ok: true, result });
+  } catch(e) {
+    captureError("FirstHarvest", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /cron/badge-unlock-emails — daily, emails users who earned a badge and have no push
+// Managed by cron-job.org (10:00 UTC every day)
+app.post("/cron/badge-unlock-emails", async (req, res) => {
+  const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
+  if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  try {
+    const result = await runBadgeUnlockEmails(supabaseService);
+    console.log("[BadgeUnlockEmails]", result);
+    return res.json({ ok: true, result });
+  } catch(e) {
+    captureError("BadgeUnlockEmails", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /cron/upgrade-prompt — daily, fires within 24h of a free user hitting Why Now/PlantCheck/Boost limit
+// Managed by cron-job.org (11:00 UTC every day)
+app.post("/cron/upgrade-prompt", async (req, res) => {
+  const cronAuth = req.headers["x-cron-secret"] === process.env.CRON_SECRET || req.headers["authorization"] === `Bearer ${process.env.CRON_SECRET}`;
+  if (!cronAuth) return res.status(401).json({ error: "Unauthorised" });
+  try {
+    const result = await runUpgradePrompt(supabaseService);
+    console.log("[UpgradePrompt]", result);
+    return res.json({ ok: true, result });
+  } catch(e) {
+    captureError("UpgradePrompt", e);
     return res.status(500).json({ error: e.message });
   }
 });
