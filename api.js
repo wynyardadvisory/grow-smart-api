@@ -6060,6 +6060,17 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
     signup_source_self_reported,
   } = req.body;
 
+  // UTM fallback: prefer the request body (frontend-read cookie at onboarding-submit
+  // time), but fall back to Supabase auth user_metadata if the body doesn't have them.
+  // The metadata path is more reliable — it's written server-side at the moment of
+  // sign-up (see vercro-landing's googleSignup/appleSignup/sendMagicLink/signUp calls)
+  // and isn't dependent on a redirect URL surviving the OAuth round-trip intact, which
+  // was confirmed broken for query-string UTMs in session-60's investigation.
+  const metaUtms = req.user?.user_metadata || {};
+  const resolvedSignupSource   = signup_source   || metaUtms.utm_source   || null;
+  const resolvedSignupMedium   = signup_medium   || metaUtms.utm_medium   || null;
+  const resolvedSignupCampaign = signup_campaign || metaUtms.utm_campaign || null;
+
   if (!name || !postcode || !crops?.length || !area_type) {
     return res.status(400).json({ error: "name, postcode, crops and area_type required" });
   }
@@ -6077,9 +6088,9 @@ app.post("/onboarding/complete", requireAuth, async (req, res) => {
     // 1. Save profile — use supabaseService so it bypasses RLS and definitely commits
     // locations.user_id FK references profiles.id so profile MUST exist before location insert
     const profileData = { id: userId, name, postcode, country_code: countryCode, locale };
-    if (signup_source)               profileData.signup_source               = signup_source;
-    if (signup_medium)               profileData.signup_medium               = signup_medium;
-    if (signup_campaign)             profileData.signup_campaign             = signup_campaign;
+    if (resolvedSignupSource)        profileData.signup_source               = resolvedSignupSource;
+    if (resolvedSignupMedium)        profileData.signup_medium               = resolvedSignupMedium;
+    if (resolvedSignupCampaign)      profileData.signup_campaign             = resolvedSignupCampaign;
     if (signup_source_self_reported) profileData.signup_source_self_reported = signup_source_self_reported;
     if (area_type)                   profileData.onboarding_area_type        = area_type;
     const onboardingStage = crops?.[0]?.stage;
